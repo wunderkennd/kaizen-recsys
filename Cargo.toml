@@ -1,0 +1,20 @@
+[package]
+name = "rust_fease_recommender" # Changed name to be a valid Python module
+version = "0.1.0"
+edition = "2024"
+
+# Define as a Python library
+[lib]
+name = "rust_fease_recommender"
+crate-type = ["cdylib"]
+
+[dependencies]
+ahash = "0.8.12"
+anyhow = "1.0.100"
+deltalake = "0.29.3"
+nalgebra = { version = "0.34.1", features = ["serde-serialize"] }
+polars = { version = "0.41.0", features = ["csv", "dtype-date", "dtype-datetime", "dtype-i8", "dtype-time", "lazy", "parquet"] }
+pyo3 = { version = "0.27.1", features = ["extension-module"] }
+rustbricks = "0.1.1"
+serde = { version = "1.0.228", features = ["derive"] }
+sprs = "0.11.4"
