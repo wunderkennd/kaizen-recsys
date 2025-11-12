@@ -95,17 +95,41 @@ impl RustFeaseModel {
         println!("Assembling dense Gram matrix G...");
         let mut g = DMatrix::<f64>::zeros(total_dim, total_dim);
 
-        // Convert from sprs's ndarray to nalgebra::DMatrix
-        let g_11_nalgebra = DMatrix::from(&g_11.to_dense());
+        // Convert from sprs's ndarray (row-major) to nalgebra::DMatrix (col-major)
+        // FIX: Use `from_row_slice` for robust ndarray -> nalgebra conversion
+        let g_11_nd = g_11.to_dense();
+        let g_11_nalgebra = DMatrix::from_row_slice(
+            g_11_nd.nrows(),
+            g_11_nd.ncols(),
+            g_11_nd.as_slice().expect("g_11 ndarray was not contiguous"),
+        );
         set_block(&mut g, &g_11_nalgebra, 0, 0);
 
-        let g_12_nalgebra = DMatrix::from(&g_12.to_dense());
+        // FIX: Use `from_row_slice`
+        let g_12_nd = g_12.to_dense();
+        let g_12_nalgebra = DMatrix::from_row_slice(
+            g_12_nd.nrows(),
+            g_12_nd.ncols(),
+            g_12_nd.as_slice().expect("g_12 ndarray was not contiguous"),
+        );
         set_block(&mut g, &g_12_nalgebra, 0, m);
 
-        let g_21_nalgebra = DMatrix::from(&g_21.to_dense());
+        // FIX: Use `from_row_slice`
+        let g_21_nd = g_21.to_dense();
+        let g_21_nalgebra = DMatrix::from_row_slice(
+            g_21_nd.nrows(),
+            g_21_nd.ncols(),
+            g_21_nd.as_slice().expect("g_21 ndarray was not contiguous"),
+        );
         set_block(&mut g, &g_21_nalgebra, m, 0);
 
-        let g_22_nalgebra = DMatrix::from(&g_22.to_dense());
+        // FIX: Use `from_row_slice`
+        let g_22_nd = g_22.to_dense();
+        let g_22_nalgebra = DMatrix::from_row_slice(
+            g_22_nd.nrows(),
+            g_22_nd.ncols(),
+            g_22_nd.as_slice().expect("g_22 ndarray was not contiguous"),
+        );
         set_block(&mut g, &g_22_nalgebra, m, m);
 
         // ---
@@ -113,8 +137,9 @@ impl RustFeaseModel {
         // ---
         println!("Calculating P = (G + λI)^-1...");
         let mut g_reg = g.clone();
-        // Use add_diagonal_mut (f64)
-        g_reg.add_diagonal_mut(lambda);
+        for i in 0..g_reg.nrows() {
+            g_reg[(i, i)] += lambda;
+        }
         let p = g_reg
             .try_inverse()
             .expect("Failed to invert Gram matrix P. Check regularization.");
@@ -170,7 +195,8 @@ impl RustFeaseModel {
 
         // Fill item interactions
         // Corrected iterator: .iter() yields (&value, (row, col))
-        for (item_idx, &val) in user_interactions.iter().map(|(&v, (_r, c))| (c, v)) {
+        // FIX: Changed `&val` to `val` to match the iterator type `(usize, f64)`
+        for (item_idx, val) in user_interactions.iter().map(|(&v, (_r, c))| (c, v)) {
             if item_idx < self.num_items {
                 z_vec[item_idx] = val;
             }
@@ -178,7 +204,8 @@ impl RustFeaseModel {
 
         // Fill user features
         // Corrected iterator: .iter() yields (&value, (row, col))
-        for (feat_idx, &val) in user_features.iter().map(|(&v, (_r, c))| (c, v)) {
+        // FIX: Changed `&val` to `val` to match the iterator type `(usize, f64)`
+        for (feat_idx, val) in user_features.iter().map(|(&v, (_r, c))| (c, v)) {
             if feat_idx < self.num_user_features {
                 z_vec[self.num_items + feat_idx] = val * beta;
             }

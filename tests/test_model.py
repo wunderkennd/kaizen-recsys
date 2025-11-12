@@ -35,7 +35,7 @@ def trained_model():
                 "account_tenure_days": [400, 400, 10],
                 "region_major_account": ["US/CA", "US/CA", "EMEA"],
                 "subscription_status": ["Paying", "Paying", "Inactive"],
-            }
+            },
         )
 
         # Add cold user features (no interactions)
@@ -52,7 +52,7 @@ def trained_model():
                 "account_tenure_days": [1],
                 "region_major_account": ["APAC"],
                 "subscription_status": ["Free Trial"],
-            }
+            },
         )
 
         eng_df = pl.concat([eng_df, cold_user_df])

@@ -4,6 +4,7 @@ use std::collections::HashMap;
 mod data_pipeline;
 mod model;
 mod schemas;
+mod data_validation;
 
 use data_pipeline::{Mappings, build_matrices};
 use model::{RustFeaseModel, create_sparse_matrix};
@@ -81,6 +82,7 @@ impl FeaseModel {
             .collect();
 
         // Sort by score, descending
+        // FIX: Corrected typo `std.cmp` to `std::cmp`
         results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
         // 4. Take top_k and return
