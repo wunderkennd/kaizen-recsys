@@ -3,11 +3,11 @@ use std::collections::HashMap;
 
 mod data_pipeline;
 mod model;
-mod schemas;
+mod schema;
 mod data_validation;
 
-use data_pipeline::{Mappings, build_matrices};
-use model::{RustFeaseModel, create_sparse_matrix};
+use data_pipeline::{build_matrices, Mappings};
+use model::{create_sparse_matrix, RustFeaseModel};
 use nalgebra::DVector;
 
 /// A trained FEASE model, ready for predictions.
