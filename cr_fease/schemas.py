@@ -1,4 +1,4 @@
-# schema.py
+# schemas.py
 from enum import Enum
 from typing import Optional
 from pydantic import BaseModel, Field, field_validator
@@ -35,7 +35,7 @@ class EngagementSchema(BaseModel):
     @classmethod
     def validate_and_cast(cls, df: pl.DataFrame) -> pl.DataFrame:
         """
-        Validates and casts a DataFrame to the expected schema.
+        Validates and casts a DataFrame to the expected schemas.
 
         Args:
             df: Input DataFrame

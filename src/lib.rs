@@ -1,164 +1,245 @@
+//! This file is the main entrypoint for the Python library.
+//! It uses PyO3 to define the Python-callable functions and the `FeaseModel` class.
+//! This is the "bridge" between Python and Rust.
+
+use ahash::AHashMap;
+use anyhow::Result;
+use model::RustFeaseModel; // The internal Rust struct
 use pyo3::prelude::*;
-use std::collections::HashMap;
+use pyo3::types::{PyDict, PyFloat, PyList, PyString};
+use std::time::Instant;
 
 mod data_pipeline;
 mod model;
-mod schema;
-mod data_validation;
+mod schemas;
 
-use data_pipeline::{build_matrices, Mappings};
-use model::{create_sparse_matrix, RustFeaseModel};
-use nalgebra::DVector;
-
-/// A trained FEASE model, ready for predictions.
+/// A Python-accessible class that holds the trained FEASE model.
 ///
-/// This class is created by the `build_and_train` function.
-/// It holds the trained model weights and the necessary ID/feature
-/// mappings to make predictions.
+/// This struct is a thin wrapper around the internal `RustFeaseModel`,
+/// adding Python methods like `predict` and properties like `num_items`.
+///
+/// We use `#[pyo3(get)]` to expose the Rust fields as read-only
+/// Python properties.
 #[pyclass]
 struct FeaseModel {
-    /// The internal Rust model containing the S-matrix
+    /// The internal Rust model, which holds the S-matrix and mappings.
+    /// `#[pyo3(get)]` requires `RustFeaseModel` to be `Clone`.
+    #[pyo3(get)]
     model: RustFeaseModel,
-    /// Mappings from string IDs/features to integer indices
-    mappings: Mappings,
-    /// Mapping from integer item_idx back to string item_guid
-    idx_to_item: HashMap<usize, String>,
-    /// The beta parameter used at training time
-    beta: f64,
+
+    /// Number of items the model was trained on.
+    #[pyo3(get)]
+    num_items: usize,
+
+    /// Number of user features the model was trained on.
+    #[pyo3(get)]
+    num_user_features: usize,
+
+    /// Number of item features the model was trained on.
+    #[pyo3(get)]
+    num_item_features: usize,
 }
 
 #[pymethods]
 impl FeaseModel {
-    /// Predicts item scores for a user.
+    /// Predicts recommendation scores for a user.
     ///
     /// Args:
-    ///     user_interactions (dict[str, float]): A dictionary mapping
-    ///         `view_media_id` to its score (e.g., log_watch_time).
-    ///         Use an empty dict `{}` for a cold-start user.
-    ///     user_features (dict[str, float]): A dictionary mapping
-    ///         feature names (e.g., "device_Mobile", "tenure_31-90d") to 1.0.
-    ///     top_k (int): The number of recommendations to return.
+    ///     interactions (dict[str, float]):
+    ///         A dictionary mapping item_guids to interaction values
+    ///         (e.g., log_watch_time) for the user.
+    ///     features (dict[str, float]):
+    ///         A dictionary mapping user_feature_names to their values
+    ///         (e.g., {"plan_Premium": 1.0, "tenure_30d": 1.0}).
+    ///     top_k (int):
+    ///         The number of top recommendations to return.
     ///
     /// Returns:
-    ///     list[tuple[str, float]]: A list of (item_guid, score) tuples,
-    ///     sorted from highest score to lowest.
-    #[pyo3(signature = (user_interactions, user_features, top_k=100))]
-    fn predict(
+    ///     list[tuple[str, float]]:
+    ///         A list of (item_guid, score) tuples, sorted descending by score.
+    #[pyfn(signature = (interactions, features, top_k=100))]
+    fn predict<'py>(
         &self,
-        user_interactions: HashMap<String, f64>,
-        user_features: HashMap<String, f64>,
+        py: Python<'py>,
+        interactions: &Bound<'_, PyDict>,
+        features: &Bound<'_, PyDict>,
         top_k: usize,
-    ) -> PyResult<Vec<(String, f64)>> {
-        // 1. Convert Python HashMaps to Rust sparse vectors (1-row CsMat)
-        let mut x_triplets = Vec::new();
-        for (item_guid, val) in user_interactions {
-            if let Some(item_idx) = self.mappings.item_mapping.get(&item_guid) {
-                x_triplets.push((0, *item_idx, val));
+    ) -> PyResult<Bound<'py, PyList>> {
+        // --- 1. Convert Python inputs to Rust vectors ---
+        // We use `with_capacity` for a small optimization.
+        let mut user_interactions: Vec<(usize, f64)> =
+            Vec::with_capacity(interactions.len());
+        let mut user_features: Vec<(usize, f64)> =
+            Vec::with_capacity(features.len());
+
+        // Convert interactions (item_guid -> item_idx)
+        for (key, val) in interactions.iter() {
+            let item_guid: &str = key.extract()?;
+            let value: f64 = val.extract()?;
+            // Silently ignore items not seen in training
+            if let Some(&item_idx) = self.model.mappings.item_to_idx.get(item_guid) {
+                user_interactions.push((item_idx, value));
             }
         }
-        let x_sparse = create_sparse_matrix(1, self.model.num_items, x_triplets);
 
-        let mut u_triplets = Vec::new();
-        for (feat_name, val) in user_features {
-            if let Some(feat_idx) = self.mappings.user_feature_mapping.get(&feat_name) {
-                u_triplets.push((0, *feat_idx, val));
+        // Convert features (feature_name -> feature_idx)
+        for (key, val) in features.iter() {
+            let feature_name: &str = key.extract()?;
+            let value: f64 = val.extract()?;
+            // Silently ignore features not seen in training
+            if let Some(&feature_idx) =
+                self.model.mappings.user_feature_to_idx.get(feature_name)
+            {
+                user_features.push((feature_idx, value));
             }
         }
-        let u_sparse = create_sparse_matrix(1, self.model.num_user_features, u_triplets);
 
-        // 2. Call the internal Rust model's predict function
-        let scores_vec: DVector<f64> = self.model.predict(&x_sparse, &u_sparse, self.beta);
+        // --- 2. Call the internal Rust prediction function ---
+        // This is the high-performance part.
+        let scores: Vec<f64> = self
+            .model
+            .predict(&user_interactions, &user_features, self.model.beta);
 
-        // 3. Map results back to item GUIs and sort
-        let mut results: Vec<(String, f64)> = scores_vec
-            .iter()
+        // --- 3. Process and sort results ---
+        // This part is a bit slow (O(M log M)) but fine for a single user.
+        // For batch prediction, this should be optimized.
+        let mut results_with_idx: Vec<(usize, f64)> = scores
+            .into_iter()
             .enumerate()
-            .filter_map(|(item_idx, &score)| {
-                // Map the index back to the original string ID
-                self.idx_to_item
-                    .get(&item_idx)
-                    .map(|item_guid| (item_guid.clone(), score))
+            // Don't recommend items the user has already interacted with
+            .filter(|(idx, _score)| {
+                !user_interactions
+                    .iter()
+                    .any(|(interacted_idx, _)| *interacted_idx == *idx)
             })
             .collect();
 
-        // Sort by score, descending
-        // FIX: Corrected typo `std.cmp` to `std::cmp`
-        results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        // Sort by score, descending.
+        // We use `partial_cmp` because f64 is not `Ord`.
+        results_with_idx.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal) // FIX: Corrected typo `std.cmp`
+        });
 
-        // 4. Take top_k and return
-        results.truncate(top_k);
-        Ok(results)
-    }
+        // --- 4. Convert top-K results back to Python types ---
+        // We use `new_bound` for `pyo3 = "0.21.0"`
+        let py_results = PyList::empty_bound(py);
+        for (idx, score) in results_with_idx.into_iter().take(top_k) {
+            // Map item_idx back to item_guid
+            if let Some(guid) = self.model.mappings.idx_to_item.get(idx) {
+                let py_guid = PyString::new_bound(py, guid);
+                let py_score = PyFloat::new_bound(py, score);
+                py_results.append((py_guid, py_score))?;
+            }
+        }
 
-    /// Gets the number of items the model was trained on.
-    #[getter]
-    fn num_items(&self) -> PyResult<usize> {
-        Ok(self.model.num_items)
-    }
-
-    /// Gets the number of user features the model was trained on.
-    #[getter]
-    fn num_user_features(&self) -> PyResult<usize> {
-        Ok(self.model.num_user_features)
+        Ok(py_results)
     }
 }
 
-/// Builds the feature matrices from Parquet files, trains the FEASE model,
-/// and returns a trained, ready-to-use model object.
+/// A Python-callable function to build and train the model from file paths.
+///
+/// This is the main "factory" function for creating a FeaseModel instance
+/// from your Python/Databricks environment.
 ///
 /// Args:
-///     engagement_path (str): Path to the `Engagement` Parquet file.
-///     metadata_path (str): Path to the `Content Metadata` Parquet file.
-///     alpha (float): Weight for item features (α).
-///     beta (float): Weight for user features (β).
-///     lambda_ (float): L2 regularization strength (λ). Note the underscore
-///         to avoid conflict with Python's `lambda` keyword.
-///
-/// Returns:
-///     FeaseModel: A trained, ready-to-use model.
-#[pyfunction]
-#[pyo3(signature = (engagement_path, metadata_path, alpha = 1.0, beta = 1.0, lambda_ = 100.0))]
+///     interactions_path (str):
+///         Local file path to the interactions Parquet/CSV file.
+///     user_features_path (str):
+///         Local file path to the user features Parquet/CSV file.
+///     item_features_path (str):
+///         Local file path to the item features Parquet/CSV file.
+///     alpha (float): Weight for item features.
+///     beta (float): Weight for user features.
+///     lambda_ (float): L2 regularization term.
+#[pyfunction(signature = (
+    interactions_path,
+    user_features_path,
+    item_features_path,
+    alpha = 1.0,
+    beta = 1.0,
+    lambda_ = 100.0
+))]
 fn build_and_train(
-    engagement_path: String,
-    metadata_path: String,
+    interactions_path: String,
+    user_features_path: String,
+    item_features_path: String,
     alpha: f64,
     beta: f64,
     lambda_: f64,
 ) -> PyResult<FeaseModel> {
-    // 1. Build the matrices from the data pipeline
-    println!("Building sparse matrices from data...");
-    let (x_mat, u_mat, t_mat, mappings) = build_matrices(&engagement_path, &metadata_path)
-        .map_err(|e| {
-            pyo3::exceptions::PyIOError::new_err(format!("Failed to build matrices: {}", e))
-        })?;
+    println!("--- [Rust] Starting Model Training ---");
+    let start_time = Instant::now();
+
+    // --- 1. Build Matrices ---
+    // This calls the data pipeline, which uses Polars to read files
+    // and `sprs` to build the matrices.
+    let (x_mat, u_mat, t_mat, mappings) =
+        match data_pipeline::build_matrices(
+            &interactions_path,
+            &user_features_path,
+            &item_features_path,
+        ) {
+            Ok(data) => data,
+            Err(e) => {
+                // Convert the Rust `anyhow::Error` into a Python `PyErr`
+                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                    e.to_string(),
+                ));
+            }
+        };
+    println!(
+        "[Rust] Matrix build complete in {:.2}s",
+        start_time.elapsed().as_secs_f32()
+    );
 
     let num_items = x_mat.cols();
     let num_user_features = u_mat.cols();
+    let num_item_features = t_mat.rows();
 
-    // 2. Train the model
-    println!("Training model...");
-    let mut model = RustFeaseModel::new(num_items, num_user_features);
-    model.train(&x_mat, &u_mat, &t_mat, alpha, beta, lambda_);
-    println!("Training complete.");
-
-    // 3. Create the reverse item mapping for predictions
-    let mut idx_to_item = HashMap::new();
-    for (guid, &idx) in &mappings.item_mapping {
-        idx_to_item.insert(idx, guid.clone());
-    }
-
-    // 4. Wrap and return the Python object
-    Ok(FeaseModel {
-        model,
-        mappings,
-        idx_to_item,
+    // --- 2. Train Model ---
+    let train_start = Instant::now();
+    let mut rust_model = RustFeaseModel::new(
+        num_items,
+        num_user_features,
+        num_item_features,
+        alpha,
         beta,
-    })
+        lambda_,
+        mappings,
+    );
+
+    // This is the main compute-heavy step
+    if let Err(e) = rust_model.train(&x_mat, &u_mat, &t_mat) {
+        return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+            e.to_string(),
+        ));
+    }
+    println!(
+        "[Rust] Core model training complete in {:.2}s",
+        train_start.elapsed().as_secs_f32()
+    );
+
+    // --- 3. Wrap in Python Class ---
+    let model = FeaseModel {
+        model: rust_model,
+        num_items,
+        num_user_features,
+        num_item_features,
+    };
+
+    println!(
+        "[Rust] Total training time: {:.2}s",
+        start_time.elapsed().as_secs_f32()
+    );
+
+    Ok(model)
 }
 
-/// A Python module implementing the FEASE recommender in Rust.
+/// Defines the Python module.
+/// This function is called when Python runs `import rust_fease_recommender`.
 #[pymodule]
-fn rust_fease_recommender(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn rust_fease_recommender(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(build_and_train, m)?)?;
     m.add_class::<FeaseModel>()?;
     Ok(())

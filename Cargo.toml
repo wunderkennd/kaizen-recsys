@@ -3,6 +3,9 @@ name = "rust_fease_recommender" # Changed name to be a valid Python module
 version = "0.1.0"
 edition = "2024"
 
+[build]
+target = "aarch64-unknown-linux-gnu"
+
 # Define as a Python library
 [lib]
 name = "rust_fease_recommender"

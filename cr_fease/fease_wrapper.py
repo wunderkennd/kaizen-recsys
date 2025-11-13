@@ -1,7 +1,7 @@
 # fease_wrapper.py (optional high-level API)
 import polars as pl
 import rust_fease_recommender as fease
-from schema import EngagementSchema, MetadataSchema
+from schemas import EngagementSchema, MetadataSchema
 
 def build_and_train_safe(
         engagement_path: str,
@@ -20,7 +20,7 @@ def build_and_train_safe(
         alpha: Item feature weight
         beta: User feature weight
         lambda_: L2 regularization
-        validate: If True, validates schema before passing to Rust
+        validate: If True, validates schemas before passing to Rust
 
     Returns:
         Trained FeaseModel

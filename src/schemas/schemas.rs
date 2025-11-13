@@ -1,4 +1,4 @@
-//! This file defines the Rust structs that correspond to your data schema.
+//! This file defines the Rust structs that correspond to your data schemas.
 //! These are primarily for type safety, documentation, and potential
 //! row-based deserialization.
 
@@ -338,6 +338,7 @@ pub struct AccountRecord {
     // ... other fields omitted for brevity ...
 }
 
+//noinspection ALL
 #[derive(Debug, Deserialize)]
 pub struct AccountProfile {
     pub profile_id: Option<String>,

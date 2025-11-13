@@ -1,0 +1,32 @@
+name: Build Python Wheel for Linux
+
+on:
+  push:
+    branches:
+      - main  # Or whichever branch you use
+  workflow_dispatch: # Allows you to run it manually
+
+jobs:
+  build-linux-wheel:
+    runs-on: ubuntu-latest # This is the x86_64 Linux VM
+
+    steps:
+    - name: Check out code
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.10' # Match your Databricks cluster's Python version
+
+    - name: Install maturin
+      run: pip install maturin
+
+    - name: Build the wheel
+      run: maturin build --release --out dist
+
+    - name: Upload wheel as artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: linux-wheel
+        path: dist/

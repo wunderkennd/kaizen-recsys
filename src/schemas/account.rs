@@ -1,5 +1,5 @@
 
-//! This file defines the Rust structs that correspond to your data schema.
+//! This file defines the Rust structs that correspond to your data schemas.
 //! These are primarily for type safety, documentation, and potential
 //! row-based deserialization.
 
