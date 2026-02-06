@@ -1,6 +1,3 @@
-I'll help you fix the formatting in the README.md document. Let me read the file first to see the current formatting issues.I can see the README.md file needs formatting improvements. Here are the issues I've identified and the fixes:
-
-```markdown
 # Rust FEASE Recommender
 (Python Library)
 
@@ -14,11 +11,12 @@ This model is similar to the EASE model but is augmented to handle the user cold
 The core idea is to augment the User-Item matrix (X) with a User-Feature matrix (U) and an Item-Feature matrix (T).
 
 We define a new, combined feature matrix Z:
-```
 
+```
 Z = [ X  | βU ]   (N x M) | (N x K)
 [ αT |  0  ]   (L x M) | (L x K)
 ```
+
 Where:
 - N = number of users
 - M = number of items
@@ -27,10 +25,11 @@ Where:
 - α, β = scalar weights for the features
 
 The model then learns a weight matrix S (size (M+K) x (M+K)) by solving the standard EASE objective:
-```
 
+```
 L(S) = ||Z - ZS||^2 + λ||S||^2
 ```
+
 This has a closed-form solution that depends on the Gram matrix G = Z^T * Z.
 
 ### Key to Memory Efficiency
@@ -38,8 +37,8 @@ This has a closed-form solution that depends on the Gram matrix G = Z^T * Z.
 This implementation's memory efficiency comes from never building the Z matrix, which could be enormous ((N+L) x (M+K)).
 
 Instead, we compute the (M+K) x (M+K) Gram matrix G in blocks, using sparse-sparse matrix multiplication on the inputs:
-```
 
+```
 G = Z^T * Z = [ G_11 | G_12 ]
 [ G_21 | G_22 ]
 ```
@@ -84,8 +83,7 @@ maturin build --release
 ### 3. Python Usage Example
 
 Once built, you can import and use the library directly in Python.
-```
-python
+```python
 import rust_fease_recommender as fease
 import time
 
