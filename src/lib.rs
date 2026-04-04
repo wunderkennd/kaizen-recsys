@@ -2,8 +2,6 @@
 //! It uses PyO3 to define the Python-callable functions and the `FeaseModel` class.
 //! This is the "bridge" between Python and Rust.
 
-use ahash::AHashMap;
-use anyhow::Result;
 use model::RustFeaseModel; // The internal Rust struct
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyFloat, PyList, PyString};
@@ -23,8 +21,6 @@ mod schemas;
 #[pyclass]
 struct FeaseModel {
     /// The internal Rust model, which holds the S-matrix and mappings.
-    /// `#[pyo3(get)]` requires `RustFeaseModel` to be `Clone`.
-    #[pyo3(get)]
     model: RustFeaseModel,
 
     /// Number of items the model was trained on.
@@ -57,7 +53,7 @@ impl FeaseModel {
     /// Returns:
     ///     list[tuple[str, float]]:
     ///         A list of (item_guid, score) tuples, sorted descending by score.
-    #[pyfn(signature = (interactions, features, top_k=100))]
+    #[pyo3(signature = (interactions, features, top_k=100))]
     fn predict<'py>(
         &self,
         py: Python<'py>,
@@ -66,7 +62,6 @@ impl FeaseModel {
         top_k: usize,
     ) -> PyResult<Bound<'py, PyList>> {
         // --- 1. Convert Python inputs to Rust vectors ---
-        // We use `with_capacity` for a small optimization.
         let mut user_interactions: Vec<(usize, f64)> =
             Vec::with_capacity(interactions.len());
         let mut user_features: Vec<(usize, f64)> =
@@ -95,14 +90,11 @@ impl FeaseModel {
         }
 
         // --- 2. Call the internal Rust prediction function ---
-        // This is the high-performance part.
         let scores: Vec<f64> = self
             .model
             .predict(&user_interactions, &user_features, self.model.beta);
 
         // --- 3. Process and sort results ---
-        // This part is a bit slow (O(M log M)) but fine for a single user.
-        // For batch prediction, this should be optimized.
         let mut results_with_idx: Vec<(usize, f64)> = scores
             .into_iter()
             .enumerate()
@@ -115,25 +107,80 @@ impl FeaseModel {
             .collect();
 
         // Sort by score, descending.
-        // We use `partial_cmp` because f64 is not `Ord`.
         results_with_idx.sort_by(|a, b| {
             b.1.partial_cmp(&a.1)
-                .unwrap_or(std::cmp::Ordering::Equal) // FIX: Corrected typo `std.cmp`
+                .unwrap_or(std::cmp::Ordering::Equal)
         });
 
         // --- 4. Convert top-K results back to Python types ---
-        // We use `new_bound` for `pyo3 = "0.21.0"`
-        let py_results = PyList::empty_bound(py);
+        let py_results = PyList::empty(py);
         for (idx, score) in results_with_idx.into_iter().take(top_k) {
             // Map item_idx back to item_guid
             if let Some(guid) = self.model.mappings.idx_to_item.get(idx) {
-                let py_guid = PyString::new_bound(py, guid);
-                let py_score = PyFloat::new_bound(py, score);
+                let py_guid = PyString::new(py, guid);
+                let py_score = PyFloat::new(py, score);
                 py_results.append((py_guid, py_score))?;
             }
         }
 
         Ok(py_results)
+    }
+
+    /// Predicts similar items for a given item (More-Like-This / MLT).
+    ///
+    /// Uses the item-item block of the S matrix to find the most similar items
+    /// to a given source item. This leverages the same learned weight matrix
+    /// used for user recommendations.
+    ///
+    /// Args:
+    ///     item_guid (str): The item GUID to find similar items for.
+    ///     top_k (int): The number of similar items to return.
+    ///
+    /// Returns:
+    ///     list[tuple[str, float]]:
+    ///         A list of (item_guid, score) tuples, sorted descending by similarity.
+    ///         Returns an empty list if the item_guid is unknown.
+    #[pyo3(signature = (item_guid, top_k=20))]
+    fn predict_similar_items<'py>(
+        &self,
+        py: Python<'py>,
+        item_guid: &str,
+        top_k: usize,
+    ) -> PyResult<Bound<'py, PyList>> {
+        let py_results = PyList::empty(py);
+
+        // Look up item index
+        let item_idx = match self.model.mappings.item_to_idx.get(item_guid) {
+            Some(&idx) => idx,
+            None => return Ok(py_results), // Unknown item → empty list
+        };
+
+        let similar = self.model.predict_similar_items(item_idx, top_k);
+
+        for (idx, score) in similar {
+            if let Some(guid) = self.model.mappings.idx_to_item.get(idx) {
+                let py_guid = PyString::new(py, guid);
+                let py_score = PyFloat::new(py, score);
+                py_results.append((py_guid, py_score))?;
+            }
+        }
+
+        Ok(py_results)
+    }
+
+    /// Validates the trained model, checking for common issues.
+    ///
+    /// Returns:
+    ///     tuple[bool, list[str]]:
+    ///         A tuple of (passed, messages) where passed is True if all checks
+    ///         passed and messages is a list of diagnostic strings.
+    fn validate<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<(bool, Bound<'py, PyList>)> {
+        let report = self.model.validate();
+        let py_messages = PyList::new(py, &report.messages)?;
+        Ok((report.passed, py_messages))
     }
 }
 
@@ -152,13 +199,17 @@ impl FeaseModel {
 ///     alpha (float): Weight for item features.
 ///     beta (float): Weight for user features.
 ///     lambda_ (float): L2 regularization term.
+///     meta_weight (float): Weight for metadata rows in the Gram matrix.
+///         When 0 or 1, metadata is weighted equally with interactions.
+///         Values > 1 increase metadata influence; values < 1 decrease it.
 #[pyfunction(signature = (
     interactions_path,
     user_features_path,
     item_features_path,
     alpha = 1.0,
     beta = 1.0,
-    lambda_ = 100.0
+    lambda_ = 100.0,
+    meta_weight = 0.0
 ))]
 fn build_and_train(
     interactions_path: String,
@@ -167,13 +218,12 @@ fn build_and_train(
     alpha: f64,
     beta: f64,
     lambda_: f64,
+    meta_weight: f64,
 ) -> PyResult<FeaseModel> {
     println!("--- [Rust] Starting Model Training ---");
     let start_time = Instant::now();
 
     // --- 1. Build Matrices ---
-    // This calls the data pipeline, which uses Polars to read files
-    // and `sprs` to build the matrices.
     let (x_mat, u_mat, t_mat, mappings) =
         match data_pipeline::build_matrices(
             &interactions_path,
@@ -182,7 +232,6 @@ fn build_and_train(
         ) {
             Ok(data) => data,
             Err(e) => {
-                // Convert the Rust `anyhow::Error` into a Python `PyErr`
                 return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
                     e.to_string(),
                 ));
@@ -206,6 +255,7 @@ fn build_and_train(
         alpha,
         beta,
         lambda_,
+        meta_weight,
         mappings,
     );
 
@@ -220,7 +270,20 @@ fn build_and_train(
         train_start.elapsed().as_secs_f32()
     );
 
-    // --- 3. Wrap in Python Class ---
+    // --- 3. Validate Model ---
+    let report = rust_model.validate();
+    if !report.passed {
+        let msg = format!(
+            "Model validation failed:\n{}",
+            report.messages.join("\n")
+        );
+        return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(msg));
+    }
+    for msg in &report.messages {
+        println!("[Rust] Validation: {}", msg);
+    }
+
+    // --- 4. Wrap in Python Class ---
     let model = FeaseModel {
         model: rust_model,
         num_items,
@@ -239,7 +302,7 @@ fn build_and_train(
 /// Defines the Python module.
 /// This function is called when Python runs `import rust_fease_recommender`.
 #[pymodule]
-fn rust_fease_recommender(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn rust_fease_recommender(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(build_and_train, m)?)?;
     m.add_class::<FeaseModel>()?;
     Ok(())
