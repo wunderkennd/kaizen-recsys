@@ -3,9 +3,6 @@ name = "rust_fease_recommender" # Changed name to be a valid Python module
 version = "0.1.0"
 edition = "2024"
 
-[build]
-target = "aarch64-unknown-linux-gnu"
-
 # Define as a Python library
 [lib]
 name = "rust_fease_recommender"
@@ -15,6 +12,7 @@ crate-type = ["cdylib"]
 ahash = "0.8.12"
 anyhow = "1.0.100"
 nalgebra = { version = "0.34.1", features = ["serde-serialize"] }
+log = "0.4"
 polars = { version = "0.52.0", features = ["csv", "dtype-full", "lazy", "parquet", "timezones"] }
 pyo3 = { version = "0.27.1", features = ["extension-module"] }
 serde = { version = "1.0.228", features = ["derive"] }

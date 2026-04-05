@@ -2696,6 +2696,7 @@ version = "0.1.0"
 dependencies = [
  "ahash",
  "anyhow",
+ "log",
  "nalgebra",
  "polars",
  "pyo3",

@@ -12,7 +12,8 @@ use std::path::Path;
 
 /// A struct to hold all the string-to-index mappings
 /// required for training and prediction.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct Mappings {
     pub user_to_idx: AHashMap<String, usize>,
     pub idx_to_user: Vec<String>,
