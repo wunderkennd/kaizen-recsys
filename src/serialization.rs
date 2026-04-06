@@ -103,6 +103,16 @@ impl SerializedModel {
                 self.s_data.len(), self.s_nrows, self.s_ncols, expected_len
             );
         }
+
+        // Verify S matrix dimensions are consistent with model parameters
+        let expected_dim = self.num_items + self.num_user_features;
+        if self.s_nrows != expected_dim || self.s_ncols != expected_dim {
+            anyhow::bail!(
+                "S matrix dimensions {}x{} don't match num_items ({}) + num_user_features ({}) = {}",
+                self.s_nrows, self.s_ncols, self.num_items, self.num_user_features, expected_dim
+            );
+        }
+
         let s_matrix = DMatrix::from_vec(self.s_nrows, self.s_ncols, self.s_data);
 
         let mappings = Mappings {
