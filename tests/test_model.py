@@ -366,3 +366,118 @@ def test_backward_compat(weighting_data):
     for (g1, s1), (g2, s2) in zip(recs1, recs2):
         assert g1 == g2
         assert abs(s1 - s2) < 1e-10
+
+
+# --- FeaseRegistry Tests ---
+
+@pytest.fixture(scope="session")
+def two_territory_models(weighting_data):
+    """Trains two separate models with different params to simulate different territories."""
+    i_path, u_path, t_path = weighting_data
+
+    model_us = fease.build_and_train(
+        i_path, u_path, t_path,
+        alpha=1.0, beta=1.0, lambda_=10.0,
+    )
+    model_br = fease.build_and_train(
+        i_path, u_path, t_path,
+        alpha=1.0, beta=1.0, lambda_=50.0,  # different lambda
+    )
+    return model_us, model_br
+
+
+def test_registry_basic(two_territory_models):
+    """Create registry, register 2 models for different territories, verify predict works."""
+    model_us, model_br = two_territory_models
+
+    registry = fease.FeaseRegistry()
+    assert len(registry) == 0
+
+    registry.register("US", model_us)
+    registry.register("BR", model_br)
+
+    assert len(registry) == 2
+    territories = registry.territories()
+    assert "US" in territories
+    assert "BR" in territories
+
+    # Predict in each territory using index-based API
+    scores_us = registry.predict("US", [(0, 1.0)])
+    scores_br = registry.predict("BR", [(0, 1.0)])
+
+    assert len(scores_us) == model_us.num_items
+    assert len(scores_br) == model_br.num_items
+
+    # Different lambda should produce different scores
+    assert scores_us != scores_br
+
+
+def test_registry_fallback(two_territory_models):
+    """Create with fallback, verify unknown territory falls back."""
+    model_us, model_br = two_territory_models
+
+    registry = fease.FeaseRegistry(fallback_territory="US")
+    registry.register("US", model_us)
+    registry.register("BR", model_br)
+
+    # Known territory works
+    scores_us = registry.predict("US", [(0, 1.0)])
+    assert len(scores_us) == model_us.num_items
+
+    # Unknown territory "JP" falls back to "US"
+    scores_jp = registry.predict("JP", [(0, 1.0)])
+    assert len(scores_jp) == model_us.num_items
+
+    # Fallback scores should exactly match US scores
+    for a, b in zip(scores_us, scores_jp):
+        assert abs(a - b) < 1e-12
+
+
+def test_registry_predict_unknown_territory_error(two_territory_models):
+    """No fallback, unknown territory raises error."""
+    model_us, _ = two_territory_models
+
+    registry = fease.FeaseRegistry()  # No fallback
+    registry.register("US", model_us)
+
+    with pytest.raises(ValueError, match="No model registered for territory 'JP'"):
+        registry.predict("JP", [(0, 1.0)])
+
+
+def test_registry_predict_top_k(two_territory_models):
+    """Tests predict_top_k on registry, verifying exclusion and ordering."""
+    model_us, _ = two_territory_models
+
+    registry = fease.FeaseRegistry()
+    registry.register("US", model_us)
+
+    # User interacted with item 0, ask for top 2
+    top_recs = registry.predict_top_k("US", [(0, 1.0)], top_k=2)
+
+    assert len(top_recs) <= 2
+    # Item 0 should be excluded (user already interacted)
+    for idx, _ in top_recs:
+        assert idx != 0
+    # Results should be sorted descending by score
+    if len(top_recs) >= 2:
+        assert top_recs[0][1] >= top_recs[1][1]
+
+
+def test_registry_predict_similar_items(two_territory_models):
+    """Tests predict_similar_items on registry."""
+    model_us, _ = two_territory_models
+
+    registry = fease.FeaseRegistry()
+    registry.register("US", model_us)
+
+    similar = registry.predict_similar_items("US", 0, top_k=2)
+    assert len(similar) <= 2
+    # Should not contain item 0 itself
+    for idx, _ in similar:
+        assert idx != 0
+
+
+def test_registry_bool():
+    """Tests __bool__ — empty registry is falsy, non-empty is truthy."""
+    registry = fease.FeaseRegistry()
+    assert not registry  # empty -> falsy

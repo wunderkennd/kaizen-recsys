@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! Serving module for territory-aware multi-model support and batch predictions.
 //!
 //! Ports the Python `RFYTerritoryGroupServing` pattern: maintain a dictionary of
@@ -136,6 +135,7 @@ pub struct UserInput {
 /// in the future.
 ///
 /// Returns a Vec of score vectors, one per user, in the same order as `users`.
+#[allow(dead_code)]
 pub fn predict_batch(model: &RustFeaseModel, users: &[UserInput]) -> Vec<Vec<f64>> {
     log::info!("Batch prediction for {} users", users.len());
 
