@@ -288,6 +288,19 @@ fn load_model(path: String) -> PyResult<FeaseModel> {
         PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string())
     })?;
 
+    // Validate loaded model (same as build_and_train does after training)
+    let report = model.validate();
+    if !report.passed {
+        let msg = format!(
+            "Loaded model failed validation:\n{}",
+            report.messages.join("\n")
+        );
+        return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(msg));
+    }
+    for msg in &report.messages {
+        log::info!("[Rust] Loaded model validation: {}", msg);
+    }
+
     Ok(FeaseModel {
         num_items: model.num_items,
         num_user_features: model.num_user_features,
