@@ -10,9 +10,9 @@ use crate::model::RustFeaseModel;
 use ahash::AHashMap;
 use anyhow::{Result, anyhow};
 use polars::prelude::*;
-use rand::seq::SliceRandom;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
+use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs::File;
@@ -307,11 +307,12 @@ pub fn evaluate_model(
     let train_df = read_interactions_df(train_interactions_path)?;
 
     // Load user features if provided
-    let user_features_map: AHashMap<String, Vec<(usize, f64)>> = if let Some(uf_path) = user_features_path {
-        build_user_features_map(uf_path, &model.mappings)?
-    } else {
-        AHashMap::new()
-    };
+    let user_features_map: AHashMap<String, Vec<(usize, f64)>> =
+        if let Some(uf_path) = user_features_path {
+            build_user_features_map(uf_path, &model.mappings)?
+        } else {
+            AHashMap::new()
+        };
 
     // Build per-user ground truth from test set: user_id -> set of item indices
     let test_user_col = test_df.column("user_id")?.str()?;
@@ -340,8 +341,7 @@ pub fn evaluate_model(
             train_user_col.get(i),
             train_item_col.get(i),
             train_val_col.get(i),
-        )
-            && let Some(&item_idx) = model.mappings.item_to_idx.get(iid)
+        ) && let Some(&item_idx) = model.mappings.item_to_idx.get(iid)
         {
             train_user_interactions
                 .entry(uid.to_string())
@@ -402,7 +402,10 @@ pub fn evaluate_model(
             sum_precision[ki] += metrics::precision_at_k(&recommended, relevant_items, k);
             sum_recall[ki] += metrics::recall_at_k(&recommended, relevant_items, k);
             sum_ndcg[ki] += metrics::ndcg_at_k(&recommended, relevant_items, k);
-            sum_map[ki] += metrics::mean_average_precision(&recommended[..k.min(recommended.len())], relevant_items);
+            sum_map[ki] += metrics::mean_average_precision(
+                &recommended[..k.min(recommended.len())],
+                relevant_items,
+            );
             sum_hit_rate[ki] += metrics::hit_rate_at_k(&recommended, relevant_items, k);
         }
 
@@ -622,7 +625,10 @@ mod tests {
         // u2 has 3 interactions (>=k+1=3), should have exactly 2 in test
         // u3 has 5 interactions (>=k+1=3), should have exactly 2 in test
         for (_uid, count) in &user_test_counts {
-            assert_eq!(*count, k, "Each eligible user should have exactly k test items");
+            assert_eq!(
+                *count, k,
+                "Each eligible user should have exactly k test items"
+            );
         }
 
         Ok(())

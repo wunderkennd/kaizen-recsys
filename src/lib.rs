@@ -457,9 +457,20 @@ fn random_split(
     test_ratio: f64,
     seed: u64,
 ) -> PyResult<(usize, usize, usize, usize)> {
-    let stats = evaluation::random_split(interactions_path, train_output, test_output, test_ratio, seed)
-        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
-    Ok((stats.train_interactions, stats.test_interactions, stats.train_users, stats.test_users))
+    let stats = evaluation::random_split(
+        interactions_path,
+        train_output,
+        test_output,
+        test_ratio,
+        seed,
+    )
+    .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+    Ok((
+        stats.train_interactions,
+        stats.test_interactions,
+        stats.train_users,
+        stats.test_users,
+    ))
 }
 
 /// Splits interaction data by time: recent interactions (days_ago <= cutoff) go to test.
@@ -480,9 +491,19 @@ fn temporal_split(
     test_output: &str,
     days_ago_cutoff: f64,
 ) -> PyResult<(usize, usize, usize, usize)> {
-    let stats = evaluation::temporal_split(interactions_path, train_output, test_output, days_ago_cutoff)
-        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
-    Ok((stats.train_interactions, stats.test_interactions, stats.train_users, stats.test_users))
+    let stats = evaluation::temporal_split(
+        interactions_path,
+        train_output,
+        test_output,
+        days_ago_cutoff,
+    )
+    .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+    Ok((
+        stats.train_interactions,
+        stats.test_interactions,
+        stats.train_users,
+        stats.test_users,
+    ))
 }
 
 /// Leave-K-Out split: holds out exactly k random interactions per user for test.
@@ -507,9 +528,15 @@ fn leave_k_out_split(
     k: usize,
     seed: u64,
 ) -> PyResult<(usize, usize, usize, usize)> {
-    let stats = evaluation::leave_k_out_split(interactions_path, train_output, test_output, k, seed)
-        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
-    Ok((stats.train_interactions, stats.test_interactions, stats.train_users, stats.test_users))
+    let stats =
+        evaluation::leave_k_out_split(interactions_path, train_output, test_output, k, seed)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+    Ok((
+        stats.train_interactions,
+        stats.test_interactions,
+        stats.train_users,
+        stats.test_users,
+    ))
 }
 
 /// A Python-callable function to build and train the model from file paths.

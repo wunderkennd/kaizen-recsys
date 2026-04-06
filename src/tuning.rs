@@ -10,9 +10,9 @@ use crate::weighting::WeightingConfig;
 use ahash::AHashMap;
 use anyhow::{Result, anyhow};
 use polars::prelude::*;
-use rand::seq::SliceRandom;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
+use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::path::Path;
@@ -92,11 +92,7 @@ fn ndcg_at_k(recommended: &[usize], relevant: &ahash::AHashSet<usize>, k: usize)
         idcg += 1.0 / (i as f64 + 2.0).log2();
     }
 
-    if idcg == 0.0 {
-        0.0
-    } else {
-        dcg / idcg
-    }
+    if idcg == 0.0 { 0.0 } else { dcg / idcg }
 }
 
 // ---------------------------------------------------------------------------
@@ -185,8 +181,7 @@ fn generate_kfold_splits(
 
     for (fold_idx, fold_users) in folds.iter().enumerate() {
         // Test users = fold_idx group; train users = everyone else
-        let test_users: ahash::AHashSet<&str> =
-            fold_users.iter().map(|s| s.as_str()).collect();
+        let test_users: ahash::AHashSet<&str> = fold_users.iter().map(|s| s.as_str()).collect();
 
         // Build boolean mask for train/test
         let user_col = df.column("user_id")?.str()?;
@@ -246,19 +241,17 @@ fn evaluate_trial(
     eval_k: usize,
 ) -> Result<f64> {
     // 1. Build WeightingConfig from params
-    let weighting = if params.decay_rate > 0.0
-        || params.ips_alpha > 0.0
-        || params.sparsity_threshold > 0.0
-    {
-        Some(WeightingConfig {
-            event_weights: None,
-            decay_rate: params.decay_rate,
-            ips_alpha: params.ips_alpha,
-            sparsity_threshold: params.sparsity_threshold,
-        })
-    } else {
-        None
-    };
+    let weighting =
+        if params.decay_rate > 0.0 || params.ips_alpha > 0.0 || params.sparsity_threshold > 0.0 {
+            Some(WeightingConfig {
+                event_weights: None,
+                decay_rate: params.decay_rate,
+                ips_alpha: params.ips_alpha,
+                sparsity_threshold: params.sparsity_threshold,
+            })
+        } else {
+            None
+        };
 
     // 2. Build matrices from training data
     let (x_mat, u_mat, t_mat, mappings) = data_pipeline::build_matrices(
@@ -311,16 +304,12 @@ fn evaluate_trial(
         }
 
         // Get the user's training interactions (may be empty for cold-start users)
-        let train_items: Vec<(usize, f64)> = train_user_items
-            .get(user_id)
-            .cloned()
-            .unwrap_or_default();
+        let train_items: Vec<(usize, f64)> =
+            train_user_items.get(user_id).cloned().unwrap_or_default();
 
         // Get user features
-        let user_feats: Vec<(usize, f64)> = user_features_map
-            .get(user_id)
-            .cloned()
-            .unwrap_or_default();
+        let user_feats: Vec<(usize, f64)> =
+            user_features_map.get(user_id).cloned().unwrap_or_default();
 
         // Predict scores for all items
         let scores = model.predict(&train_items, &user_feats, params.beta);
@@ -340,8 +329,7 @@ fn evaluate_trial(
         let recommended: Vec<usize> = ranked.iter().map(|(idx, _)| *idx).collect();
 
         // Relevant items = test items for this user
-        let relevant: ahash::AHashSet<usize> =
-            test_items.iter().map(|(idx, _)| *idx).collect();
+        let relevant: ahash::AHashSet<usize> = test_items.iter().map(|(idx, _)| *idx).collect();
 
         ndcg_sum += ndcg_at_k(&recommended, &relevant, eval_k);
         n_users += 1;
@@ -373,7 +361,11 @@ pub fn grid_search(
     if total == 0 {
         return Err(anyhow!("Parameter grid produced 0 combinations"));
     }
-    log::info!("Grid search: {} parameter combinations, {}-fold CV", total, n_folds);
+    log::info!(
+        "Grid search: {} parameter combinations, {}-fold CV",
+        total,
+        n_folds
+    );
 
     // Generate k-fold splits once
     let (_tmp_dir, fold_paths) = generate_kfold_splits(interactions_path, n_folds, seed)?;
@@ -449,11 +441,7 @@ pub fn random_search(
     if n_trials == 0 {
         return Err(anyhow!("n_trials must be >= 1"));
     }
-    log::info!(
-        "Random search: {} trials, {}-fold CV",
-        n_trials,
-        n_folds
-    );
+    log::info!("Random search: {} trials, {}-fold CV", n_trials, n_folds);
 
     // Generate k-fold splits once
     let (_tmp_dir, fold_paths) = generate_kfold_splits(interactions_path, n_folds, seed)?;
@@ -669,10 +657,7 @@ mod tests {
         assert_eq!(combos.len(), 8);
 
         // Verify all values appear
-        let alphas: ahash::AHashSet<u64> = combos
-            .iter()
-            .map(|p| p.alpha.to_bits())
-            .collect();
+        let alphas: ahash::AHashSet<u64> = combos.iter().map(|p| p.alpha.to_bits()).collect();
         assert!(alphas.contains(&0.5_f64.to_bits()));
         assert!(alphas.contains(&1.0_f64.to_bits()));
     }
