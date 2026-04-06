@@ -264,16 +264,15 @@ pub fn load_model(path: &Path) -> Result<RustFeaseModel> {
     }
 
     let payload = &data[MAGIC.len()..];
-    let serialized: SerializedModel =
-        match bincode::deserialize::<SerializedModel>(payload) {
-            Ok(s) => s,
-            Err(_) => {
-                let v1: SerializedModelV1 = bincode::deserialize(payload)
-                    .context("Failed to deserialize model data (tried v2 and v1 formats)")?;
-                log::info!("Loaded v1 model file, migrating to v2 format");
-                v1.into_v2()
-            }
-        };
+    let serialized: SerializedModel = match bincode::deserialize::<SerializedModel>(payload) {
+        Ok(s) => s,
+        Err(_) => {
+            let v1: SerializedModelV1 = bincode::deserialize(payload)
+                .context("Failed to deserialize model data (tried v2 and v1 formats)")?;
+            log::info!("Loaded v1 model file, migrating to v2 format");
+            v1.into_v2()
+        }
+    };
 
     let model = serialized.into_model()?;
 
@@ -492,7 +491,9 @@ mod tests {
 
         let loaded = load_model(path).expect("Failed to load model");
 
-        let wc = loaded.weighting_config.expect("weighting_config should be Some");
+        let wc = loaded
+            .weighting_config
+            .expect("weighting_config should be Some");
         assert!((wc.decay_rate - 0.01).abs() < 1e-12);
         assert!((wc.ips_alpha - 0.5).abs() < 1e-12);
         assert!((wc.sparsity_threshold - 1e-4).abs() < 1e-12);
@@ -521,13 +522,33 @@ mod tests {
             beta: model.beta,
             lambda_: model.lambda_,
             meta_weight: model.meta_weight,
-            user_to_idx: model.mappings.user_to_idx.iter().map(|(k, v)| (k.clone(), *v)).collect(),
+            user_to_idx: model
+                .mappings
+                .user_to_idx
+                .iter()
+                .map(|(k, v)| (k.clone(), *v))
+                .collect(),
             idx_to_user: model.mappings.idx_to_user.clone(),
-            item_to_idx: model.mappings.item_to_idx.iter().map(|(k, v)| (k.clone(), *v)).collect(),
+            item_to_idx: model
+                .mappings
+                .item_to_idx
+                .iter()
+                .map(|(k, v)| (k.clone(), *v))
+                .collect(),
             idx_to_item: model.mappings.idx_to_item.clone(),
-            user_feature_to_idx: model.mappings.user_feature_to_idx.iter().map(|(k, v)| (k.clone(), *v)).collect(),
+            user_feature_to_idx: model
+                .mappings
+                .user_feature_to_idx
+                .iter()
+                .map(|(k, v)| (k.clone(), *v))
+                .collect(),
             idx_to_user_feature: model.mappings.idx_to_user_feature.clone(),
-            item_feature_to_idx: model.mappings.item_feature_to_idx.iter().map(|(k, v)| (k.clone(), *v)).collect(),
+            item_feature_to_idx: model
+                .mappings
+                .item_feature_to_idx
+                .iter()
+                .map(|(k, v)| (k.clone(), *v))
+                .collect(),
             idx_to_item_feature: model.mappings.idx_to_item_feature.clone(),
         };
         let encoded = bincode::serialize(&v1).expect("Failed to serialize v1");

@@ -579,4 +579,3 @@ def test_hit_rate_at_k():
     # Hit outside k
     assert abs(fease.hit_rate_at_k([10, 20, 30, 40], {40}, 2) - 0.0) < 1e-10
     assert abs(fease.hit_rate_at_k([10, 20, 30, 40], {40}, 4) - 1.0) < 1e-10
->>>>>>> 623132e (feat: add ranking evaluation metrics (precision, NDCG, recall, MAP, coverage))

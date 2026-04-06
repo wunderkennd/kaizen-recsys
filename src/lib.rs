@@ -612,7 +612,11 @@ impl FeaseRegistry {
     /// Returns:
     ///     list[str]: Territory keys in arbitrary order.
     fn territories(&self) -> Vec<String> {
-        self.inner.territories().into_iter().map(|s| s.to_string()).collect()
+        self.inner
+            .territories()
+            .into_iter()
+            .map(|s| s.to_string())
+            .collect()
     }
 
     /// Returns the number of registered models.
@@ -675,15 +679,12 @@ impl FeaseRegistry {
         user_features: Option<Vec<(usize, f64)>>,
     ) -> PyResult<Vec<(usize, f64)>> {
         let features = user_features.unwrap_or_default();
-        let model = self
-            .inner
-            .get_model(territory)
-            .ok_or_else(|| {
-                PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-                    "No model registered for territory '{}'",
-                    territory
-                ))
-            })?;
+        let model = self.inner.get_model(territory).ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                "No model registered for territory '{}'",
+                territory
+            ))
+        })?;
 
         let scores = model.predict(&user_interactions, &features, model.beta);
 
