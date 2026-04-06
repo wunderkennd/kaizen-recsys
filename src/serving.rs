@@ -223,6 +223,7 @@ mod tests {
             lambda_: 100.0,
             meta_weight: 0.0,
             mappings: dummy_mappings(),
+            weighting_config: None,
         }
     }
 

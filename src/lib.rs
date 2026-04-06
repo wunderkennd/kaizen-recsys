@@ -515,6 +515,8 @@ fn build_and_train(
         train_start.elapsed().as_secs_f32()
     );
 
+    rust_model.weighting_config = weighting_config;
+
     // --- 2b. Apply sparsity pruning ---
     if sparsity_threshold > 0.0 {
         rust_model.prune_sparse(sparsity_threshold);

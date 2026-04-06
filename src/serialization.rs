@@ -6,6 +6,7 @@
 
 use crate::data_pipeline::Mappings;
 use crate::model::RustFeaseModel;
+use crate::weighting::WeightingConfig;
 use anyhow::{Context, Result};
 use nalgebra::DMatrix;
 use serde::{Deserialize, Serialize};
@@ -14,10 +15,62 @@ use std::path::Path;
 
 /// Current version of the serialization format.
 /// Increment when making breaking changes to `SerializedModel`.
-const FORMAT_VERSION: u32 = 1;
+const FORMAT_VERSION: u32 = 2;
 
 /// Magic bytes to identify FEASE model files.
 const MAGIC: &[u8; 4] = b"FEAS";
+
+/// V1 serialization format (without weighting_config).
+/// Used for backward-compatible loading of models saved before v2.
+#[derive(Serialize, Deserialize)]
+struct SerializedModelV1 {
+    version: u32,
+    s_nrows: usize,
+    s_ncols: usize,
+    s_data: Vec<f64>,
+    num_items: usize,
+    num_user_features: usize,
+    num_item_features: usize,
+    alpha: f64,
+    beta: f64,
+    lambda_: f64,
+    meta_weight: f64,
+    user_to_idx: Vec<(String, usize)>,
+    idx_to_user: Vec<String>,
+    item_to_idx: Vec<(String, usize)>,
+    idx_to_item: Vec<String>,
+    user_feature_to_idx: Vec<(String, usize)>,
+    idx_to_user_feature: Vec<String>,
+    item_feature_to_idx: Vec<(String, usize)>,
+    idx_to_item_feature: Vec<String>,
+}
+
+impl SerializedModelV1 {
+    fn into_v2(self) -> SerializedModel {
+        SerializedModel {
+            version: self.version,
+            s_nrows: self.s_nrows,
+            s_ncols: self.s_ncols,
+            s_data: self.s_data,
+            num_items: self.num_items,
+            num_user_features: self.num_user_features,
+            num_item_features: self.num_item_features,
+            alpha: self.alpha,
+            beta: self.beta,
+            lambda_: self.lambda_,
+            meta_weight: self.meta_weight,
+            user_to_idx: self.user_to_idx,
+            idx_to_user: self.idx_to_user,
+            item_to_idx: self.item_to_idx,
+            idx_to_item: self.idx_to_item,
+            user_feature_to_idx: self.user_feature_to_idx,
+            idx_to_user_feature: self.idx_to_user_feature,
+            item_feature_to_idx: self.item_feature_to_idx,
+            idx_to_item_feature: self.idx_to_item_feature,
+            weighting_config: None,
+        }
+    }
+}
 
 /// Serializable representation of a trained FEASE model.
 ///
@@ -50,6 +103,8 @@ struct SerializedModel {
     idx_to_user_feature: Vec<String>,
     item_feature_to_idx: Vec<(String, usize)>,
     idx_to_item_feature: Vec<String>,
+    /// Weighting configuration used during training (added in v2).
+    weighting_config: Option<WeightingConfig>,
 }
 
 impl SerializedModel {
@@ -94,13 +149,14 @@ impl SerializedModel {
                 .map(|(k, v)| (k.clone(), *v))
                 .collect(),
             idx_to_item_feature: model.mappings.idx_to_item_feature.clone(),
+            weighting_config: model.weighting_config.clone(),
         }
     }
 
     fn into_model(self) -> Result<RustFeaseModel> {
-        if self.version != FORMAT_VERSION {
+        if self.version != FORMAT_VERSION && self.version != 1 {
             anyhow::bail!(
-                "Unsupported model format version: {} (expected {})",
+                "Unsupported model format version: {} (expected {} or 1)",
                 self.version,
                 FORMAT_VERSION
             );
@@ -143,6 +199,12 @@ impl SerializedModel {
             idx_to_item_feature: self.idx_to_item_feature,
         };
 
+        let weighting_config = if self.version >= 2 {
+            self.weighting_config
+        } else {
+            None
+        };
+
         Ok(RustFeaseModel {
             s_matrix,
             num_items: self.num_items,
@@ -153,6 +215,7 @@ impl SerializedModel {
             lambda_: self.lambda_,
             meta_weight: self.meta_weight,
             mappings,
+            weighting_config,
         })
     }
 }
@@ -200,8 +263,17 @@ pub fn load_model(path: &Path) -> Result<RustFeaseModel> {
         );
     }
 
+    let payload = &data[MAGIC.len()..];
     let serialized: SerializedModel =
-        bincode::deserialize(&data[MAGIC.len()..]).context("Failed to deserialize model data")?;
+        match bincode::deserialize::<SerializedModel>(payload) {
+            Ok(s) => s,
+            Err(_) => {
+                let v1: SerializedModelV1 = bincode::deserialize(payload)
+                    .context("Failed to deserialize model data (tried v2 and v1 formats)")?;
+                log::info!("Loaded v1 model file, migrating to v2 format");
+                v1.into_v2()
+            }
+        };
 
     let model = serialized.into_model()?;
 
@@ -267,6 +339,7 @@ mod tests {
                 item_feature_to_idx: AHashMap::new(),
                 idx_to_item_feature: vec![],
             },
+            weighting_config: None,
         }
     }
 
@@ -397,6 +470,78 @@ mod tests {
 
         let result = load_model(path);
         assert!(result.is_err(), "Should fail on corrupted model file");
+
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn test_weighting_config_roundtrip() {
+        let mut model = make_test_model();
+        let mut event_weights = std::collections::HashMap::new();
+        event_weights.insert("click".to_string(), 1.0);
+        event_weights.insert("purchase".to_string(), 5.0);
+        model.weighting_config = Some(WeightingConfig {
+            event_weights: Some(event_weights),
+            decay_rate: 0.01,
+            ips_alpha: 0.5,
+            sparsity_threshold: 1e-4,
+        });
+
+        let path = Path::new("./test_weighting_roundtrip.fease");
+        save_model(&model, path).expect("Failed to save model");
+
+        let loaded = load_model(path).expect("Failed to load model");
+
+        let wc = loaded.weighting_config.expect("weighting_config should be Some");
+        assert!((wc.decay_rate - 0.01).abs() < 1e-12);
+        assert!((wc.ips_alpha - 0.5).abs() < 1e-12);
+        assert!((wc.sparsity_threshold - 1e-4).abs() < 1e-12);
+        let ew = wc.event_weights.expect("event_weights should be Some");
+        assert_eq!(ew.get("click"), Some(&1.0));
+        assert_eq!(ew.get("purchase"), Some(&5.0));
+        assert_eq!(ew.len(), 2);
+
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn test_v1_migration_loads_with_none_weighting() {
+        let model = make_test_model();
+
+        // Manually serialize using the V1 format (no weighting_config field)
+        let v1 = SerializedModelV1 {
+            version: 1,
+            s_nrows: model.s_matrix.nrows(),
+            s_ncols: model.s_matrix.ncols(),
+            s_data: model.s_matrix.as_slice().to_vec(),
+            num_items: model.num_items,
+            num_user_features: model.num_user_features,
+            num_item_features: model.num_item_features,
+            alpha: model.alpha,
+            beta: model.beta,
+            lambda_: model.lambda_,
+            meta_weight: model.meta_weight,
+            user_to_idx: model.mappings.user_to_idx.iter().map(|(k, v)| (k.clone(), *v)).collect(),
+            idx_to_user: model.mappings.idx_to_user.clone(),
+            item_to_idx: model.mappings.item_to_idx.iter().map(|(k, v)| (k.clone(), *v)).collect(),
+            idx_to_item: model.mappings.idx_to_item.clone(),
+            user_feature_to_idx: model.mappings.user_feature_to_idx.iter().map(|(k, v)| (k.clone(), *v)).collect(),
+            idx_to_user_feature: model.mappings.idx_to_user_feature.clone(),
+            item_feature_to_idx: model.mappings.item_feature_to_idx.iter().map(|(k, v)| (k.clone(), *v)).collect(),
+            idx_to_item_feature: model.mappings.idx_to_item_feature.clone(),
+        };
+        let encoded = bincode::serialize(&v1).expect("Failed to serialize v1");
+
+        let path = Path::new("./test_v1_migration.fease");
+        let mut data = Vec::with_capacity(MAGIC.len() + encoded.len());
+        data.extend_from_slice(MAGIC);
+        data.extend(encoded);
+        fs::write(path, &data).expect("Failed to write v1 file");
+
+        let loaded = load_model(path).expect("Failed to load v1 model");
+        assert!(loaded.weighting_config.is_none());
+        assert_eq!(loaded.num_items, model.num_items);
+        assert_eq!(loaded.num_user_features, model.num_user_features);
 
         std::fs::remove_file(path).ok();
     }
