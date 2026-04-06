@@ -159,6 +159,7 @@ fn generate_kfold_splits(
         .collect::<ahash::AHashSet<String>>()
         .into_iter()
         .collect();
+    unique_users.sort();
 
     // Deterministic shuffle
     let mut rng = StdRng::seed_from_u64(seed);
