@@ -54,7 +54,7 @@ pub fn ndcg_at_k(recommended: &[usize], relevant: &HashSet<usize>, k: usize) -> 
         .take(k)
         .enumerate()
         .filter(|(_, item)| relevant.contains(item))
-        .map(|(rank, _)| 1.0 / ((rank as f64) + 2.0).log2()) // rank+1 is 1-based, +1 more for log2(rank+1)
+        .map(|(rank, _)| 1.0 / ((rank as f64) + 2.0).log2()) // 0-based rank r → 1-based position r+1 → discount 1/log2(r+2)
         .sum();
 
     // IDCG@K: best possible DCG with min(|relevant|, k) hits at the top

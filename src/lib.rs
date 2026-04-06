@@ -98,15 +98,15 @@ impl FeaseModel {
                 .predict(&user_interactions, &user_features, self.model.beta);
 
         // --- 3. Process and sort results ---
+        // Build a set of interacted items for O(1) lookup
+        let interacted: HashSet<usize> =
+            user_interactions.iter().map(|(idx, _)| *idx).collect();
+
         let mut results_with_idx: Vec<(usize, f64)> = scores
             .into_iter()
             .enumerate()
             // Don't recommend items the user has already interacted with
-            .filter(|(idx, _score)| {
-                !user_interactions
-                    .iter()
-                    .any(|(interacted_idx, _)| *interacted_idx == *idx)
-            })
+            .filter(|(idx, _score)| !interacted.contains(idx))
             .collect();
 
         // Sort by score, descending.
@@ -189,8 +189,11 @@ impl FeaseModel {
             });
         }
 
-        // Run batch prediction with top-K filtering
-        let batch_results = serving::predict_batch_top_k(&self.model, &batch_inputs, top_k);
+        // Run batch prediction with top-K filtering.
+        // Release the GIL so other Python threads can proceed during rayon parallel work.
+        let batch_results = py.allow_threads(|| {
+            serving::predict_batch_top_k(&self.model, &batch_inputs, top_k)
+        });
 
         // Convert results back to Python
         let py_outer = PyList::empty(py);
@@ -687,21 +690,10 @@ impl FeaseRegistry {
         })?;
 
         let scores = model.predict(&user_interactions, &features, model.beta);
-
-        // Build a set of interacted items for fast lookup
-        let interacted: std::collections::HashSet<usize> =
+        let interacted_indices: Vec<usize> =
             user_interactions.iter().map(|(idx, _)| *idx).collect();
 
-        // Collect (index, score), filter out interacted, sort descending
-        let mut ranked: Vec<(usize, f64)> = scores
-            .into_iter()
-            .enumerate()
-            .filter(|(idx, _)| !interacted.contains(idx))
-            .collect();
-
-        ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        ranked.truncate(top_k);
-        Ok(ranked)
+        Ok(serving::filter_sort_top_k(scores, &interacted_indices, top_k))
     }
 
     /// Predicts similar items for a given item index in a specific territory.

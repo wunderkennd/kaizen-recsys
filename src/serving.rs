@@ -146,6 +146,27 @@ pub fn predict_batch(model: &RustFeaseModel, users: &[UserInput]) -> Vec<Vec<f64
         .collect()
 }
 
+/// Filters scores by removing interacted items, sorts descending, and truncates to top-K.
+///
+/// Shared logic used by both batch prediction and single-user registry prediction.
+pub fn filter_sort_top_k(
+    scores: Vec<f64>,
+    interacted: &[usize],
+    top_k: usize,
+) -> Vec<(usize, f64)> {
+    let interacted_set: ahash::AHashSet<usize> = interacted.iter().copied().collect();
+
+    let mut ranked: Vec<(usize, f64)> = scores
+        .into_iter()
+        .enumerate()
+        .filter(|(idx, _)| !interacted_set.contains(idx))
+        .collect();
+
+    ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    ranked.truncate(top_k);
+    ranked
+}
+
 /// Batch prediction that also returns top-K results per user.
 ///
 /// Returns a Vec of Vec<(item_index, score)>, sorted descending by score,
@@ -162,22 +183,9 @@ pub fn predict_batch_top_k(
         .par_iter()
         .map(|user| {
             let scores = model.predict(&user.interactions, &user.features, model.beta);
-
-            // Build a set of interacted items for fast lookup
-            let interacted: ahash::AHashSet<usize> =
+            let interacted_indices: Vec<usize> =
                 user.interactions.iter().map(|(idx, _)| *idx).collect();
-
-            // Collect (index, score), filter out interacted, sort descending
-            let mut ranked: Vec<(usize, f64)> = scores
-                .into_iter()
-                .enumerate()
-                .filter(|(idx, _)| !interacted.contains(idx))
-                .collect();
-
-            ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
-            ranked.truncate(top_k);
-            ranked
+            filter_sort_top_k(scores, &interacted_indices, top_k)
         })
         .collect()
 }
@@ -383,5 +391,36 @@ mod tests {
         let removed = registry.unregister("US");
         assert!(removed.is_some());
         assert!(registry.is_empty());
+    }
+
+    #[test]
+    fn test_filter_sort_top_k() {
+        let scores = vec![0.1, 0.9, 0.5, 0.3];
+        let interacted = vec![0]; // exclude item 0
+
+        let result = filter_sort_top_k(scores, &interacted, 2);
+
+        assert_eq!(result.len(), 2);
+        // Item 0 should be excluded
+        for (idx, _) in &result {
+            assert_ne!(*idx, 0);
+        }
+        // Should be sorted descending: item 1 (0.9), item 2 (0.5)
+        assert_eq!(result[0].0, 1);
+        assert!((result[0].1 - 0.9).abs() < 1e-12);
+        assert_eq!(result[1].0, 2);
+        assert!((result[1].1 - 0.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_filter_sort_top_k_empty_interacted() {
+        let scores = vec![0.3, 0.1, 0.9];
+        let interacted: Vec<usize> = vec![];
+
+        let result = filter_sort_top_k(scores, &interacted, 2);
+
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].0, 2); // 0.9
+        assert_eq!(result[1].0, 0); // 0.3
     }
 }

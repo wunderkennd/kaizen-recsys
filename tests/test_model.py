@@ -250,43 +250,43 @@ def test_validate_data():
 @pytest.fixture(scope="session")
 def weighting_data():
     """Creates test data with event_type and days_ago columns for weighting tests."""
-    tmpdir = tempfile.mkdtemp()
-    i_path = Path(tmpdir) / "interactions.parquet"
-    u_path = Path(tmpdir) / "user_features.parquet"
-    t_path = Path(tmpdir) / "item_features.parquet"
+    with tempfile.TemporaryDirectory() as tmpdir:
+        i_path = Path(tmpdir) / "interactions.parquet"
+        u_path = Path(tmpdir) / "user_features.parquet"
+        t_path = Path(tmpdir) / "item_features.parquet"
 
-    # Interactions with event_type and days_ago columns
-    interactions_df = pl.DataFrame(
-        {
-            "user_id": ["u0", "u0", "u1", "u1"],
-            "item_id": ["G0", "G1", "G1", "G2"],
-            "value": [1.0, 1.0, 1.0, 1.0],
-            "event_type": ["purchase", "click", "click", "cart"],
-            "days_ago": [0.0, 30.0, 10.0, 100.0],
-        }
-    )
+        # Interactions with event_type and days_ago columns
+        interactions_df = pl.DataFrame(
+            {
+                "user_id": ["u0", "u0", "u1", "u1"],
+                "item_id": ["G0", "G1", "G1", "G2"],
+                "value": [1.0, 1.0, 1.0, 1.0],
+                "event_type": ["purchase", "click", "click", "cart"],
+                "days_ago": [0.0, 30.0, 10.0, 100.0],
+            }
+        )
 
-    user_features_df = pl.DataFrame(
-        {
-            "user_id": ["u0", "u1"],
-            "feature_name": ["plan_Premium", "plan_Free"],
-            "value": [1.0, 1.0],
-        }
-    )
+        user_features_df = pl.DataFrame(
+            {
+                "user_id": ["u0", "u1"],
+                "feature_name": ["plan_Premium", "plan_Free"],
+                "value": [1.0, 1.0],
+            }
+        )
 
-    item_features_df = pl.DataFrame(
-        {
-            "item_id": ["G0", "G1", "G2"],
-            "feature_name": ["genre_Action", "genre_Comedy", "genre_Drama"],
-            "value": [1.0, 1.0, 1.0],
-        }
-    )
+        item_features_df = pl.DataFrame(
+            {
+                "item_id": ["G0", "G1", "G2"],
+                "feature_name": ["genre_Action", "genre_Comedy", "genre_Drama"],
+                "value": [1.0, 1.0, 1.0],
+            }
+        )
 
-    interactions_df.write_parquet(i_path)
-    user_features_df.write_parquet(u_path)
-    item_features_df.write_parquet(t_path)
+        interactions_df.write_parquet(i_path)
+        user_features_df.write_parquet(u_path)
+        item_features_df.write_parquet(t_path)
 
-    return str(i_path), str(u_path), str(t_path)
+        yield str(i_path), str(u_path), str(t_path)
 
 
 def test_train_with_ips(weighting_data):
