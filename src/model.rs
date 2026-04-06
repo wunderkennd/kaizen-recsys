@@ -47,6 +47,7 @@ pub struct RustFeaseModel {
 
 impl RustFeaseModel {
     /// Creates a new, untrained model container.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         num_items: usize,
         num_user_features: usize,
