@@ -99,6 +99,16 @@ The model trains from three long-format tables (Parquet or CSV):
 - **User features**: `user_id`, `feature_name`, `value`
 - **Item features**: `item_id`, `feature_name`, `value`
 
+## PR Review Policy
+
+All PRs require a review from Devin (`devin-ai-integration[bot]`) before merging. When creating PRs, always request review:
+
+```bash
+gh pr edit <number> --add-reviewer devin-ai-integration[bot]
+```
+
+Do not merge PRs without an approved review from Devin. This is enforced via branch protection on `main`.
+
 ## Python Module Name
 
 The compiled Rust library is importable as `rust_fease_recommender`. The Python package is `cr_fease`.
