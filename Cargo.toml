@@ -17,6 +17,7 @@ bincode = "1.3"
 nalgebra = { version = "0.34.1", features = ["serde-serialize"] }
 log = "0.4"
 polars = { version = "0.52.0", features = ["csv", "dtype-full", "lazy", "parquet", "timezones"] }
+rayon = "1.10"
 pyo3 = { version = "0.27.1", features = ["extension-module"] }
 serde = { version = "1.0.228", features = ["derive"] }
 sprs = "0.11.4"

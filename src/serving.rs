@@ -9,6 +9,7 @@
 use crate::model::RustFeaseModel;
 use ahash::AHashMap;
 use anyhow::{Result, anyhow};
+use rayon::prelude::*;
 
 /// A registry of FEASE models keyed by territory/region name.
 ///
@@ -140,7 +141,7 @@ pub fn predict_batch(model: &RustFeaseModel, users: &[UserInput]) -> Vec<Vec<f64
     log::info!("Batch prediction for {} users", users.len());
 
     users
-        .iter()
+        .par_iter()
         .map(|user| model.predict(&user.interactions, &user.features, model.beta))
         .collect()
 }
@@ -158,7 +159,7 @@ pub fn predict_batch_top_k(
     log::info!("Batch top-{} prediction for {} users", top_k, users.len());
 
     users
-        .iter()
+        .par_iter()
         .map(|user| {
             let scores = model.predict(&user.interactions, &user.features, model.beta);
 

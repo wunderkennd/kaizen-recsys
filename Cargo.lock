@@ -2710,6 +2710,7 @@ dependencies = [
  "nalgebra",
  "polars",
  "pyo3",
+ "rayon",
  "serde",
  "sprs",
 ]
