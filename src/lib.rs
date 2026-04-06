@@ -280,12 +280,13 @@ impl FeaseModel {
     ///         - "coverage" (float)
     ///         - "metrics" (list[dict]): Per-K metrics, each with keys:
     ///           "k", "precision", "recall", "ndcg", "map", "hit_rate"
-    #[pyo3(signature = (test_interactions_path, train_interactions_path, k_values=None))]
+    #[pyo3(signature = (test_interactions_path, train_interactions_path, user_features_path=None, k_values=None))]
     fn evaluate<'py>(
         &self,
         py: Python<'py>,
         test_interactions_path: &str,
         train_interactions_path: &str,
+        user_features_path: Option<&str>,
         k_values: Option<Vec<usize>>,
     ) -> PyResult<Bound<'py, PyDict>> {
         let config = evaluation::EvalConfig {
@@ -296,6 +297,7 @@ impl FeaseModel {
             &self.model,
             test_interactions_path,
             train_interactions_path,
+            user_features_path,
             &config,
         )
         .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;

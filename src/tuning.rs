@@ -159,6 +159,7 @@ fn generate_kfold_splits(
         .collect::<ahash::AHashSet<String>>()
         .into_iter()
         .collect();
+    // Sort for deterministic order before shuffling (AHashSet iteration is non-deterministic)
     unique_users.sort();
 
     // Deterministic shuffle
@@ -369,6 +370,9 @@ pub fn grid_search(
 ) -> Result<SearchResult> {
     let combos = cartesian_product(grid);
     let total = combos.len();
+    if total == 0 {
+        return Err(anyhow!("Parameter grid produced 0 combinations"));
+    }
     log::info!("Grid search: {} parameter combinations, {}-fold CV", total, n_folds);
 
     // Generate k-fold splits once
@@ -442,6 +446,9 @@ pub fn random_search(
     eval_k: usize,
     seed: u64,
 ) -> Result<SearchResult> {
+    if n_trials == 0 {
+        return Err(anyhow!("n_trials must be >= 1"));
+    }
     log::info!(
         "Random search: {} trials, {}-fold CV",
         n_trials,

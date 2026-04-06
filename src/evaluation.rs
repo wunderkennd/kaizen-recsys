@@ -4,6 +4,7 @@
 //! strategies (random, temporal, leave-K-out), and an evaluation harness that
 //! computes standard recommendation metrics on held-out data.
 
+use crate::data_pipeline::Mappings;
 use crate::metrics;
 use crate::model::RustFeaseModel;
 use ahash::AHashMap;
@@ -125,7 +126,11 @@ pub fn random_split(
     let mut rng = StdRng::seed_from_u64(seed);
     let mut train_mask = vec![true; n];
 
-    for (_uid, rows) in user_rows.iter_mut() {
+    // Sort user keys for deterministic iteration order (AHashMap is non-deterministic)
+    let mut sorted_uids: Vec<String> = user_rows.keys().cloned().collect();
+    sorted_uids.sort();
+    for uid in &sorted_uids {
+        let rows = user_rows.get_mut(uid).unwrap();
         rows.shuffle(&mut rng);
         let n_test = (rows.len() as f64 * test_ratio).round() as usize;
         for &idx in rows.iter().take(n_test) {
@@ -233,9 +238,12 @@ pub fn leave_k_out_split(
     let mut rng = StdRng::seed_from_u64(seed);
     let mut train_mask = vec![true; n];
 
-    for (_uid, rows) in user_rows.iter_mut() {
+    // Sort user keys for deterministic iteration order (AHashMap is non-deterministic)
+    let mut sorted_uids: Vec<String> = user_rows.keys().cloned().collect();
+    sorted_uids.sort();
+    for uid in &sorted_uids {
+        let rows = user_rows.get_mut(uid).unwrap();
         if rows.len() < k + 1 {
-            // Not enough interactions: all go to train
             continue;
         }
         rows.shuffle(&mut rng);
@@ -290,12 +298,20 @@ pub fn evaluate_model(
     model: &RustFeaseModel,
     test_interactions_path: &str,
     train_interactions_path: &str,
+    user_features_path: Option<&str>,
     config: &EvalConfig,
 ) -> Result<EvalReport> {
     log::info!("Starting model evaluation...");
 
     let test_df = read_interactions_df(test_interactions_path)?;
     let train_df = read_interactions_df(train_interactions_path)?;
+
+    // Load user features if provided
+    let user_features_map: AHashMap<String, Vec<(usize, f64)>> = if let Some(uf_path) = user_features_path {
+        build_user_features_map(uf_path, &model.mappings)?
+    } else {
+        AHashMap::new()
+    };
 
     // Build per-user ground truth from test set: user_id -> set of item indices
     let test_user_col = test_df.column("user_id")?.str()?;
@@ -359,8 +375,10 @@ pub fn evaluate_model(
             .cloned()
             .unwrap_or_default();
 
-        // Build user feature vector (empty -- we don't have features file in eval)
-        let user_features: Vec<(usize, f64)> = Vec::new();
+        let user_features: Vec<(usize, f64)> = user_features_map
+            .get(uid.as_str())
+            .cloned()
+            .unwrap_or_default();
 
         // Predict scores
         let scores = model.predict(&user_interactions, &user_features, model.beta);
@@ -431,6 +449,31 @@ pub fn evaluate_model(
     );
 
     Ok(report)
+}
+
+/// Builds a map from user_id string to Vec<(feature_idx, value)> from a user features file.
+fn build_user_features_map(
+    user_features_path: &str,
+    mappings: &Mappings,
+) -> Result<AHashMap<String, Vec<(usize, f64)>>> {
+    let df = read_interactions_df(user_features_path)?;
+    let user_col = df.column("user_id")?.str()?;
+    let feat_col = df.column("feature_name")?.str()?;
+    let val_col = df.column("value")?.f64()?;
+
+    let mut map: AHashMap<String, Vec<(usize, f64)>> = AHashMap::new();
+    for ((user, feat), val) in user_col
+        .into_iter()
+        .zip(feat_col.into_iter())
+        .zip(val_col.into_iter())
+    {
+        if let (Some(u), Some(f), Some(v)) = (user, feat, val)
+            && let Some(&feat_idx) = mappings.user_feature_to_idx.get(f)
+        {
+            map.entry(u.to_string()).or_default().push((feat_idx, v));
+        }
+    }
+    Ok(map)
 }
 
 // ---------------------------------------------------------------------------

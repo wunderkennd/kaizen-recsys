@@ -708,8 +708,8 @@ def test_evaluate_model(evaluation_data):
         lambda_=10.0,
     )
 
-    # Evaluate
-    report = model.evaluate(test_out, train_out, k_values=[2, 5])
+    # Evaluate (pass user features for accurate cold-start metrics)
+    report = model.evaluate(test_out, train_out, user_features_path=u_path, k_values=[2, 5])
 
     # Verify report structure
     assert "num_users" in report
