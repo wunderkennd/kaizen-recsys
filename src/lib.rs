@@ -99,8 +99,7 @@ impl FeaseModel {
 
         // --- 3. Process and sort results ---
         // Build a set of interacted items for O(1) lookup
-        let interacted: HashSet<usize> =
-            user_interactions.iter().map(|(idx, _)| *idx).collect();
+        let interacted: HashSet<usize> = user_interactions.iter().map(|(idx, _)| *idx).collect();
 
         let mut results_with_idx: Vec<(usize, f64)> = scores
             .into_iter()
@@ -191,9 +190,8 @@ impl FeaseModel {
 
         // Run batch prediction with top-K filtering.
         // Release the GIL so other Python threads can proceed during rayon parallel work.
-        let batch_results = py.allow_threads(|| {
-            serving::predict_batch_top_k(&self.model, &batch_inputs, top_k)
-        });
+        let batch_results =
+            py.detach(|| serving::predict_batch_top_k(&self.model, &batch_inputs, top_k));
 
         // Convert results back to Python
         let py_outer = PyList::empty(py);
@@ -693,7 +691,11 @@ impl FeaseRegistry {
         let interacted_indices: Vec<usize> =
             user_interactions.iter().map(|(idx, _)| *idx).collect();
 
-        Ok(serving::filter_sort_top_k(scores, &interacted_indices, top_k))
+        Ok(serving::filter_sort_top_k(
+            scores,
+            &interacted_indices,
+            top_k,
+        ))
     }
 
     /// Predicts similar items for a given item index in a specific territory.
