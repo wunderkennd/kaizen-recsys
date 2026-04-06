@@ -34,14 +34,16 @@ jobs:
       with:
         python-version: '3.10'
 
-    - name: Install maturin and test deps
-      run: pip install maturin pytest polars pydantic
+    - name: Create virtualenv and install deps
+      run: |
+        python -m venv .venv
+        .venv/bin/pip install maturin pytest polars pydantic
 
     - name: Build and install extension
-      run: maturin develop
+      run: .venv/bin/maturin develop
 
     - name: Run Python tests
-      run: pytest tests/ -v
+      run: .venv/bin/pytest tests/ -v
 
   build-wheel:
     needs: lint-and-test
