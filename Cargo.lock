@@ -1525,6 +1525,7 @@ dependencies = [
  "num-complex 0.4.6",
  "num-rational",
  "num-traits",
+ "rayon",
  "serde",
  "simba",
  "typenum",

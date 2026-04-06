@@ -14,7 +14,7 @@ crate-type = ["cdylib"]
 ahash = "0.8.12"
 anyhow = "1.0.100"
 bincode = "1.3"
-nalgebra = { version = "0.34.1", features = ["serde-serialize"] }
+nalgebra = { version = "0.34.1", features = ["serde-serialize", "rayon"] }
 log = "0.4"
 polars = { version = "0.52.0", features = ["csv", "dtype-full", "lazy", "parquet", "timezones"] }
 rayon = "1.10"
