@@ -481,3 +481,102 @@ def test_registry_bool():
     """Tests __bool__ — empty registry is falsy, non-empty is truthy."""
     registry = fease.FeaseRegistry()
     assert not registry  # empty -> falsy
+
+
+# --- Ranking Evaluation Metrics Tests ---
+
+import math
+
+
+def test_precision_at_k():
+    """Tests precision@K with known recommendations vs known relevant set."""
+    # recommended = [1, 2, 3, 4, 5], relevant = {1, 3, 5}
+    # top-3: hits = {1, 3} → 2/3
+    assert abs(fease.precision_at_k([1, 2, 3, 4, 5], {1, 3, 5}, 3) - 2.0 / 3.0) < 1e-10
+
+    # All relevant at top → 1.0
+    assert abs(fease.precision_at_k([1, 2, 3], {1, 2, 3}, 3) - 1.0) < 1e-10
+
+    # None relevant → 0.0
+    assert abs(fease.precision_at_k([1, 2, 3], {4, 5}, 3) - 0.0) < 1e-10
+
+    # k=0 → 0.0
+    assert abs(fease.precision_at_k([1, 2], {1}, 0) - 0.0) < 1e-10
+
+
+def test_recall_at_k():
+    """Tests recall@K computation."""
+    # top-3 of [1, 2, 3, 4, 5] with relevant {1, 3, 5, 7}: hits = {1, 3} → 2/4
+    assert abs(fease.recall_at_k([1, 2, 3, 4, 5], {1, 3, 5, 7}, 3) - 0.5) < 1e-10
+
+    # Full recall
+    assert abs(fease.recall_at_k([1, 3, 5, 7], {1, 3, 5, 7}, 4) - 1.0) < 1e-10
+
+    # Empty relevant → 0.0
+    assert abs(fease.recall_at_k([1, 2, 3], set(), 3) - 0.0) < 1e-10
+
+
+def test_ndcg_at_k():
+    """Tests NDCG@K with DCG normalization verification."""
+    # Perfect ranking: all relevant at top → NDCG = 1.0
+    assert abs(fease.ndcg_at_k([1, 2, 3, 4, 5], {1, 2, 3}, 3) - 1.0) < 1e-10
+
+    # Imperfect ranking: relevant = {3, 5}, recommended = [1, 2, 3, 4, 5]
+    # Hits at 0-based positions 2 and 4
+    # DCG = 1/log2(3+1) + 1/log2(5+1)
+    # IDCG = 1/log2(1+1) + 1/log2(2+1)
+    dcg = 1.0 / math.log2(4.0) + 1.0 / math.log2(6.0)
+    idcg = 1.0 / math.log2(2.0) + 1.0 / math.log2(3.0)
+    expected = dcg / idcg
+    assert abs(fease.ndcg_at_k([1, 2, 3, 4, 5], {3, 5}, 5) - expected) < 1e-10
+
+    # Single hit at top → 1.0
+    assert abs(fease.ndcg_at_k([1, 2, 3], {1}, 3) - 1.0) < 1e-10
+
+    # Empty relevant → 0.0
+    assert abs(fease.ndcg_at_k([1, 2, 3], set(), 3) - 0.0) < 1e-10
+
+
+def test_mean_average_precision():
+    """Tests MAP computation."""
+    # recommended = [1, 2, 3, 4, 5], relevant = {1, 3, 5}
+    # Hit at pos 0: prec = 1/1, pos 2: prec = 2/3, pos 4: prec = 3/5
+    # MAP = (1 + 2/3 + 3/5) / 3
+    expected = (1.0 + 2.0 / 3.0 + 3.0 / 5.0) / 3.0
+    assert abs(fease.mean_average_precision([1, 2, 3, 4, 5], {1, 3, 5}) - expected) < 1e-10
+
+    # Perfect ranking → 1.0
+    assert abs(fease.mean_average_precision([1, 2, 3], {1, 2, 3}) - 1.0) < 1e-10
+
+    # No hits → 0.0
+    assert abs(fease.mean_average_precision([1, 2, 3], {4, 5, 6}) - 0.0) < 1e-10
+
+
+def test_coverage():
+    """Tests coverage across multiple user recommendation lists."""
+    # 3 users, 10 total items, 6 unique recommended
+    all_recs = [[0, 1, 2], [2, 3, 4], [4, 5]]
+    assert abs(fease.coverage(all_recs, 10) - 0.6) < 1e-10
+
+    # Full coverage
+    assert abs(fease.coverage([[0, 1], [2, 3], [4]], 5) - 1.0) < 1e-10
+
+    # Duplicates across users don't inflate coverage
+    assert abs(fease.coverage([[0, 1], [0, 1], [0, 1]], 10) - 0.2) < 1e-10
+
+    # Empty recommendations → 0.0
+    assert abs(fease.coverage([[], []], 10) - 0.0) < 1e-10
+
+
+def test_hit_rate_at_k():
+    """Tests hit rate@K."""
+    # Hit within k
+    assert abs(fease.hit_rate_at_k([10, 20, 30], {20, 40}, 3) - 1.0) < 1e-10
+
+    # No hit
+    assert abs(fease.hit_rate_at_k([10, 20, 30], {40, 50}, 3) - 0.0) < 1e-10
+
+    # Hit outside k
+    assert abs(fease.hit_rate_at_k([10, 20, 30, 40], {40}, 2) - 0.0) < 1e-10
+    assert abs(fease.hit_rate_at_k([10, 20, 30, 40], {40}, 4) - 1.0) < 1e-10
+>>>>>>> 623132e (feat: add ranking evaluation metrics (precision, NDCG, recall, MAP, coverage))
