@@ -71,7 +71,7 @@ impl GaussianAnomalyDetector {
             0.0
         };
 
-        if value > self.low && value < self.high {
+        if value >= self.low && value <= self.high {
             log::info!(
                 "Data check PASSED for '{}': value={:.2}, z_score={:.2}, bounds=[{:.2}, {:.2}]",
                 label,

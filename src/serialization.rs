@@ -96,6 +96,13 @@ impl SerializedModel {
             );
         }
 
+        let expected_len = self.s_nrows * self.s_ncols;
+        if self.s_data.len() != expected_len {
+            anyhow::bail!(
+                "S matrix data length {} doesn't match dimensions {}x{} (expected {})",
+                self.s_data.len(), self.s_nrows, self.s_ncols, expected_len
+            );
+        }
         let s_matrix = DMatrix::from_vec(self.s_nrows, self.s_ncols, self.s_data);
 
         let mappings = Mappings {
@@ -344,6 +351,24 @@ mod tests {
                 b
             );
         }
+
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn test_load_corrupted_dimensions() {
+        // Create a valid model file, then corrupt the s_data length
+        let model = make_test_model();
+        let path = Path::new("./test_corrupted_dims.fease");
+        save_model(&model, path).expect("Failed to save");
+
+        // Read the file, corrupt it by truncating some bytes from the end
+        let mut data = fs::read(path).unwrap();
+        data.truncate(data.len() - 50); // Remove some data bytes
+        fs::write(path, &data).unwrap();
+
+        let result = load_model(path);
+        assert!(result.is_err(), "Should fail on corrupted model file");
 
         std::fs::remove_file(path).ok();
     }
