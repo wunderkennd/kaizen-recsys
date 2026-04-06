@@ -1,4 +1,3 @@
-
 //! This file defines the Rust structs that correspond to your data schemas.
 //! These are primarily for type safety, documentation, and potential
 //! row-based deserialization.
@@ -18,7 +17,7 @@ pub struct AccountProfile {
     pub avatar: Option<String>,
     pub profile_type: Option<String>,
     pub custom_fields: Option<HashMap<String, String>>,
-    pub created: Option<String>, // timestamp
+    pub created: Option<String>,         // timestamp
     pub event_timestamp: Option<String>, // timestamp
 }
 

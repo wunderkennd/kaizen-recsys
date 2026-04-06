@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Data validation module for pre-training quality checks.
 //!
 //! Ports the Python `GaussianAnomalyDetector` pattern: compute confidence
@@ -271,17 +272,19 @@ pub fn validate_data_counts(
 ) -> DataValidationReport {
     let mut report = DataValidationReport::new();
 
-    if let Some(detector) =
-        GaussianAnomalyDetector::from_observations(historical_users, config.distinct_users_multiplier)
-    {
+    if let Some(detector) = GaussianAnomalyDetector::from_observations(
+        historical_users,
+        config.distinct_users_multiplier,
+    ) {
         report.add(detector.check(current_users, "distinct_users"));
     } else {
         log::warn!("Skipping distinct_users check: insufficient historical data");
     }
 
-    if let Some(detector) =
-        GaussianAnomalyDetector::from_observations(historical_items, config.distinct_items_multiplier)
-    {
+    if let Some(detector) = GaussianAnomalyDetector::from_observations(
+        historical_items,
+        config.distinct_items_multiplier,
+    ) {
         report.add(detector.check(current_items, "distinct_items"));
     } else {
         log::warn!("Skipping distinct_items check: insufficient historical data");

@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Serving module for territory-aware multi-model support and batch predictions.
 //!
 //! Ports the Python `RFYTerritoryGroupServing` pattern: maintain a dictionary of
@@ -8,7 +9,7 @@
 
 use crate::model::RustFeaseModel;
 use ahash::AHashMap;
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 
 /// A registry of FEASE models keyed by territory/region name.
 ///
@@ -60,13 +61,11 @@ impl FeaseModelRegistry {
 
     /// Returns the model for a given territory (or the fallback if set).
     pub fn get_model(&self, territory: &str) -> Option<&RustFeaseModel> {
-        self.models
-            .get(territory)
-            .or_else(|| {
-                self.fallback_territory
-                    .as_ref()
-                    .and_then(|fb| self.models.get(fb.as_str()))
-            })
+        self.models.get(territory).or_else(|| {
+            self.fallback_territory
+                .as_ref()
+                .and_then(|fb| self.models.get(fb.as_str()))
+        })
     }
 
     /// Lists all registered territory names.
@@ -137,17 +136,12 @@ pub struct UserInput {
 /// in the future.
 ///
 /// Returns a Vec of score vectors, one per user, in the same order as `users`.
-pub fn predict_batch(
-    model: &RustFeaseModel,
-    users: &[UserInput],
-) -> Vec<Vec<f64>> {
+pub fn predict_batch(model: &RustFeaseModel, users: &[UserInput]) -> Vec<Vec<f64>> {
     log::info!("Batch prediction for {} users", users.len());
 
     users
         .iter()
-        .map(|user| {
-            model.predict(&user.interactions, &user.features, model.beta)
-        })
+        .map(|user| model.predict(&user.interactions, &user.features, model.beta))
         .collect()
 }
 
@@ -161,11 +155,7 @@ pub fn predict_batch_top_k(
     users: &[UserInput],
     top_k: usize,
 ) -> Vec<Vec<(usize, f64)>> {
-    log::info!(
-        "Batch top-{} prediction for {} users",
-        top_k,
-        users.len()
-    );
+    log::info!("Batch top-{} prediction for {} users", top_k, users.len());
 
     users
         .iter()
@@ -183,10 +173,7 @@ pub fn predict_batch_top_k(
                 .filter(|(idx, _)| !interacted.contains(idx))
                 .collect();
 
-            ranked.sort_by(|a, b| {
-                b.1.partial_cmp(&a.1)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
+            ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
             ranked.truncate(top_k);
             ranked
@@ -285,12 +272,8 @@ mod tests {
         registry.register("US".to_string(), make_test_model(1.0));
         registry.register("BR".to_string(), make_test_model(2.0));
 
-        let scores_us = registry
-            .predict("US", &[(0, 1.0)], &[])
-            .unwrap();
-        let scores_br = registry
-            .predict("BR", &[(0, 1.0)], &[])
-            .unwrap();
+        let scores_us = registry.predict("US", &[(0, 1.0)], &[]).unwrap();
+        let scores_br = registry.predict("BR", &[(0, 1.0)], &[]).unwrap();
 
         // BR model has 2x scale, so scores should differ
         let us_sum: f64 = scores_us.iter().sum();
@@ -362,12 +345,10 @@ mod tests {
     #[test]
     fn test_batch_top_k() {
         let model = make_test_model(1.0);
-        let users = vec![
-            UserInput {
-                interactions: vec![(0, 1.0)],
-                features: vec![],
-            },
-        ];
+        let users = vec![UserInput {
+            interactions: vec![(0, 1.0)],
+            features: vec![],
+        }];
 
         let results = predict_batch_top_k(&model, &users, 2);
         assert_eq!(results.len(), 1);

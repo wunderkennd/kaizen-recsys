@@ -14,6 +14,7 @@ mod model;
 mod schemas;
 mod serialization;
 mod serving;
+mod weighting;
 
 /// A Python-accessible class that holds the trained FEASE model.
 ///
@@ -66,10 +67,8 @@ impl FeaseModel {
         top_k: usize,
     ) -> PyResult<Bound<'py, PyList>> {
         // --- 1. Convert Python inputs to Rust vectors ---
-        let mut user_interactions: Vec<(usize, f64)> =
-            Vec::with_capacity(interactions.len());
-        let mut user_features: Vec<(usize, f64)> =
-            Vec::with_capacity(features.len());
+        let mut user_interactions: Vec<(usize, f64)> = Vec::with_capacity(interactions.len());
+        let mut user_features: Vec<(usize, f64)> = Vec::with_capacity(features.len());
 
         // Convert interactions (item_guid -> item_idx)
         for (key, val) in interactions.iter() {
@@ -86,17 +85,15 @@ impl FeaseModel {
             let feature_name: &str = key.extract()?;
             let value: f64 = val.extract()?;
             // Silently ignore features not seen in training
-            if let Some(&feature_idx) =
-                self.model.mappings.user_feature_to_idx.get(feature_name)
-            {
+            if let Some(&feature_idx) = self.model.mappings.user_feature_to_idx.get(feature_name) {
                 user_features.push((feature_idx, value));
             }
         }
 
         // --- 2. Call the internal Rust prediction function ---
-        let scores: Vec<f64> = self
-            .model
-            .predict(&user_interactions, &user_features, self.model.beta);
+        let scores: Vec<f64> =
+            self.model
+                .predict(&user_interactions, &user_features, self.model.beta);
 
         // --- 3. Process and sort results ---
         let mut results_with_idx: Vec<(usize, f64)> = scores
@@ -111,10 +108,7 @@ impl FeaseModel {
             .collect();
 
         // Sort by score, descending.
-        results_with_idx.sort_by(|a, b| {
-            b.1.partial_cmp(&a.1)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        results_with_idx.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
         // --- 4. Convert top-K results back to Python types ---
         let py_results = PyList::empty(py);
@@ -155,11 +149,15 @@ impl FeaseModel {
 
         // Convert all users' Python dicts to Rust UserInput structs
         for user_obj in users.iter() {
-            let user_dict: &Bound<'_, PyDict> = user_obj.downcast().map_err(|e| PyErr::new::<pyo3::exceptions::PyTypeError, _>(e.to_string()))?;
+            let user_dict: &Bound<'_, PyDict> = user_obj
+                .cast()
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyTypeError, _>(e.to_string()))?;
 
             let mut interactions = Vec::new();
             if let Some(inter_obj) = user_dict.get_item("interactions")? {
-                let inter_dict: &Bound<'_, PyDict> = inter_obj.downcast().map_err(|e| PyErr::new::<pyo3::exceptions::PyTypeError, _>(e.to_string()))?;
+                let inter_dict: &Bound<'_, PyDict> = inter_obj
+                    .cast()
+                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyTypeError, _>(e.to_string()))?;
                 for (key, val) in inter_dict.iter() {
                     let guid: &str = key.extract()?;
                     let value: f64 = val.extract()?;
@@ -171,7 +169,9 @@ impl FeaseModel {
 
             let mut features = Vec::new();
             if let Some(feat_obj) = user_dict.get_item("features")? {
-                let feat_dict: &Bound<'_, PyDict> = feat_obj.downcast().map_err(|e| PyErr::new::<pyo3::exceptions::PyTypeError, _>(e.to_string()))?;
+                let feat_dict: &Bound<'_, PyDict> = feat_obj
+                    .cast()
+                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyTypeError, _>(e.to_string()))?;
                 for (key, val) in feat_dict.iter() {
                     let name: &str = key.extract()?;
                     let value: f64 = val.extract()?;
@@ -255,10 +255,7 @@ impl FeaseModel {
     ///     tuple[bool, list[str]]:
     ///         A tuple of (passed, messages) where passed is True if all checks
     ///         passed and messages is a list of diagnostic strings.
-    fn validate<'py>(
-        &self,
-        py: Python<'py>,
-    ) -> PyResult<(bool, Bound<'py, PyList>)> {
+    fn validate<'py>(&self, py: Python<'py>) -> PyResult<(bool, Bound<'py, PyList>)> {
         let report = self.model.validate();
         let py_messages = PyList::new(py, &report.messages)?;
         Ok((report.passed, py_messages))
@@ -269,9 +266,8 @@ impl FeaseModel {
     /// Args:
     ///     path (str): File path to save the model to (e.g., "model.fease").
     fn save(&self, path: String) -> PyResult<()> {
-        serialization::save_model(&self.model, Path::new(&path)).map_err(|e| {
-            PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string())
-        })
+        serialization::save_model(&self.model, Path::new(&path))
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))
     }
 }
 
@@ -284,9 +280,8 @@ impl FeaseModel {
 ///     FeaseModel: The loaded model, ready for predictions.
 #[pyfunction]
 fn load_model(path: String) -> PyResult<FeaseModel> {
-    let model = serialization::load_model(Path::new(&path)).map_err(|e| {
-        PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string())
-    })?;
+    let model = serialization::load_model(Path::new(&path))
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
 
     // Validate loaded model (same as build_and_train does after training)
     let report = model.validate();
@@ -405,8 +400,13 @@ fn validate_data<'py>(
     alpha = 1.0,
     beta = 1.0,
     lambda_ = 100.0,
-    meta_weight = 0.0
+    meta_weight = 0.0,
+    decay_rate = 0.0,
+    ips_alpha = 0.0,
+    sparsity_threshold = 0.0,
+    event_weights = None
 ))]
+#[allow(clippy::too_many_arguments)]
 fn build_and_train(
     interactions_path: String,
     user_features_path: String,
@@ -415,24 +415,73 @@ fn build_and_train(
     beta: f64,
     lambda_: f64,
     meta_weight: f64,
+    decay_rate: f64,
+    ips_alpha: f64,
+    sparsity_threshold: f64,
+    event_weights: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<FeaseModel> {
     log::info!("--- [Rust] Starting Model Training ---");
     let start_time = Instant::now();
 
-    // --- 1. Build Matrices ---
-    let (x_mat, u_mat, t_mat, mappings) =
-        match data_pipeline::build_matrices(
-            &interactions_path,
-            &user_features_path,
-            &item_features_path,
-        ) {
-            Ok(data) => data,
-            Err(e) => {
-                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                    e.to_string(),
-                ));
+    // --- Input validation ---
+    if decay_rate < 0.0 {
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+            "decay_rate must be >= 0.0",
+        ));
+    }
+    if ips_alpha < 0.0 {
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+            "ips_alpha must be >= 0.0",
+        ));
+    }
+    if sparsity_threshold < 0.0 {
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+            "sparsity_threshold must be >= 0.0",
+        ));
+    }
+
+    // --- Build WeightingConfig from Python args ---
+    let weighting_config = if decay_rate > 0.0
+        || ips_alpha > 0.0
+        || sparsity_threshold > 0.0
+        || event_weights.is_some()
+    {
+        let ew = match event_weights {
+            Some(dict) => {
+                let mut map = std::collections::HashMap::new();
+                for (key, val) in dict.iter() {
+                    let k: String = key.extract()?;
+                    let v: f64 = val.extract()?;
+                    map.insert(k, v);
+                }
+                Some(map)
             }
+            None => None,
         };
+        Some(weighting::WeightingConfig {
+            event_weights: ew,
+            decay_rate,
+            ips_alpha,
+            sparsity_threshold,
+        })
+    } else {
+        None
+    };
+
+    // --- 1. Build Matrices ---
+    let (x_mat, u_mat, t_mat, mappings) = match data_pipeline::build_matrices(
+        &interactions_path,
+        &user_features_path,
+        &item_features_path,
+        weighting_config.as_ref(),
+    ) {
+        Ok(data) => data,
+        Err(e) => {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                e.to_string(),
+            ));
+        }
+    };
     log::info!(
         "[Rust] Matrix build complete in {:.2}s",
         start_time.elapsed().as_secs_f32()
@@ -466,13 +515,15 @@ fn build_and_train(
         train_start.elapsed().as_secs_f32()
     );
 
+    // --- 2b. Apply sparsity pruning ---
+    if sparsity_threshold > 0.0 {
+        rust_model.prune_sparse(sparsity_threshold);
+    }
+
     // --- 3. Validate Model ---
     let report = rust_model.validate();
     if !report.passed {
-        let msg = format!(
-            "Model validation failed:\n{}",
-            report.messages.join("\n")
-        );
+        let msg = format!("Model validation failed:\n{}", report.messages.join("\n"));
         return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(msg));
     }
     for msg in &report.messages {

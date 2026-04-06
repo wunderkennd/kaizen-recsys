@@ -1,14 +1,51 @@
-name: Build Python Wheel for Linux
+name: Build & Test
 
 on:
   push:
     branches:
-      - main  # Or whichever branch you use
-  workflow_dispatch: # Allows you to run it manually
+      - main
+  pull_request:
+  workflow_dispatch:
 
 jobs:
-  build-linux-wheel:
-    runs-on: ubuntu-latest # This is the x86_64 Linux VM
+  lint-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Check out code
+      uses: actions/checkout@v4
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        components: rustfmt, clippy
+
+    - name: Check formatting
+      run: cargo fmt --check
+
+    - name: Run clippy
+      run: cargo clippy -- -D warnings
+
+    - name: Run Rust tests
+      run: cargo test
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.10'
+
+    - name: Install maturin and test deps
+      run: pip install maturin pytest polars pydantic
+
+    - name: Build and install extension
+      run: maturin develop
+
+    - name: Run Python tests
+      run: pytest tests/ -v
+
+  build-wheel:
+    needs: lint-and-test
+    runs-on: ubuntu-latest
 
     steps:
     - name: Check out code
@@ -17,7 +54,7 @@ jobs:
     - name: Set up Python
       uses: actions/setup-python@v5
       with:
-        python-version: '3.10' # Match your Databricks cluster's Python version
+        python-version: '3.10'
 
     - name: Install maturin
       run: pip install maturin

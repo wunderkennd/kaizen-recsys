@@ -6,8 +6,7 @@
 //! It's called by `src/lib.rs` to perform the actual math.
 
 use crate::data_pipeline::Mappings;
-use anyhow::{anyhow, Result};
-use log;
+use anyhow::{Result, anyhow};
 use nalgebra::{DMatrix, DVector};
 use sprs::{CsMat, TriMat};
 
@@ -125,10 +124,7 @@ impl RustFeaseModel {
             1.0
         };
 
-        log::info!(
-            "Calculating G_11 = X^T*X + {}*α²*T^T*T...",
-            w
-        );
+        log::info!("Calculating G_11 = X^T*X + {}*α²*T^T*T...", w);
         let xtx = sparse_transpose_self_multiply(x_mat); // M x M
         let ttt = sparse_transpose_self_multiply(t_mat); // M x M
         let g_11 = &xtx + &(&ttt * (w * self.alpha * self.alpha));
@@ -215,11 +211,7 @@ impl RustFeaseModel {
         for j in 0..total_dim {
             let p_jj = p[(j, j)];
             // Guard against division by zero (shouldn't happen with λ > 0)
-            let inv_p_jj = if p_jj.abs() > 1e-12 {
-                -1.0 / p_jj
-            } else {
-                0.0
-            };
+            let inv_p_jj = if p_jj.abs() > 1e-12 { -1.0 / p_jj } else { 0.0 };
             for i in 0..total_dim {
                 if i != j {
                     s[(i, j)] = p[(i, j)] * inv_p_jj;
@@ -237,6 +229,26 @@ impl RustFeaseModel {
     ///
     /// Returns a `ValidationReport` with pass/fail status and diagnostic messages.
     /// Checks:
+    /// Prunes small entries from the S matrix, setting values with
+    /// |value| < threshold to zero. This increases sparsity and can
+    /// reduce noise from near-zero weights.
+    pub fn prune_sparse(&mut self, threshold: f64) {
+        let mut pruned = 0usize;
+        for val in self.s_matrix.iter_mut() {
+            if val.abs() < threshold {
+                *val = 0.0;
+                pruned += 1;
+            }
+        }
+        let total = self.s_matrix.nrows() * self.s_matrix.ncols();
+        log::info!(
+            "Sparsity pruning: zeroed {}/{} entries (threshold={})",
+            pruned,
+            total,
+            threshold
+        );
+    }
+
     /// - S matrix dimensions match expected (M+K)²
     /// - Diagonal entries are near-zero
     /// - No NaN or Inf values in S
@@ -316,10 +328,7 @@ impl RustFeaseModel {
                 "FAIL: S matrix is effectively all zeros — model may not have learned".to_string(),
             );
         } else {
-            messages.push(format!(
-                "OK: S matrix max |value| = {:.4e}",
-                max_abs
-            ));
+            messages.push(format!("OK: S matrix max |value| = {:.4e}", max_abs));
         }
 
         ValidationReport { passed, messages }
@@ -376,11 +385,7 @@ impl RustFeaseModel {
     /// Returns a Vec of (item_index, score) pairs sorted by descending score,
     /// excluding the source item itself. Caller is responsible for mapping indices
     /// back to item GUIDs.
-    pub fn predict_similar_items(
-        &self,
-        item_idx: usize,
-        top_k: usize,
-    ) -> Vec<(usize, f64)> {
+    pub fn predict_similar_items(&self, item_idx: usize, top_k: usize) -> Vec<(usize, f64)> {
         if item_idx >= self.num_items {
             return Vec::new();
         }
@@ -392,10 +397,7 @@ impl RustFeaseModel {
             .map(|i| (i, self.s_matrix[(i, item_idx)]))
             .collect();
 
-        scores.sort_by(|a, b| {
-            b.1.partial_cmp(&a.1)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
         scores.truncate(top_k);
         scores
@@ -570,10 +572,7 @@ mod tests {
         // The S matrices should differ (meta_weight affects G_11)
         let diff = &model_w.s_matrix - &model_no_w.s_matrix;
         let max_diff = diff.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
-        assert!(
-            max_diff > 1e-10,
-            "Meta weight should change the S matrix"
-        );
+        assert!(max_diff > 1e-10, "Meta weight should change the S matrix");
 
         // Both should still have zero diagonals
         let total_dim = n_items + n_user_features;
@@ -724,7 +723,11 @@ mod tests {
         model.train(&x_mat, &u_mat, &t_mat)?;
 
         let report = model.validate();
-        assert!(report.passed, "Validation should pass: {:?}", report.messages);
+        assert!(
+            report.passed,
+            "Validation should pass: {:?}",
+            report.messages
+        );
 
         Ok(())
     }

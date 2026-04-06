@@ -3,9 +3,9 @@
 //! it into the sparse matrices (`X`, `U`, `T`) and the ID/feature
 //! mappings required by the model.
 
+use crate::weighting::{self, WeightingConfig};
 use ahash::AHashMap;
 use anyhow::Result;
-use log;
 use polars::prelude::*;
 use sprs::{CsMat, TriMat};
 use std::fs::File;
@@ -31,10 +31,12 @@ pub struct Mappings {
 /// This function is the core of the flexible data pipeline. It reads three
 /// separate files (interactions, user features, item features) and
 /// constructs the three required CSR matrices and the ID mappings.
+#[allow(clippy::type_complexity)]
 pub fn build_matrices(
     interactions_path: &str,
     user_features_path: &str,
     item_features_path: &str,
+    weighting: Option<&WeightingConfig>,
 ) -> Result<(CsMat<f64>, CsMat<f64>, CsMat<f64>, Mappings)> {
     log::info!("Starting matrix build process...");
 
@@ -48,10 +50,8 @@ pub fn build_matrices(
     // to include cold-start users/items.
     log::info!("Building ID and feature mappings...");
 
-    let (user_to_idx, idx_to_user) =
-        build_mapping_from_dfs(&[&df_i, &df_u], "user_id")?;
-    let (item_to_idx, idx_to_item) =
-        build_mapping_from_dfs(&[&df_i, &df_t], "item_id")?;
+    let (user_to_idx, idx_to_user) = build_mapping_from_dfs(&[&df_i, &df_u], "user_id")?;
+    let (item_to_idx, idx_to_item) = build_mapping_from_dfs(&[&df_i, &df_t], "item_id")?;
     let (user_feature_to_idx, idx_to_user_feature) =
         build_mapping_from_dfs(&[&df_u], "feature_name")?;
     let (item_feature_to_idx, idx_to_item_feature) =
@@ -73,7 +73,7 @@ pub fn build_matrices(
     // as we don't know the exact dimensions until after mapping.
     log::info!("Building triplet lists...");
 
-    let x_triplets = build_triplets(
+    let mut x_triplets = build_triplets(
         &df_i,
         "user_id",
         "item_id",
@@ -97,6 +97,84 @@ pub fn build_matrices(
         &item_to_idx,
         &item_feature_to_idx,
     )?;
+
+    // --- 3b. Apply advanced weighting to interaction triplets ---
+    // Weighting columns must be filtered in sync with build_triplets (which skips
+    // rows with null user_id/item_id/value). We re-iterate the DataFrame with the
+    // same null-checks to extract only the rows that became triplets.
+    if let Some(cfg) = weighting {
+        let row_series = df_i.column("user_id")?.str()?;
+        let col_series = df_i.column("item_id")?.str()?;
+        let val_series = df_i.column("value")?.f64()?;
+
+        // Build a mask of which rows survived into triplets (same null/mapping
+        // filter as build_triplets, so weighting vectors stay in sync).
+        let kept: Vec<bool> = row_series
+            .iter()
+            .zip(col_series.iter())
+            .zip(val_series.iter())
+            .map(|((r, c), v)| {
+                r.is_some()
+                    && c.is_some()
+                    && v.is_some()
+                    && r.and_then(|rs| user_to_idx.get(rs)).is_some()
+                    && c.and_then(|cs| item_to_idx.get(cs)).is_some()
+            })
+            .collect();
+
+        // Event-type weighting (requires `event_type` column in interactions)
+        if let Some(ref weights) = cfg.event_weights
+            && let Ok(col) = df_i.column("event_type")
+        {
+            match col.str() {
+                Ok(str_col) => {
+                    let event_types: Vec<Option<&str>> = str_col
+                        .into_iter()
+                        .zip(kept.iter())
+                        .filter(|(_, k)| **k)
+                        .map(|(v, _)| v)
+                        .collect();
+                    weighting::apply_event_weights(&mut x_triplets, &event_types, weights);
+                    log::info!(
+                        "Applied event-type weighting ({} event types)",
+                        weights.len()
+                    );
+                }
+                Err(_) => log::warn!(
+                    "event_type column found but is not Utf8 (dtype={:?}); skipping event weighting",
+                    col.dtype()
+                ),
+            }
+        }
+
+        // Temporal decay (requires `days_ago` column in interactions)
+        if cfg.decay_rate > 0.0
+            && let Ok(col) = df_i.column("days_ago")
+        {
+            match col.f64() {
+                Ok(f64_col) => {
+                    let days_ago: Vec<Option<f64>> = f64_col
+                        .into_iter()
+                        .zip(kept.iter())
+                        .filter(|(_, k)| **k)
+                        .map(|(v, _)| v)
+                        .collect();
+                    weighting::apply_temporal_decay(&mut x_triplets, &days_ago, cfg.decay_rate);
+                    log::info!("Applied temporal decay (rate={})", cfg.decay_rate);
+                }
+                Err(_) => log::warn!(
+                    "days_ago column found but is not Float64 (dtype={:?}); skipping temporal decay",
+                    col.dtype()
+                ),
+            }
+        }
+
+        // Inverse Propensity Scoring (operates on triplet item indices, no column needed)
+        if cfg.ips_alpha > 0.0 {
+            weighting::apply_ips(&mut x_triplets, num_items, cfg.ips_alpha);
+            log::info!("Applied IPS (alpha={})", cfg.ips_alpha);
+        }
+    }
 
     // --- 4. Build CSR Matrices ---
     log::info!("Converting triplets to CSR matrices...");
@@ -152,13 +230,11 @@ fn build_mapping_from_dfs(
 
     for df in dfs {
         let col = df.column(col_name)?.str()?;
-        for opt_val in col.into_iter() {
-            if let Some(val) = opt_val {
-                if !unique_strings.contains_key(val) {
-                    let idx = unique_strings.len();
-                    unique_strings.insert(val.to_string(), idx);
-                    idx_to_string.push(val.to_string());
-                }
+        for val in col.into_iter().flatten() {
+            if !unique_strings.contains_key(val) {
+                let idx = unique_strings.len();
+                unique_strings.insert(val.to_string(), idx);
+                idx_to_string.push(val.to_string());
             }
         }
     }
@@ -192,8 +268,10 @@ fn build_triplets(
 
     let mut triplets = Vec::with_capacity(df.height());
 
-    for ((opt_row_str, opt_col_str), opt_val) in
-        row_series.into_iter().zip(col_series.into_iter()).zip(val_iter)
+    for ((opt_row_str, opt_col_str), opt_val) in row_series
+        .into_iter()
+        .zip(col_series.into_iter())
+        .zip(val_iter)
     {
         if let (Some(row_str), Some(col_str), Some(val)) = (opt_row_str, opt_col_str, opt_val) {
             // Look up the indices. If not found, skip (shouldn't happen if maps
@@ -215,9 +293,7 @@ fn read_lazyframe(path_str: &str) -> Result<LazyFrame> {
     let lf = match extension {
         Some("parquet") => {
             // Use File::open
-            ParquetReader::new(File::open(path)?)
-                .finish()?
-                .lazy()
+            ParquetReader::new(File::open(path)?).finish()?.lazy()
         }
         Some("csv") => {
             // FIX: API change .with_infer_schema_length -> .with_infer_schema
@@ -243,10 +319,7 @@ mod tests {
     use polars::df;
 
     // Helper to create a dummy parquet file and return its path
-    fn create_dummy_parquet(
-        df: &mut DataFrame,
-        file_name: &str,
-    ) -> Result<String> {
+    fn create_dummy_parquet(df: &mut DataFrame, file_name: &str) -> Result<String> {
         let path = format!("./{}", file_name);
         let mut file = File::create(&path)?;
         ParquetWriter::new(&mut file).finish(df)?;
@@ -282,8 +355,7 @@ mod tests {
         let t_path = create_dummy_parquet(&mut df_t, "test_t.parquet")?;
 
         // --- 3. Run the build_matrices function ---
-        let (x_mat, u_mat, t_mat, mappings) =
-            build_matrices(&i_path, &u_path, &t_path)?;
+        let (x_mat, u_mat, t_mat, mappings) = build_matrices(&i_path, &u_path, &t_path, None)?;
 
         // --- 4. Validate Mappings ---
         assert_eq!(mappings.user_to_idx.len(), 4); // u1, u2, u3, u4

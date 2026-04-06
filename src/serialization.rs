@@ -66,9 +66,19 @@ impl SerializedModel {
             beta: model.beta,
             lambda_: model.lambda_,
             meta_weight: model.meta_weight,
-            user_to_idx: model.mappings.user_to_idx.iter().map(|(k, v)| (k.clone(), *v)).collect(),
+            user_to_idx: model
+                .mappings
+                .user_to_idx
+                .iter()
+                .map(|(k, v)| (k.clone(), *v))
+                .collect(),
             idx_to_user: model.mappings.idx_to_user.clone(),
-            item_to_idx: model.mappings.item_to_idx.iter().map(|(k, v)| (k.clone(), *v)).collect(),
+            item_to_idx: model
+                .mappings
+                .item_to_idx
+                .iter()
+                .map(|(k, v)| (k.clone(), *v))
+                .collect(),
             idx_to_item: model.mappings.idx_to_item.clone(),
             user_feature_to_idx: model
                 .mappings
@@ -100,7 +110,10 @@ impl SerializedModel {
         if self.s_data.len() != expected_len {
             anyhow::bail!(
                 "S matrix data length {} doesn't match dimensions {}x{} (expected {})",
-                self.s_data.len(), self.s_nrows, self.s_ncols, expected_len
+                self.s_data.len(),
+                self.s_nrows,
+                self.s_ncols,
+                expected_len
             );
         }
 
@@ -109,7 +122,11 @@ impl SerializedModel {
         if self.s_nrows != expected_dim || self.s_ncols != expected_dim {
             anyhow::bail!(
                 "S matrix dimensions {}x{} don't match num_items ({}) + num_user_features ({}) = {}",
-                self.s_nrows, self.s_ncols, self.num_items, self.num_user_features, expected_dim
+                self.s_nrows,
+                self.s_ncols,
+                self.num_items,
+                self.num_user_features,
+                expected_dim
             );
         }
 
@@ -145,8 +162,7 @@ impl SerializedModel {
 /// The file format is: `FEAS` magic (4 bytes) + bincode-encoded `SerializedModel`.
 pub fn save_model(model: &RustFeaseModel, path: &Path) -> Result<()> {
     let serialized = SerializedModel::from_model(model);
-    let encoded = bincode::serialize(&serialized)
-        .context("Failed to serialize model")?;
+    let encoded = bincode::serialize(&serialized).context("Failed to serialize model")?;
 
     let mut data = Vec::with_capacity(MAGIC.len() + encoded.len());
     data.extend_from_slice(MAGIC);
@@ -167,11 +183,14 @@ pub fn save_model(model: &RustFeaseModel, path: &Path) -> Result<()> {
 ///
 /// Verifies the magic bytes and format version before deserializing.
 pub fn load_model(path: &Path) -> Result<RustFeaseModel> {
-    let data = fs::read(path)
-        .with_context(|| format!("Failed to read model from {}", path.display()))?;
+    let data =
+        fs::read(path).with_context(|| format!("Failed to read model from {}", path.display()))?;
 
     if data.len() < MAGIC.len() {
-        anyhow::bail!("File too small to be a valid FEASE model: {}", path.display());
+        anyhow::bail!(
+            "File too small to be a valid FEASE model: {}",
+            path.display()
+        );
     }
 
     if &data[..MAGIC.len()] != MAGIC {
@@ -181,8 +200,8 @@ pub fn load_model(path: &Path) -> Result<RustFeaseModel> {
         );
     }
 
-    let serialized: SerializedModel = bincode::deserialize(&data[MAGIC.len()..])
-        .context("Failed to deserialize model data")?;
+    let serialized: SerializedModel =
+        bincode::deserialize(&data[MAGIC.len()..]).context("Failed to deserialize model data")?;
 
     let model = serialized.into_model()?;
 
@@ -314,10 +333,12 @@ mod tests {
 
         let result = load_model(path);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Invalid magic bytes"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Invalid magic bytes")
+        );
 
         std::fs::remove_file(path).ok();
     }
@@ -329,10 +350,7 @@ mod tests {
 
         let result = load_model(path);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("too small"));
+        assert!(result.unwrap_err().to_string().contains("too small"));
 
         std::fs::remove_file(path).ok();
     }
