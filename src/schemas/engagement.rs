@@ -64,9 +64,9 @@ pub struct ContainerAdditionalAttributes {
     pub season_tags: Option<HashMap<String, Vec<String>>>, // e.g., "en": [...]
     pub seo_description: Option<String>,
     pub seo_title: Option<String>,
-    pub sequence_number: Option<i64>, // bigint
+    pub sequence_number: Option<i64>,    // bigint
     pub series_launch_year: Option<i64>, // bigint
-    pub subscriptions: Option<String>, // Could be more complex, String is safe
+    pub subscriptions: Option<String>,   // Could be more complex, String is safe
     pub subtitle_window: Option<Vec<SubtitleWindow>>,
     pub title: Option<String>,
 }
@@ -76,9 +76,9 @@ pub struct ContainerRestrictionWindow {
     pub audio_locale: Option<String>,
     pub geo: Option<Vec<String>>,
     pub level: Option<Vec<String>>,
-    pub list_end: Option<String>,   // timestamp
-    pub list_start: Option<String>, // timestamp
-    pub watch_end: Option<String>,  // timestamp
+    pub list_end: Option<String>,    // timestamp
+    pub list_start: Option<String>,  // timestamp
+    pub watch_end: Option<String>,   // timestamp
     pub watch_start: Option<String>, // timestamp
 }
 
@@ -111,8 +111,8 @@ pub struct CrMediaVideo {
     #[serde(rename = "type")]
     pub type_field: Option<i32>, // int
     pub source: Option<String>,
-    pub width: Option<i32>,  // int
-    pub height: Option<i32>, // int
+    pub width: Option<i32>,     // int
+    pub height: Option<i32>,    // int
     pub framerate: Option<f64>, // decimal(20,4)
     #[serde(rename = "int")]
     pub int_field: Option<String>,
@@ -122,18 +122,18 @@ pub struct CrMediaVideo {
     pub vcodec: Option<String>,
     pub acodec: Option<String>,
     pub container: Option<String>,
-    pub created: Option<String>, // timestamp
-    pub deleted: Option<i32>,    // int
+    pub created: Option<String>,  // timestamp
+    pub deleted: Option<i32>,     // int
     pub modified: Option<String>, // timestamp
-    pub flags: Option<i32>,      // int
+    pub flags: Option<i32>,       // int
     pub encode_version: Option<String>,
     pub encode_info: Option<String>,
-    pub cache_version: Option<i32>, // int
-    pub format: Option<i32>,        // int
+    pub cache_version: Option<i32>,  // int
+    pub format: Option<i32>,         // int
     pub format_primary: Option<i32>, // int
     pub hardsub_lang: Option<String>,
     pub audio_lang: Option<String>,
-    pub version: Option<i32>, // int
+    pub version: Option<i32>,                 // int
     pub subtitle_update_time: Option<String>, // timestamp
 }
 
@@ -146,8 +146,8 @@ pub struct CrMediaVideoEncode {
     pub video_id: Option<i32>, // int
     pub quality: Option<i32>,  // int
     pub source: Option<String>,
-    pub width: Option<i32>,  // int
-    pub height: Option<i32>, // int
+    pub width: Option<i32>,     // int
+    pub height: Option<i32>,    // int
     pub framerate: Option<f64>, // decimal(20,4)
     pub bitrate: Option<i32>,   // int
     pub abitrate: Option<i32>,  // int
@@ -156,13 +156,13 @@ pub struct CrMediaVideoEncode {
     pub vcodec: Option<String>,
     pub acodec: Option<String>,
     pub container: Option<String>,
-    pub created: Option<String>, // timestamp
-    pub deleted: Option<i32>,    // int
+    pub created: Option<String>,  // timestamp
+    pub deleted: Option<i32>,     // int
     pub modified: Option<String>, // timestamp
-    pub flags: Option<i32>,      // int
+    pub flags: Option<i32>,       // int
     pub encode_version: Option<String>,
     pub encode_info: Option<String>,
-    pub deprecated: Option<i32>, // int
+    pub deprecated: Option<i32>,   // int
     pub old_video_id: Option<i32>, // int
 }
 

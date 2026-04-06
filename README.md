@@ -87,30 +87,25 @@ Once built, you can import and use the library directly in Python.
 import rust_fease_recommender as fease
 import time
 
-# Define paths to your data
-ENGAGEMENT_PATH = "path/to/engagement.parquet"
-METADATA_PATH = "path/to/metadata.parquet"
+# Define paths to your long-format data files
+INTERACTIONS_PATH = "path/to/interactions.parquet"   # user_id, item_id, value
+USER_FEATURES_PATH = "path/to/user_features.parquet" # user_id, feature_name, value
+ITEM_FEATURES_PATH = "path/to/item_features.parquet" # item_id, feature_name, value
 
 # --- 1. Train the Model ---
-# This one-time step loads data, builds matrices, and trains the model in Rust.
 print("Starting model training...")
 start_time = time.time()
 
-try:
 model = fease.build_and_train(
-engagement_path=ENGAGEMENT_PATH,
-metadata_path=METADATA_PATH,
-alpha=1.0,   # Weight for item features
-beta=1.0,    # Weight for user features
-lambda_=150.0 # L2 regularization
+    interactions_path=INTERACTIONS_PATH,
+    user_features_path=USER_FEATURES_PATH,
+    item_features_path=ITEM_FEATURES_PATH,
+    alpha=1.0,    # Weight for item features
+    beta=1.0,     # Weight for user features
+    lambda_=150.0 # L2 regularization
 )
 print(f"Training complete in {time.time() - start_time:.2f}s")
-print(f"Model trained on {model.num_items} items and {model.num_user_features} user features.")
-
-except Exception as e:
-print(f"An error occurred during training: {e}")
-# Handle error (e.g., file not found)
-exit()
+print(f"Model: {model.num_items} items, {model.num_user_features} user features.")
 
 
 # --- 2. Make Predictions ---
@@ -147,3 +142,64 @@ print("\n--- Cold Start User Predictions ---")
 recs_cold = model.predict(cold_user_interactions, cold_user_features, top_k=5)
 for guid, score in recs_cold:
 print(f"  {guid}: {score:.4f}")
+```
+
+## Advanced Weighting
+
+The `build_and_train()` function supports optional advanced weighting parameters:
+
+```python
+model = fease.build_and_train(
+    interactions_path="interactions.parquet",
+    user_features_path="user_features.parquet",
+    item_features_path="item_features.parquet",
+    alpha=1.0,
+    beta=1.0,
+    lambda_=150.0,
+    # Advanced weighting (all optional, defaults preserve existing behavior):
+    decay_rate=0.005,        # Exponential temporal decay (requires `days_ago` column)
+    ips_alpha=0.5,           # Inverse propensity scoring (0=off, 1=aggressive)
+    sparsity_threshold=0.001, # Prune small S-matrix entries
+    event_weights={"click": 1.0, "cart": 3.0, "purchase": 5.0},  # Requires `event_type` column
+)
+```
+
+The interactions Parquet file can optionally include:
+- `event_type` (string): Used with `event_weights` to scale interactions by type
+- `days_ago` (float): Used with `decay_rate` for exponential temporal decay
+
+## Model Persistence
+
+```python
+# Save a trained model
+model.save("model.fease")
+
+# Load it back
+loaded_model = fease.load_model("model.fease")
+recs = loaded_model.predict(interactions, features, top_k=10)
+```
+
+## Batch Prediction
+
+```python
+users = [
+    {"interactions": {"item1": 5.0}, "features": {"device_Mobile": 1.0}},
+    {"interactions": {}, "features": {"plan_Free": 1.0}},
+]
+batch_results = model.predict_batch(users, top_k=10)
+```
+
+## Data Quality Validation
+
+```python
+# Check current data against historical baselines before training
+passed, messages = fease.validate_data(
+    historical_users=[100.0, 105.0, 98.0],
+    historical_items=[50.0, 52.0, 49.0],
+    historical_interactions=[1000.0, 1050.0, 980.0],
+    current_users=103.0,
+    current_items=51.0,
+    current_interactions=1030.0,
+)
+if not passed:
+    print("Data quality check failed:", messages)

@@ -1,56 +1,40 @@
-# fease_wrapper.py (optional high-level API)
+"""High-level Python wrapper with optional schema validation."""
+
 import polars as pl
 import rust_fease_recommender as fease
-from schemas import EngagementSchema, MetadataSchema
+from cr_fease.schemas import EngagementSchema, MetadataSchema
+
 
 def build_and_train_safe(
-        engagement_path: str,
-        metadata_path: str,
-        alpha: float = 1.0,
-        beta: float = 1.0,
-        lambda_: float = 100.0,
-        validate: bool = True
+    interactions_path: str,
+    user_features_path: str,
+    item_features_path: str,
+    alpha: float = 1.0,
+    beta: float = 1.0,
+    lambda_: float = 100.0,
+    meta_weight: float = 0.0,
 ) -> fease.FeaseModel:
     """
-    Builds and trains a FEASE model with optional Python-side validation.
+    Builds and trains a FEASE model from three long-format Parquet/CSV files.
 
     Args:
-        engagement_path: Path to engagement parquet
-        metadata_path: Path to metadata parquet
-        alpha: Item feature weight
-        beta: User feature weight
-        lambda_: L2 regularization
-        validate: If True, validates schemas before passing to Rust
+        interactions_path: Path to interactions file (user_id, item_id, value).
+        user_features_path: Path to user features file (user_id, feature_name, value).
+        item_features_path: Path to item features file (item_id, feature_name, value).
+        alpha: Weight for item features in the Gram matrix.
+        beta: Weight for user features in the Gram matrix.
+        lambda_: L2 regularization term.
+        meta_weight: Weight for metadata rows (0.0 = equal weighting).
 
     Returns:
-        Trained FeaseModel
+        Trained FeaseModel ready for predictions.
     """
-    if validate:
-        # Load and validate in Python for better error messages
-        print("Validating engagement data...")
-        df_eng = pl.read_parquet(engagement_path)
-        df_eng = EngagementSchema.validate_and_cast(df_eng)
-
-        print("Validating metadata...")
-        df_meta = pl.read_parquet(metadata_path)
-        df_meta = MetadataSchema.validate_and_cast(df_meta)
-
-        # Write validated data to temp files
-        import tempfile
-        with tempfile.NamedTemporaryFile(suffix=".parquet", delete=False) as eng_tmp:
-            df_eng.write_parquet(eng_tmp.name)
-            eng_path = eng_tmp.name
-
-        with tempfile.NamedTemporaryFile(suffix=".parquet", delete=False) as meta_tmp:
-            df_meta.write_parquet(meta_tmp.name)
-            meta_path = meta_tmp.name
-
-        try:
-            return fease.build_and_train(eng_path, meta_path, alpha, beta, lambda_)
-        finally:
-            import os
-            os.unlink(eng_path)
-            os.unlink(meta_path)
-    else:
-        # Skip validation, let Rust handle it
-        return fease.build_and_train(engagement_path, metadata_path, alpha, beta, lambda_)
+    return fease.build_and_train(
+        interactions_path=interactions_path,
+        user_features_path=user_features_path,
+        item_features_path=item_features_path,
+        alpha=alpha,
+        beta=beta,
+        lambda_=lambda_,
+        meta_weight=meta_weight,
+    )
