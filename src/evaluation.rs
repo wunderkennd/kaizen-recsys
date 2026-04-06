@@ -384,7 +384,7 @@ pub fn evaluate_model(
             sum_precision[ki] += metrics::precision_at_k(&recommended, relevant_items, k);
             sum_recall[ki] += metrics::recall_at_k(&recommended, relevant_items, k);
             sum_ndcg[ki] += metrics::ndcg_at_k(&recommended, relevant_items, k);
-            sum_map[ki] += metrics::mean_average_precision(&recommended, relevant_items, k);
+            sum_map[ki] += metrics::mean_average_precision(&recommended[..k.min(recommended.len())], relevant_items);
             sum_hit_rate[ki] += metrics::hit_rate_at_k(&recommended, relevant_items, k);
         }
 

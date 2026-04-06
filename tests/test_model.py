@@ -368,7 +368,6 @@ def test_backward_compat(weighting_data):
         assert abs(s1 - s2) < 1e-10
 
 
-<<<<<<< HEAD
 # --- FeaseRegistry Tests ---
 
 @pytest.fixture(scope="session")
@@ -739,3 +738,117 @@ def test_evaluate_model(evaluation_data):
         assert 0.0 <= m["hit_rate"] <= 1.0
 
     print("\nEvaluation Report:", report)
+
+
+# --- Hyperparameter Tuning Tests ---
+
+@pytest.fixture(scope="session")
+def tuning_data():
+    """Creates test data with enough users for k-fold cross-validation."""
+    tmpdir = tempfile.mkdtemp()
+    i_path = Path(tmpdir) / "interactions.parquet"
+    u_path = Path(tmpdir) / "user_features.parquet"
+    t_path = Path(tmpdir) / "item_features.parquet"
+
+    interactions_df = pl.DataFrame(
+        {
+            "user_id": [
+                "u0", "u0", "u1", "u1", "u2", "u2",
+                "u3", "u3", "u4", "u4", "u5", "u5",
+            ],
+            "item_id": [
+                "G0", "G1", "G1", "G2", "G0", "G2",
+                "G2", "G3", "G0", "G3", "G1", "G3",
+            ],
+            "value": [1.0] * 12,
+        }
+    )
+
+    user_features_df = pl.DataFrame(
+        {
+            "user_id": ["u0", "u1", "u2", "u3", "u4", "u5"],
+            "feature_name": ["plan_A", "plan_B", "plan_A", "plan_B", "plan_A", "plan_B"],
+            "value": [1.0] * 6,
+        }
+    )
+
+    item_features_df = pl.DataFrame(
+        {
+            "item_id": ["G0", "G1", "G2", "G3"],
+            "feature_name": ["genre_X", "genre_Y", "genre_X", "genre_Y"],
+            "value": [1.0] * 4,
+        }
+    )
+
+    interactions_df.write_parquet(i_path)
+    user_features_df.write_parquet(u_path)
+    item_features_df.write_parquet(t_path)
+
+    return str(i_path), str(u_path), str(t_path)
+
+
+def test_grid_search(tuning_data):
+    """Tests grid search returns correct result structure."""
+    i_path, u_path, t_path = tuning_data
+    result = fease.grid_search_py(
+        i_path, u_path, t_path,
+        param_grid={"lambda_": [10.0, 100.0]},
+        n_folds=2,
+        eval_k=10,
+        seed=42,
+    )
+
+    assert "best_params" in result
+    assert "best_score" in result
+    assert "metric" in result
+    assert "trials" in result
+    assert result["metric"] == "ndcg@10"
+    assert len(result["trials"]) == 2
+
+    # Check best_params structure
+    bp = result["best_params"]
+    assert "alpha" in bp
+    assert "beta" in bp
+    assert "lambda_" in bp
+    assert "meta_weight" in bp
+
+    # Check trial structure
+    trial = result["trials"][0]
+    assert "params" in trial
+    assert "mean_score" in trial
+    assert "fold_scores" in trial
+    assert len(trial["fold_scores"]) == 2
+
+    # best_score should match one of the trial scores
+    trial_scores = [t["mean_score"] for t in result["trials"]]
+    assert result["best_score"] == max(trial_scores)
+
+    print("\nGrid search result:", result)
+
+
+def test_random_search(tuning_data):
+    """Tests random search with n_trials=2 returns correct structure."""
+    i_path, u_path, t_path = tuning_data
+    result = fease.random_search_py(
+        i_path, u_path, t_path,
+        param_grid={"alpha": [0.5, 1.0, 2.0], "lambda_": [10.0, 50.0, 100.0]},
+        n_trials=2,
+        n_folds=2,
+        eval_k=10,
+        seed=42,
+    )
+
+    assert "best_params" in result
+    assert "best_score" in result
+    assert "metric" in result
+    assert "trials" in result
+    assert result["metric"] == "ndcg@10"
+    assert len(result["trials"]) == 2
+
+    for trial in result["trials"]:
+        assert "params" in trial
+        assert "mean_score" in trial
+        assert "fold_scores" in trial
+        assert len(trial["fold_scores"]) == 2
+
+    print("\nRandom search result:", result)

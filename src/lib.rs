@@ -17,6 +17,7 @@ mod model;
 mod schemas;
 mod serialization;
 mod serving;
+pub mod tuning;
 mod weighting;
 
 /// A Python-accessible class that holds the trained FEASE model.
@@ -899,6 +900,180 @@ fn hit_rate_at_k(recommended: Vec<usize>, relevant: HashSet<usize>, k: usize) ->
     metrics::hit_rate_at_k(&recommended, &relevant, k)
 }
 
+/// Grid search over hyperparameters with k-fold cross-validation.
+///
+/// Args:
+///     interactions_path (str): Path to interactions Parquet/CSV file.
+///     user_features_path (str): Path to user features Parquet/CSV file.
+///     item_features_path (str): Path to item features Parquet/CSV file.
+///     param_grid (dict): Dict of parameter name -> list of values to try.
+///         Keys: "alpha", "beta", "lambda_", "meta_weight", "decay_rate",
+///         "ips_alpha", "sparsity_threshold". Missing keys get default single-element lists.
+///     n_folds (int): Number of cross-validation folds (default 3).
+///     eval_k (int): k for NDCG@k evaluation metric (default 10).
+///     seed (int): Random seed for fold generation (default 42).
+///
+/// Returns:
+///     dict: {"best_params": {...}, "best_score": float, "metric": str,
+///            "trials": [{"params": {...}, "mean_score": float, "fold_scores": [...]}, ...]}
+#[pyfunction]
+#[pyo3(signature = (
+    interactions_path,
+    user_features_path,
+    item_features_path,
+    param_grid,
+    n_folds = 3,
+    eval_k = 10,
+    seed = 42
+))]
+#[allow(clippy::too_many_arguments)]
+fn grid_search_py(
+    py: Python<'_>,
+    interactions_path: &str,
+    user_features_path: &str,
+    item_features_path: &str,
+    param_grid: &Bound<'_, PyDict>,
+    n_folds: usize,
+    eval_k: usize,
+    seed: u64,
+) -> PyResult<Py<PyAny>> {
+    let grid = parse_param_grid(param_grid)?;
+    let result = tuning::grid_search(
+        interactions_path,
+        user_features_path,
+        item_features_path,
+        &grid,
+        n_folds,
+        eval_k,
+        seed,
+    )
+    .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+
+    search_result_to_py(py, &result)
+}
+
+/// Random search over hyperparameters with k-fold cross-validation.
+///
+/// Args:
+///     interactions_path (str): Path to interactions Parquet/CSV file.
+///     user_features_path (str): Path to user features Parquet/CSV file.
+///     item_features_path (str): Path to item features Parquet/CSV file.
+///     param_grid (dict): Dict of parameter name -> list of values to sample from.
+///     n_trials (int): Number of random configurations to evaluate (default 10).
+///     n_folds (int): Number of cross-validation folds (default 3).
+///     eval_k (int): k for NDCG@k evaluation metric (default 10).
+///     seed (int): Random seed for fold generation and sampling (default 42).
+///
+/// Returns:
+///     dict: Same structure as grid_search.
+#[pyfunction]
+#[pyo3(signature = (
+    interactions_path,
+    user_features_path,
+    item_features_path,
+    param_grid,
+    n_trials = 10,
+    n_folds = 3,
+    eval_k = 10,
+    seed = 42
+))]
+#[allow(clippy::too_many_arguments)]
+fn random_search_py(
+    py: Python<'_>,
+    interactions_path: &str,
+    user_features_path: &str,
+    item_features_path: &str,
+    param_grid: &Bound<'_, PyDict>,
+    n_trials: usize,
+    n_folds: usize,
+    eval_k: usize,
+    seed: u64,
+) -> PyResult<Py<PyAny>> {
+    let grid = parse_param_grid(param_grid)?;
+    let result = tuning::random_search(
+        interactions_path,
+        user_features_path,
+        item_features_path,
+        &grid,
+        n_trials,
+        n_folds,
+        eval_k,
+        seed,
+    )
+    .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+
+    search_result_to_py(py, &result)
+}
+
+/// Parses a Python dict into a ParamGrid, using defaults for missing keys.
+fn parse_param_grid(dict: &Bound<'_, PyDict>) -> PyResult<tuning::ParamGrid> {
+    fn extract_vec(dict: &Bound<'_, PyDict>, key: &str, default: f64) -> PyResult<Vec<f64>> {
+        match dict.get_item(key)? {
+            Some(val) => {
+                let list: Vec<f64> = val.extract()?;
+                if list.is_empty() {
+                    Ok(vec![default])
+                } else {
+                    Ok(list)
+                }
+            }
+            None => Ok(vec![default]),
+        }
+    }
+
+    Ok(tuning::ParamGrid {
+        alpha: extract_vec(dict, "alpha", 1.0)?,
+        beta: extract_vec(dict, "beta", 1.0)?,
+        lambda_: extract_vec(dict, "lambda_", 100.0)?,
+        meta_weight: extract_vec(dict, "meta_weight", 0.0)?,
+        decay_rate: extract_vec(dict, "decay_rate", 0.0)?,
+        ips_alpha: extract_vec(dict, "ips_alpha", 0.0)?,
+        sparsity_threshold: extract_vec(dict, "sparsity_threshold", 0.0)?,
+    })
+}
+
+/// Converts a SearchResult into a Python dict.
+fn search_result_to_py(py: Python<'_>, result: &tuning::SearchResult) -> PyResult<Py<PyAny>> {
+    let dict = PyDict::new(py);
+
+    // best_params
+    let bp = PyDict::new(py);
+    bp.set_item("alpha", result.best_params.alpha)?;
+    bp.set_item("beta", result.best_params.beta)?;
+    bp.set_item("lambda_", result.best_params.lambda_)?;
+    bp.set_item("meta_weight", result.best_params.meta_weight)?;
+    bp.set_item("decay_rate", result.best_params.decay_rate)?;
+    bp.set_item("ips_alpha", result.best_params.ips_alpha)?;
+    bp.set_item("sparsity_threshold", result.best_params.sparsity_threshold)?;
+    dict.set_item("best_params", bp)?;
+
+    dict.set_item("best_score", result.best_score)?;
+    dict.set_item("metric", &result.metric_name)?;
+
+    // trials
+    let trials_list = PyList::empty(py);
+    for trial in &result.all_trials {
+        let trial_dict = PyDict::new(py);
+
+        let params_dict = PyDict::new(py);
+        params_dict.set_item("alpha", trial.params.alpha)?;
+        params_dict.set_item("beta", trial.params.beta)?;
+        params_dict.set_item("lambda_", trial.params.lambda_)?;
+        params_dict.set_item("meta_weight", trial.params.meta_weight)?;
+        params_dict.set_item("decay_rate", trial.params.decay_rate)?;
+        params_dict.set_item("ips_alpha", trial.params.ips_alpha)?;
+        params_dict.set_item("sparsity_threshold", trial.params.sparsity_threshold)?;
+
+        trial_dict.set_item("params", params_dict)?;
+        trial_dict.set_item("mean_score", trial.mean_score)?;
+        trial_dict.set_item("fold_scores", trial.fold_scores.clone())?;
+        trials_list.append(trial_dict)?;
+    }
+    dict.set_item("trials", trials_list)?;
+
+    Ok(dict.into())
+}
+
 /// Defines the Python module.
 /// This function is called when Python runs `import rust_fease_recommender`.
 #[pymodule]
@@ -915,6 +1090,8 @@ fn rust_fease_recommender(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<
     m.add_function(wrap_pyfunction!(random_split, m)?)?;
     m.add_function(wrap_pyfunction!(temporal_split, m)?)?;
     m.add_function(wrap_pyfunction!(leave_k_out_split, m)?)?;
+    m.add_function(wrap_pyfunction!(grid_search_py, m)?)?;
+    m.add_function(wrap_pyfunction!(random_search_py, m)?)?;
     m.add_class::<FeaseModel>()?;
     m.add_class::<FeaseRegistry>()?;
     Ok(())
