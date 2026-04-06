@@ -12,6 +12,9 @@ from rust_fease_recommender import (
     precision_at_k,
     recall_at_k,
     validate_data,
+    random_split,
+    temporal_split,
+    leave_k_out_split,
 )
 from cr_fease.schemas import EngagementSchema, MetadataSchema
 
@@ -27,6 +30,9 @@ __all__ = [
     "precision_at_k",
     "recall_at_k",
     "validate_data",
+    "random_split",
+    "temporal_split",
+    "leave_k_out_split",
     "EngagementSchema",
     "MetadataSchema",
 ]
