@@ -5,6 +5,7 @@
 
 use ahash::AHashMap;
 use anyhow::Result;
+use log;
 use polars::prelude::*;
 use sprs::{CsMat, TriMat};
 use std::fs::File;
@@ -35,7 +36,7 @@ pub fn build_matrices(
     user_features_path: &str,
     item_features_path: &str,
 ) -> Result<(CsMat<f64>, CsMat<f64>, CsMat<f64>, Mappings)> {
-    println!("Starting matrix build process...");
+    log::info!("Starting matrix build process...");
 
     // --- 1. Load DataFrames from files ---
     let df_i = read_lazyframe(interactions_path)?.collect()?;
@@ -45,7 +46,7 @@ pub fn build_matrices(
     // --- 2. Build Mappings ---
     // We must build user and item mappings from *all* files
     // to include cold-start users/items.
-    println!("Building ID and feature mappings...");
+    log::info!("Building ID and feature mappings...");
 
     let (user_to_idx, idx_to_user) =
         build_mapping_from_dfs(&[&df_i, &df_u], "user_id")?;
@@ -61,16 +62,16 @@ pub fn build_matrices(
     let num_user_features = user_feature_to_idx.len();
     let num_item_features = item_feature_to_idx.len();
 
-    println!("Mappings complete:");
-    println!("  Unique Users: {}", num_users);
-    println!("  Unique Items: {}", num_items);
-    println!("  Unique User Features: {}", num_user_features);
-    println!("  Unique Item Features: {}", num_item_features);
+    log::info!("Mappings complete:");
+    log::info!("  Unique Users: {}", num_users);
+    log::info!("  Unique Items: {}", num_items);
+    log::info!("  Unique User Features: {}", num_user_features);
+    log::info!("  Unique Item Features: {}", num_item_features);
 
     // --- 3. Build Triplet Lists ---
     // This is more memory-efficient than building TriMat directly
     // as we don't know the exact dimensions until after mapping.
-    println!("Building triplet lists...");
+    log::info!("Building triplet lists...");
 
     let x_triplets = build_triplets(
         &df_i,
@@ -98,7 +99,7 @@ pub fn build_matrices(
     )?;
 
     // --- 4. Build CSR Matrices ---
-    println!("Converting triplets to CSR matrices...");
+    log::info!("Converting triplets to CSR matrices...");
 
     // X Matrix: (N x M)
     let mut x_trimat = TriMat::with_capacity((num_users, num_items), x_triplets.len());
@@ -124,7 +125,7 @@ pub fn build_matrices(
     }
     let t_mat = t_mat_ml.to_csr().transpose_into(); // Transpose to (L x M)
 
-    println!("Matrix build complete!");
+    log::info!("Matrix build complete!");
 
     let mappings = Mappings {
         user_to_idx,
