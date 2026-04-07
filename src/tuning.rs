@@ -5,6 +5,7 @@
 //! is based on NDCG@k computed over held-out test users.
 
 use crate::data_pipeline::{self, Mappings};
+use crate::evaluation::{build_user_features_map, read_interactions_df, write_parquet};
 use crate::model::RustFeaseModel;
 use crate::weighting::WeightingConfig;
 use ahash::AHashMap;
@@ -14,8 +15,6 @@ use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
-use std::fs::File;
-use std::path::Path;
 
 // ---------------------------------------------------------------------------
 // Parameter types
@@ -144,7 +143,7 @@ fn generate_kfold_splits(
     }
 
     // Read interactions DataFrame
-    let df = read_dataframe(interactions_path)?;
+    let df = read_interactions_df(interactions_path)?;
 
     // Get unique user_ids
     let user_col = df.column("user_id")?.str()?;
@@ -204,8 +203,8 @@ fn generate_kfold_splits(
         let train_bool = BooleanChunked::from_slice("mask".into(), &train_mask);
         let test_bool = BooleanChunked::from_slice("mask".into(), &test_mask);
 
-        let train_df = df.filter(&train_bool)?;
-        let test_df = df.filter(&test_bool)?;
+        let mut train_df = df.filter(&train_bool)?;
+        let mut test_df = df.filter(&test_bool)?;
 
         let train_path = tmp_dir
             .path()
@@ -214,8 +213,8 @@ fn generate_kfold_splits(
             .path()
             .join(format!("fold_{}_test.parquet", fold_idx));
 
-        write_parquet(&train_df, &train_path)?;
-        write_parquet(&test_df, &test_path)?;
+        write_parquet(&mut train_df, &train_path.to_string_lossy())?;
+        write_parquet(&mut test_df, &test_path.to_string_lossy())?;
 
         fold_paths.push((
             train_path.to_string_lossy().to_string(),
@@ -284,11 +283,11 @@ fn evaluate_trial(
     }
 
     // 5. Read training interactions to know which items each user has seen
-    let train_df = read_dataframe(train_interactions_path)?;
+    let train_df = read_interactions_df(train_interactions_path)?;
     let train_user_items = group_user_items(&train_df, &model.mappings)?;
 
     // 6. Read test interactions and group by user
-    let test_df = read_dataframe(test_interactions_path)?;
+    let test_df = read_interactions_df(test_interactions_path)?;
     let test_user_items = group_user_items(&test_df, &model.mappings)?;
 
     // 7. Build user features lookup
@@ -446,8 +445,8 @@ pub fn random_search(
     // Generate k-fold splits once
     let (_tmp_dir, fold_paths) = generate_kfold_splits(interactions_path, n_folds, seed)?;
 
-    // Sample random parameter configs
-    let mut rng = StdRng::seed_from_u64(seed);
+    // Sample random parameter configs (use seed+1 to decouple from fold generation)
+    let mut rng = StdRng::seed_from_u64(seed.wrapping_add(1));
     let mut sampled_configs = Vec::with_capacity(n_trials);
     for _ in 0..n_trials {
         let params = HyperParams {
@@ -518,27 +517,6 @@ pub fn random_search(
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Reads a Parquet or CSV file into a Polars DataFrame.
-fn read_dataframe(path_str: &str) -> Result<DataFrame> {
-    let path = Path::new(path_str);
-    let ext = path.extension().and_then(|s| s.to_str());
-    match ext {
-        Some("parquet") => Ok(ParquetReader::new(File::open(path)?).finish()?),
-        Some("csv") => Ok(CsvReader::new(File::open(path)?).finish()?),
-        _ => Err(anyhow!(
-            "Unsupported file type for: {}. Supported: .parquet, .csv",
-            path_str
-        )),
-    }
-}
-
-/// Writes a DataFrame to a Parquet file.
-fn write_parquet(df: &DataFrame, path: &Path) -> Result<()> {
-    let mut file = File::create(path)?;
-    ParquetWriter::new(&mut file).finish(&mut df.clone())?;
-    Ok(())
-}
-
 /// Groups interactions by user, returning user_id -> Vec<(item_idx, value)>.
 fn group_user_items(
     df: &DataFrame,
@@ -565,33 +543,6 @@ fn group_user_items(
     Ok(map)
 }
 
-/// Builds a map of user_id -> Vec<(feature_idx, value)> from the user features file.
-fn build_user_features_map(
-    user_features_path: &str,
-    mappings: &Mappings,
-) -> Result<AHashMap<String, Vec<(usize, f64)>>> {
-    let df = read_dataframe(user_features_path)?;
-    let user_col = df.column("user_id")?.str()?;
-    let feat_col = df.column("feature_name")?.str()?;
-    let val_col = df.column("value")?.f64()?;
-
-    let mut map: AHashMap<String, Vec<(usize, f64)>> = AHashMap::new();
-
-    for ((user, feat), val) in user_col
-        .into_iter()
-        .zip(feat_col.into_iter())
-        .zip(val_col.into_iter())
-    {
-        if let (Some(u), Some(f), Some(v)) = (user, feat, val)
-            && let Some(&feat_idx) = mappings.user_feature_to_idx.get(f)
-        {
-            map.entry(u.to_string()).or_default().push((feat_idx, v));
-        }
-    }
-
-    Ok(map)
-}
-
 // ---------------------------------------------------------------------------
 // Unit tests
 // ---------------------------------------------------------------------------
@@ -600,6 +551,8 @@ fn build_user_features_map(
 mod tests {
     use super::*;
     use polars::df;
+    use std::fs::File;
+    use std::path::Path;
 
     /// Helper to create a dummy parquet file in a temp dir and return its path.
     fn create_parquet_in(dir: &Path, name: &str, df: &mut DataFrame) -> Result<String> {
@@ -672,7 +625,7 @@ mod tests {
         // Collect all test user_ids across folds; each user should appear exactly once
         let mut all_test_users: Vec<String> = Vec::new();
         for (_train_path, test_path) in &fold_paths {
-            let test_df = read_dataframe(test_path)?;
+            let test_df = read_interactions_df(test_path)?;
             let user_col = test_df.column("user_id")?.str()?;
             let users: ahash::AHashSet<String> = user_col
                 .into_iter()
@@ -693,8 +646,8 @@ mod tests {
 
         // Each fold's train + test should cover all interactions
         for (train_path, test_path) in &fold_paths {
-            let train_df = read_dataframe(train_path)?;
-            let test_df = read_dataframe(test_path)?;
+            let train_df = read_interactions_df(train_path)?;
+            let test_df = read_interactions_df(test_path)?;
             let total = train_df.height() + test_df.height();
             assert_eq!(total, 12, "train + test should equal total interactions");
         }

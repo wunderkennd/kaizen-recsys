@@ -40,7 +40,7 @@ pub struct EvalConfig {
 pub struct EvalReport {
     /// Per-K metrics.
     pub metrics_at_k: Vec<MetricsAtK>,
-    /// Coverage across all users' recommendations.
+    /// Coverage across all users' recommendations (computed at the largest K value).
     pub coverage: f64,
     /// Number of test users evaluated.
     pub num_users: usize,
@@ -68,7 +68,7 @@ pub struct MetricsAtK {
 // Helpers for reading/writing parquet
 // ---------------------------------------------------------------------------
 
-fn read_interactions_df(path: &str) -> Result<DataFrame> {
+pub(crate) fn read_interactions_df(path: &str) -> Result<DataFrame> {
     let p = Path::new(path);
     let ext = p.extension().and_then(|s| s.to_str());
     let df = match ext {
@@ -79,7 +79,7 @@ fn read_interactions_df(path: &str) -> Result<DataFrame> {
     Ok(df)
 }
 
-fn write_parquet(df: &mut DataFrame, path: &str) -> Result<()> {
+pub(crate) fn write_parquet(df: &mut DataFrame, path: &str) -> Result<()> {
     let mut file = File::create(path)?;
     ParquetWriter::new(&mut file).finish(df)?;
     Ok(())
@@ -455,7 +455,7 @@ pub fn evaluate_model(
 }
 
 /// Builds a map from user_id string to Vec<(feature_idx, value)> from a user features file.
-fn build_user_features_map(
+pub(crate) fn build_user_features_map(
     user_features_path: &str,
     mappings: &Mappings,
 ) -> Result<AHashMap<String, Vec<(usize, f64)>>> {
