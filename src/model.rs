@@ -228,10 +228,6 @@ impl RustFeaseModel {
         Ok(())
     }
 
-    /// Validates the trained model, checking for common issues.
-    ///
-    /// Returns a `ValidationReport` with pass/fail status and diagnostic messages.
-    /// Checks:
     /// Prunes small entries from the S matrix, setting values with
     /// |value| < threshold to zero. This increases sparsity and can
     /// reduce noise from near-zero weights.
@@ -252,6 +248,10 @@ impl RustFeaseModel {
         );
     }
 
+    /// Validates the trained model, checking for common issues.
+    ///
+    /// Returns a `ValidationReport` with pass/fail status and diagnostic messages.
+    /// Checks:
     /// - S matrix dimensions match expected (M+K)²
     /// - Diagonal entries are near-zero
     /// - No NaN or Inf values in S

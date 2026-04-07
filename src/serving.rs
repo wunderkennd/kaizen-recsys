@@ -92,9 +92,12 @@ impl FeaseModelRegistry {
         user_interactions: &[(usize, f64)],
         user_features: &[(usize, f64)],
     ) -> Result<Vec<f64>> {
-        let model = self
-            .get_model(territory)
-            .ok_or_else(|| anyhow!("No model registered for territory '{}'", territory))?;
+        let model = self.get_model(territory).ok_or_else(|| {
+            anyhow!(
+                "No model registered for territory '{}' (and no fallback available)",
+                territory
+            )
+        })?;
 
         Ok(model.predict(user_interactions, user_features, model.beta))
     }
@@ -106,9 +109,12 @@ impl FeaseModelRegistry {
         item_idx: usize,
         top_k: usize,
     ) -> Result<Vec<(usize, f64)>> {
-        let model = self
-            .get_model(territory)
-            .ok_or_else(|| anyhow!("No model registered for territory '{}'", territory))?;
+        let model = self.get_model(territory).ok_or_else(|| {
+            anyhow!(
+                "No model registered for territory '{}' (and no fallback available)",
+                territory
+            )
+        })?;
 
         Ok(model.predict_similar_items(item_idx, top_k))
     }

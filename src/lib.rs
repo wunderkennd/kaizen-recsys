@@ -682,7 +682,7 @@ impl FeaseRegistry {
         let features = user_features.unwrap_or_default();
         let model = self.inner.get_model(territory).ok_or_else(|| {
             PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-                "No model registered for territory '{}'",
+                "No model registered for territory '{}' (and no fallback available)",
                 territory
             ))
         })?;
