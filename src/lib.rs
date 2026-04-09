@@ -625,7 +625,7 @@ impl FeaseRegistry {
         self.inner.len()
     }
 
-    /// Returns True if no models are registered.
+    /// Returns True if any models are registered.
     fn __bool__(&self) -> bool {
         !self.inner.is_empty()
     }
