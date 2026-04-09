@@ -426,6 +426,76 @@ for guid, score in recs_cold:
 # COMMAND ----------
 
 # --
+# Step 6b: Evaluate Model Quality (Optional)
+# --
+#
+# Split the data and evaluate to get ranking metrics before deploying.
+
+import tempfile
+
+print("\n--- Model Evaluation ---")
+
+# random_split writes the split to disk; pick a workspace it can write to.
+SPLIT_DIR = tempfile.mkdtemp(prefix="fease_split_")
+train_split = os.path.join(SPLIT_DIR, "train.parquet")
+test_split = os.path.join(SPLIT_DIR, "test.parquet")
+
+train_int, test_int, train_users, test_users = fease.random_split(
+    interactions_path=TEMP_I_PATH,
+    train_output=train_split,
+    test_output=test_split,
+    test_ratio=0.2,
+    seed=42,
+)
+print(
+    f"Split: {train_int} train, {test_int} test interactions "
+    f"({train_users} train users, {test_users} test users)"
+)
+
+# Train a model on the training split for evaluation.
+# Reuse the same _train_kwargs pattern so disabled weighting stays backward-compatible.
+eval_model = fease.build_and_train(
+    interactions_path=train_split,
+    user_features_path=TEMP_U_PATH,
+    item_features_path=TEMP_T_PATH,
+    alpha=ALPHA,
+    beta=BETA,
+    lambda_=LAMBDA,
+    **_train_kwargs,
+)
+
+report = eval_model.evaluate(
+    test_interactions_path=test_split,
+    train_interactions_path=train_split,
+    user_features_path=TEMP_U_PATH,
+    k_values=[5, 10, 20, 50],
+)
+for m in report["metrics"]:
+    print(
+        f"  @{m['k']}: NDCG={m['ndcg']:.4f}, "
+        f"Recall={m['recall']:.4f}, Precision={m['precision']:.4f}"
+    )
+print(f"  Coverage: {report['coverage']:.4f}")
+print(f"  Users evaluated: {report['num_users']}, interactions: {report['num_interactions']}")
+
+# COMMAND ----------
+
+# --
+# Step 6c: Save Model (Optional)
+# --
+#
+# Persist the trained model for later inference without re-training.
+
+MODEL_SAVE_PATH = os.path.join(TEMP_DIR, "model.fease")
+model.save(MODEL_SAVE_PATH)
+print(f"Model saved to {MODEL_SAVE_PATH}")
+
+# To load later:
+# loaded_model = fease.load_model(MODEL_SAVE_PATH)
+
+# COMMAND ----------
+
+# --
 # Step 7: Cleanup (Optional but recommended)
 # --
 #

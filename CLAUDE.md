@@ -40,35 +40,40 @@ docker build . -t fease-builder
 ```
 Python caller
     ↓
-src/lib.rs           — PyO3 entrypoint: FeaseModel, FeaseRegistry, build_and_train(), metrics, load_model()
+src/lib.rs           — PyO3 entrypoint: FeaseModel, FeaseRegistry, build_and_train(), split/eval/tuning functions
     ↓
 src/data_pipeline.rs — Reads Parquet/CSV via Polars, builds sparse CSR matrices (X, U, T), applies weighting
 src/weighting.rs     — Event-type weights, temporal decay, IPS reweighting configs
     ↓
 src/model.rs         — Core FEASE algorithm: block Gram matrix, inversion, S-matrix, sparsity pruning
     ↓
-src/serialization.rs — Save/load via serde+bincode with magic bytes + v2 format (backward-compat v1)
-src/serving.rs       — FeaseModelRegistry (territory routing), rayon-parallel batch prediction
-src/metrics.rs       — Ranking evaluation metrics (precision, recall, NDCG, MAP, coverage, hit rate)
+src/evaluation.rs    — Train/test splitting (random, temporal, leave-K-out), evaluation harness
+src/tuning.rs        — Grid search and random search over hyperparameters with k-fold CV
+src/metrics.rs       — Pure ranking metrics: precision, recall, NDCG, MAP, coverage, hit rate
+    ↓
+src/serialization.rs — Save/load via serde+bincode with magic bytes + format versioning (v1/v2)
+src/serving.rs       — FeaseModelRegistry (territory routing), batch prediction (rayon-parallelized)
 src/data_validation.rs — GaussianAnomalyDetector for pre-training data quality checks
 ```
 
 ### Key Rust Modules
 
-- **`lib.rs`**: PyO3 bridge. Exposes `FeaseModel` (predict, predict_batch, predict_similar_items, validate, save), `FeaseRegistry` (territory-based multi-model routing), `build_and_train()`, `load_model()`, `validate_data()`, and 6 ranking metric functions (`precision_at_k`, `recall_at_k`, `ndcg_at_k`, `mean_average_precision`, `coverage`, `hit_rate_at_k`).
-- **`model.rs`**: Pure Rust `RustFeaseModel`. Training, prediction, MLT similarity, validation, sparsity pruning. Includes optional `WeightingConfig` field for serialization provenance.
-- **`metrics.rs`**: Ranking evaluation metrics — pure utility functions operating on recommendation lists and relevant item sets. No model-specific logic.
+- **`lib.rs`**: PyO3 bridge. Exposes `FeaseModel` (predict, predict_batch, predict_similar_items, evaluate, validate, save), `FeaseRegistry`, `build_and_train()`, `load_model()`, `validate_data()`, split functions, tuning functions, and standalone metrics.
+- **`model.rs`**: Pure Rust `RustFeaseModel`. Training, prediction, MLT similarity, validation, sparsity pruning.
 - **`data_pipeline.rs`**: Long-format Parquet/CSV → sparse CSR matrices + string↔index mappings. Hooks for weighting transforms.
 - **`weighting.rs`**: `WeightingConfig` struct + functions: `apply_event_weights()`, `apply_temporal_decay()`, `apply_ips()`.
-- **`serialization.rs`**: Binary save/load with `FEAS` magic bytes, format v2 (includes `WeightingConfig`), backward-compatible v1 loading, dimension validation on load.
-- **`serving.rs`**: `FeaseModelRegistry` for multi-territory model routing, `predict_batch()` / `predict_batch_top_k()` with rayon parallelization, `filter_sort_top_k()` shared ranking helper.
+- **`evaluation.rs`**: `random_split()`, `temporal_split()`, `leave_k_out_split()` for data splitting; `evaluate_model()` harness computing per-K metrics + coverage.
+- **`tuning.rs`**: `grid_search()` and `random_search()` over `HyperParams` with user-based k-fold CV optimizing NDCG@k.
+- **`metrics.rs`**: Pure functions: `precision_at_k`, `recall_at_k`, `ndcg_at_k`, `mean_average_precision`, `coverage`, `hit_rate_at_k`.
+- **`serialization.rs`**: Binary save/load with `FEAS` magic bytes, format v2 (persists `WeightingConfig`), v1 backward-compatible migration.
+- **`serving.rs`**: `FeaseModelRegistry` for multi-territory model routing, `predict_batch()` / `predict_batch_top_k()` parallelized via rayon.
 - **`data_validation.rs`**: `GaussianAnomalyDetector` — confidence interval checks for data quality.
 
 ### Python Layer (`cr_fease/`)
 
-- `__init__.py` — Exports: `FeaseModel`, `FeaseRegistry`, `build_and_train`, `load_model`, `validate_data`, `precision_at_k`, `recall_at_k`, `ndcg_at_k`, `mean_average_precision`, `coverage`, `hit_rate_at_k`, `EngagementSchema`, `MetadataSchema`
+- `__init__.py` — Exports: `FeaseModel`, `FeaseRegistry`, `build_and_train`, `load_model`, `validate_data`, split functions, tuning functions, metrics, `EngagementSchema`, `MetadataSchema`
 - `schemas.py` — Pydantic models for column validation
-- `fease_wrapper.py` — Thin validation wrapper around `build_and_train()`
+- `fease_wrapper.py` — Thin validation wrapper around `build_and_train()` with optional advanced weighting params
 - `train.py` — CLI training script (`--interactions`, `--user-features`, `--item-features`, `--output`)
 - `inference.py` — `FeasePredictor` class for loading saved models and serving predictions
 - `fease_train.py` — Databricks end-to-end workflow (PySpark → Parquet → Rust training → predictions)
@@ -83,9 +88,13 @@ src/data_validation.rs — GaussianAnomalyDetector for pre-training data quality
 
 **Cold-start:** Users with zero interactions still get recommendations through user-feature columns in the S-matrix.
 
+**Evaluation pipeline:** Three split strategies (random, temporal, leave-K-out) produce train/test Parquet files. The evaluation harness computes precision, recall, NDCG, MAP, hit rate at multiple K values, plus catalog coverage. All splits use sorted key iteration before RNG consumption to ensure deterministic results despite AHashMap's randomized hash seeds.
+
+**Hyperparameter tuning:** Grid search and random search over `(alpha, beta, lambda_, meta_weight, decay_rate, ips_alpha, sparsity_threshold)` with user-based k-fold CV. Optimization target is NDCG@k. Results include best params, best score, and all trial details.
+
 ## Key Dependencies
 
-**Rust:** nalgebra (dense LA), sprs (sparse CSR), polars (Parquet/CSV), pyo3 (Python bridge), ahash (fast hashing), bincode+serde (serialization), rayon (parallel batch prediction)
+**Rust:** nalgebra (dense LA), sprs (sparse CSR), polars (Parquet/CSV), pyo3 (Python bridge), ahash (fast hashing), bincode+serde (serialization), rayon (parallel batch prediction), rand (shuffling for splits/tuning), tempfile (k-fold temp files)
 **Python:** polars, pydantic, pytest (dev)
 
 ## Data Format
