@@ -486,10 +486,11 @@ mod tests {
             sparsity_threshold: 1e-4,
         });
 
-        let path = Path::new("./test_weighting_roundtrip.fease");
-        save_model(&model, path).expect("Failed to save model");
+        let dir = tempfile::tempdir().expect("Failed to create temp dir");
+        let path = dir.path().join("test_weighting_roundtrip.fease");
+        save_model(&model, &path).expect("Failed to save model");
 
-        let loaded = load_model(path).expect("Failed to load model");
+        let loaded = load_model(&path).expect("Failed to load model");
 
         let wc = loaded
             .weighting_config
@@ -501,8 +502,6 @@ mod tests {
         assert_eq!(ew.get("click"), Some(&1.0));
         assert_eq!(ew.get("purchase"), Some(&5.0));
         assert_eq!(ew.len(), 2);
-
-        std::fs::remove_file(path).ok();
     }
 
     #[test]
@@ -553,17 +552,16 @@ mod tests {
         };
         let encoded = bincode::serialize(&v1).expect("Failed to serialize v1");
 
-        let path = Path::new("./test_v1_migration.fease");
+        let dir = tempfile::tempdir().expect("Failed to create temp dir");
+        let path = dir.path().join("test_v1_migration.fease");
         let mut data = Vec::with_capacity(MAGIC.len() + encoded.len());
         data.extend_from_slice(MAGIC);
         data.extend(encoded);
-        fs::write(path, &data).expect("Failed to write v1 file");
+        fs::write(&path, &data).expect("Failed to write v1 file");
 
-        let loaded = load_model(path).expect("Failed to load v1 model");
+        let loaded = load_model(&path).expect("Failed to load v1 model");
         assert!(loaded.weighting_config.is_none());
         assert_eq!(loaded.num_items, model.num_items);
         assert_eq!(loaded.num_user_features, model.num_user_features);
-
-        std::fs::remove_file(path).ok();
     }
 }
