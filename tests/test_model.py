@@ -586,63 +586,63 @@ def test_hit_rate_at_k():
 @pytest.fixture(scope="session")
 def evaluation_data():
     """Creates a larger dataset suitable for train/test splitting and evaluation."""
-    tmpdir = tempfile.mkdtemp()
-    i_path = Path(tmpdir) / "interactions.parquet"
-    u_path = Path(tmpdir) / "user_features.parquet"
-    t_path = Path(tmpdir) / "item_features.parquet"
+    with tempfile.TemporaryDirectory() as tmpdir:
+        i_path = Path(tmpdir) / "interactions.parquet"
+        u_path = Path(tmpdir) / "user_features.parquet"
+        t_path = Path(tmpdir) / "item_features.parquet"
 
-    # Richer interactions: 5 users, 6 items, multiple interactions each
-    interactions_df = pl.DataFrame(
-        {
-            "user_id": [
-                "u0", "u0", "u0", "u0",
-                "u1", "u1", "u1",
-                "u2", "u2", "u2", "u2",
-                "u3", "u3", "u3",
-                "u4", "u4", "u4", "u4", "u4",
-            ],
-            "item_id": [
-                "G0", "G1", "G2", "G3",
-                "G0", "G2", "G4",
-                "G1", "G3", "G4", "G5",
-                "G0", "G1", "G5",
-                "G0", "G1", "G2", "G3", "G4",
-            ],
-            "value": [1.0] * 19,
-            "days_ago": [
-                30.0, 25.0, 5.0, 2.0,
-                60.0, 3.0, 1.0,
-                40.0, 20.0, 4.0, 1.0,
-                50.0, 15.0, 2.0,
-                35.0, 28.0, 10.0, 3.0, 1.0,
-            ],
-        }
-    )
+        # Richer interactions: 5 users, 6 items, multiple interactions each
+        interactions_df = pl.DataFrame(
+            {
+                "user_id": [
+                    "u0", "u0", "u0", "u0",
+                    "u1", "u1", "u1",
+                    "u2", "u2", "u2", "u2",
+                    "u3", "u3", "u3",
+                    "u4", "u4", "u4", "u4", "u4",
+                ],
+                "item_id": [
+                    "G0", "G1", "G2", "G3",
+                    "G0", "G2", "G4",
+                    "G1", "G3", "G4", "G5",
+                    "G0", "G1", "G5",
+                    "G0", "G1", "G2", "G3", "G4",
+                ],
+                "value": [1.0] * 19,
+                "days_ago": [
+                    30.0, 25.0, 5.0, 2.0,
+                    60.0, 3.0, 1.0,
+                    40.0, 20.0, 4.0, 1.0,
+                    50.0, 15.0, 2.0,
+                    35.0, 28.0, 10.0, 3.0, 1.0,
+                ],
+            }
+        )
 
-    user_features_df = pl.DataFrame(
-        {
-            "user_id": ["u0", "u1", "u2", "u3", "u4"],
-            "feature_name": ["plan_Premium", "plan_Free", "plan_Premium", "plan_Free", "plan_Premium"],
-            "value": [1.0] * 5,
-        }
-    )
+        user_features_df = pl.DataFrame(
+            {
+                "user_id": ["u0", "u1", "u2", "u3", "u4"],
+                "feature_name": ["plan_Premium", "plan_Free", "plan_Premium", "plan_Free", "plan_Premium"],
+                "value": [1.0] * 5,
+            }
+        )
 
-    item_features_df = pl.DataFrame(
-        {
-            "item_id": ["G0", "G1", "G2", "G3", "G4", "G5"],
-            "feature_name": [
-                "genre_Action", "genre_Comedy", "genre_Action",
-                "genre_Drama", "genre_Comedy", "genre_Drama",
-            ],
-            "value": [1.0] * 6,
-        }
-    )
+        item_features_df = pl.DataFrame(
+            {
+                "item_id": ["G0", "G1", "G2", "G3", "G4", "G5"],
+                "feature_name": [
+                    "genre_Action", "genre_Comedy", "genre_Action",
+                    "genre_Drama", "genre_Comedy", "genre_Drama",
+                ],
+                "value": [1.0] * 6,
+            }
+        )
 
-    interactions_df.write_parquet(i_path)
-    user_features_df.write_parquet(u_path)
-    item_features_df.write_parquet(t_path)
+        interactions_df.write_parquet(i_path)
+        user_features_df.write_parquet(u_path)
+        item_features_df.write_parquet(t_path)
 
-    return str(i_path), str(u_path), str(t_path), tmpdir
+        yield str(i_path), str(u_path), str(t_path), tmpdir
 
 
 def test_random_split(evaluation_data):
@@ -745,46 +745,46 @@ def test_evaluate_model(evaluation_data):
 @pytest.fixture(scope="session")
 def tuning_data():
     """Creates test data with enough users for k-fold cross-validation."""
-    tmpdir = tempfile.mkdtemp()
-    i_path = Path(tmpdir) / "interactions.parquet"
-    u_path = Path(tmpdir) / "user_features.parquet"
-    t_path = Path(tmpdir) / "item_features.parquet"
+    with tempfile.TemporaryDirectory() as tmpdir:
+        i_path = Path(tmpdir) / "interactions.parquet"
+        u_path = Path(tmpdir) / "user_features.parquet"
+        t_path = Path(tmpdir) / "item_features.parquet"
 
-    interactions_df = pl.DataFrame(
-        {
-            "user_id": [
-                "u0", "u0", "u1", "u1", "u2", "u2",
-                "u3", "u3", "u4", "u4", "u5", "u5",
-            ],
-            "item_id": [
-                "G0", "G1", "G1", "G2", "G0", "G2",
-                "G2", "G3", "G0", "G3", "G1", "G3",
-            ],
-            "value": [1.0] * 12,
-        }
-    )
+        interactions_df = pl.DataFrame(
+            {
+                "user_id": [
+                    "u0", "u0", "u1", "u1", "u2", "u2",
+                    "u3", "u3", "u4", "u4", "u5", "u5",
+                ],
+                "item_id": [
+                    "G0", "G1", "G1", "G2", "G0", "G2",
+                    "G2", "G3", "G0", "G3", "G1", "G3",
+                ],
+                "value": [1.0] * 12,
+            }
+        )
 
-    user_features_df = pl.DataFrame(
-        {
-            "user_id": ["u0", "u1", "u2", "u3", "u4", "u5"],
-            "feature_name": ["plan_A", "plan_B", "plan_A", "plan_B", "plan_A", "plan_B"],
-            "value": [1.0] * 6,
-        }
-    )
+        user_features_df = pl.DataFrame(
+            {
+                "user_id": ["u0", "u1", "u2", "u3", "u4", "u5"],
+                "feature_name": ["plan_A", "plan_B", "plan_A", "plan_B", "plan_A", "plan_B"],
+                "value": [1.0] * 6,
+            }
+        )
 
-    item_features_df = pl.DataFrame(
-        {
-            "item_id": ["G0", "G1", "G2", "G3"],
-            "feature_name": ["genre_X", "genre_Y", "genre_X", "genre_Y"],
-            "value": [1.0] * 4,
-        }
-    )
+        item_features_df = pl.DataFrame(
+            {
+                "item_id": ["G0", "G1", "G2", "G3"],
+                "feature_name": ["genre_X", "genre_Y", "genre_X", "genre_Y"],
+                "value": [1.0] * 4,
+            }
+        )
 
-    interactions_df.write_parquet(i_path)
-    user_features_df.write_parquet(u_path)
-    item_features_df.write_parquet(t_path)
+        interactions_df.write_parquet(i_path)
+        user_features_df.write_parquet(u_path)
+        item_features_df.write_parquet(t_path)
 
-    return str(i_path), str(u_path), str(t_path)
+        yield str(i_path), str(u_path), str(t_path)
 
 
 def test_grid_search(tuning_data):

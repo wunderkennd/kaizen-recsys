@@ -132,7 +132,12 @@ pub fn random_split(
     for uid in &sorted_uids {
         let rows = user_rows.get_mut(uid).unwrap();
         rows.shuffle(&mut rng);
-        let n_test = (rows.len() as f64 * test_ratio).round() as usize;
+        let n_test = if rows.len() < 2 {
+            0
+        } else {
+            let requested = (rows.len() as f64 * test_ratio).round() as usize;
+            requested.clamp(1, rows.len() - 1)
+        };
         for &idx in rows.iter().take(n_test) {
             train_mask[idx] = false;
         }
@@ -177,6 +182,12 @@ pub fn temporal_split(
 ) -> Result<SplitStats> {
     let df = read_interactions_df(interactions_path)?;
     let days_col = df.column("days_ago")?.f64()?;
+
+    if days_col.null_count() > 0 {
+        return Err(anyhow!(
+            "days_ago contains null values; temporal_split requires non-null days_ago so every interaction is assigned to train or test"
+        ));
+    }
 
     // Build mask: train = days_ago > cutoff (older), test = days_ago <= cutoff (recent)
     let train_mask: BooleanChunked = days_col

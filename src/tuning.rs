@@ -157,6 +157,14 @@ fn generate_kfold_splits(
     // Sort for deterministic order before shuffling (AHashSet iteration is non-deterministic)
     unique_users.sort();
 
+    if n_folds > unique_users.len() {
+        return Err(anyhow!(
+            "n_folds ({}) exceeds number of unique users ({})",
+            n_folds,
+            unique_users.len()
+        ));
+    }
+
     // Deterministic shuffle
     let mut rng = StdRng::seed_from_u64(seed);
     unique_users.shuffle(&mut rng);
