@@ -250,43 +250,43 @@ def test_validate_data():
 @pytest.fixture(scope="session")
 def weighting_data():
     """Creates test data with event_type and days_ago columns for weighting tests."""
-    tmpdir = tempfile.mkdtemp()
-    i_path = Path(tmpdir) / "interactions.parquet"
-    u_path = Path(tmpdir) / "user_features.parquet"
-    t_path = Path(tmpdir) / "item_features.parquet"
+    with tempfile.TemporaryDirectory() as tmpdir:
+        i_path = Path(tmpdir) / "interactions.parquet"
+        u_path = Path(tmpdir) / "user_features.parquet"
+        t_path = Path(tmpdir) / "item_features.parquet"
 
-    # Interactions with event_type and days_ago columns
-    interactions_df = pl.DataFrame(
-        {
-            "user_id": ["u0", "u0", "u1", "u1"],
-            "item_id": ["G0", "G1", "G1", "G2"],
-            "value": [1.0, 1.0, 1.0, 1.0],
-            "event_type": ["purchase", "click", "click", "cart"],
-            "days_ago": [0.0, 30.0, 10.0, 100.0],
-        }
-    )
+        # Interactions with event_type and days_ago columns
+        interactions_df = pl.DataFrame(
+            {
+                "user_id": ["u0", "u0", "u1", "u1"],
+                "item_id": ["G0", "G1", "G1", "G2"],
+                "value": [1.0, 1.0, 1.0, 1.0],
+                "event_type": ["purchase", "click", "click", "cart"],
+                "days_ago": [0.0, 30.0, 10.0, 100.0],
+            }
+        )
 
-    user_features_df = pl.DataFrame(
-        {
-            "user_id": ["u0", "u1"],
-            "feature_name": ["plan_Premium", "plan_Free"],
-            "value": [1.0, 1.0],
-        }
-    )
+        user_features_df = pl.DataFrame(
+            {
+                "user_id": ["u0", "u1"],
+                "feature_name": ["plan_Premium", "plan_Free"],
+                "value": [1.0, 1.0],
+            }
+        )
 
-    item_features_df = pl.DataFrame(
-        {
-            "item_id": ["G0", "G1", "G2"],
-            "feature_name": ["genre_Action", "genre_Comedy", "genre_Drama"],
-            "value": [1.0, 1.0, 1.0],
-        }
-    )
+        item_features_df = pl.DataFrame(
+            {
+                "item_id": ["G0", "G1", "G2"],
+                "feature_name": ["genre_Action", "genre_Comedy", "genre_Drama"],
+                "value": [1.0, 1.0, 1.0],
+            }
+        )
 
-    interactions_df.write_parquet(i_path)
-    user_features_df.write_parquet(u_path)
-    item_features_df.write_parquet(t_path)
+        interactions_df.write_parquet(i_path)
+        user_features_df.write_parquet(u_path)
+        item_features_df.write_parquet(t_path)
 
-    return str(i_path), str(u_path), str(t_path)
+        yield str(i_path), str(u_path), str(t_path)
 
 
 def test_train_with_ips(weighting_data):
@@ -366,3 +366,216 @@ def test_backward_compat(weighting_data):
     for (g1, s1), (g2, s2) in zip(recs1, recs2):
         assert g1 == g2
         assert abs(s1 - s2) < 1e-10
+
+
+# --- FeaseRegistry Tests ---
+
+@pytest.fixture(scope="session")
+def two_territory_models(weighting_data):
+    """Trains two separate models with different params to simulate different territories."""
+    i_path, u_path, t_path = weighting_data
+
+    model_us = fease.build_and_train(
+        i_path, u_path, t_path,
+        alpha=1.0, beta=1.0, lambda_=10.0,
+    )
+    model_br = fease.build_and_train(
+        i_path, u_path, t_path,
+        alpha=1.0, beta=1.0, lambda_=50.0,  # different lambda
+    )
+    return model_us, model_br
+
+
+def test_registry_basic(two_territory_models):
+    """Create registry, register 2 models for different territories, verify predict works."""
+    model_us, model_br = two_territory_models
+
+    registry = fease.FeaseRegistry()
+    assert len(registry) == 0
+
+    registry.register("US", model_us)
+    registry.register("BR", model_br)
+
+    assert len(registry) == 2
+    territories = registry.territories()
+    assert "US" in territories
+    assert "BR" in territories
+
+    # Predict in each territory using index-based API
+    scores_us = registry.predict("US", [(0, 1.0)])
+    scores_br = registry.predict("BR", [(0, 1.0)])
+
+    assert len(scores_us) == model_us.num_items
+    assert len(scores_br) == model_br.num_items
+
+    # Different lambda should produce different scores
+    assert scores_us != scores_br
+
+
+def test_registry_fallback(two_territory_models):
+    """Create with fallback, verify unknown territory falls back."""
+    model_us, model_br = two_territory_models
+
+    registry = fease.FeaseRegistry(fallback_territory="US")
+    registry.register("US", model_us)
+    registry.register("BR", model_br)
+
+    # Known territory works
+    scores_us = registry.predict("US", [(0, 1.0)])
+    assert len(scores_us) == model_us.num_items
+
+    # Unknown territory "JP" falls back to "US"
+    scores_jp = registry.predict("JP", [(0, 1.0)])
+    assert len(scores_jp) == model_us.num_items
+
+    # Fallback scores should exactly match US scores
+    for a, b in zip(scores_us, scores_jp):
+        assert abs(a - b) < 1e-12
+
+
+def test_registry_predict_unknown_territory_error(two_territory_models):
+    """No fallback, unknown territory raises error."""
+    model_us, _ = two_territory_models
+
+    registry = fease.FeaseRegistry()  # No fallback
+    registry.register("US", model_us)
+
+    with pytest.raises(ValueError, match="No model registered for territory 'JP'"):
+        registry.predict("JP", [(0, 1.0)])
+
+
+def test_registry_predict_top_k(two_territory_models):
+    """Tests predict_top_k on registry, verifying exclusion and ordering."""
+    model_us, _ = two_territory_models
+
+    registry = fease.FeaseRegistry()
+    registry.register("US", model_us)
+
+    # User interacted with item 0, ask for top 2
+    top_recs = registry.predict_top_k("US", [(0, 1.0)], top_k=2)
+
+    assert len(top_recs) <= 2
+    # Item 0 should be excluded (user already interacted)
+    for idx, _ in top_recs:
+        assert idx != 0
+    # Results should be sorted descending by score
+    if len(top_recs) >= 2:
+        assert top_recs[0][1] >= top_recs[1][1]
+
+
+def test_registry_predict_similar_items(two_territory_models):
+    """Tests predict_similar_items on registry."""
+    model_us, _ = two_territory_models
+
+    registry = fease.FeaseRegistry()
+    registry.register("US", model_us)
+
+    similar = registry.predict_similar_items("US", 0, top_k=2)
+    assert len(similar) <= 2
+    # Should not contain item 0 itself
+    for idx, _ in similar:
+        assert idx != 0
+
+
+def test_registry_bool():
+    """Tests __bool__ — empty registry is falsy, non-empty is truthy."""
+    registry = fease.FeaseRegistry()
+    assert not registry  # empty -> falsy
+
+
+# --- Ranking Evaluation Metrics Tests ---
+
+import math
+
+
+def test_precision_at_k():
+    """Tests precision@K with known recommendations vs known relevant set."""
+    # recommended = [1, 2, 3, 4, 5], relevant = {1, 3, 5}
+    # top-3: hits = {1, 3} → 2/3
+    assert abs(fease.precision_at_k([1, 2, 3, 4, 5], {1, 3, 5}, 3) - 2.0 / 3.0) < 1e-10
+
+    # All relevant at top → 1.0
+    assert abs(fease.precision_at_k([1, 2, 3], {1, 2, 3}, 3) - 1.0) < 1e-10
+
+    # None relevant → 0.0
+    assert abs(fease.precision_at_k([1, 2, 3], {4, 5}, 3) - 0.0) < 1e-10
+
+    # k=0 → 0.0
+    assert abs(fease.precision_at_k([1, 2], {1}, 0) - 0.0) < 1e-10
+
+
+def test_recall_at_k():
+    """Tests recall@K computation."""
+    # top-3 of [1, 2, 3, 4, 5] with relevant {1, 3, 5, 7}: hits = {1, 3} → 2/4
+    assert abs(fease.recall_at_k([1, 2, 3, 4, 5], {1, 3, 5, 7}, 3) - 0.5) < 1e-10
+
+    # Full recall
+    assert abs(fease.recall_at_k([1, 3, 5, 7], {1, 3, 5, 7}, 4) - 1.0) < 1e-10
+
+    # Empty relevant → 0.0
+    assert abs(fease.recall_at_k([1, 2, 3], set(), 3) - 0.0) < 1e-10
+
+
+def test_ndcg_at_k():
+    """Tests NDCG@K with DCG normalization verification."""
+    # Perfect ranking: all relevant at top → NDCG = 1.0
+    assert abs(fease.ndcg_at_k([1, 2, 3, 4, 5], {1, 2, 3}, 3) - 1.0) < 1e-10
+
+    # Imperfect ranking: relevant = {3, 5}, recommended = [1, 2, 3, 4, 5]
+    # Hits at 0-based positions 2 and 4
+    # DCG = 1/log2(3+1) + 1/log2(5+1)
+    # IDCG = 1/log2(1+1) + 1/log2(2+1)
+    dcg = 1.0 / math.log2(4.0) + 1.0 / math.log2(6.0)
+    idcg = 1.0 / math.log2(2.0) + 1.0 / math.log2(3.0)
+    expected = dcg / idcg
+    assert abs(fease.ndcg_at_k([1, 2, 3, 4, 5], {3, 5}, 5) - expected) < 1e-10
+
+    # Single hit at top → 1.0
+    assert abs(fease.ndcg_at_k([1, 2, 3], {1}, 3) - 1.0) < 1e-10
+
+    # Empty relevant → 0.0
+    assert abs(fease.ndcg_at_k([1, 2, 3], set(), 3) - 0.0) < 1e-10
+
+
+def test_mean_average_precision():
+    """Tests MAP computation."""
+    # recommended = [1, 2, 3, 4, 5], relevant = {1, 3, 5}
+    # Hit at pos 0: prec = 1/1, pos 2: prec = 2/3, pos 4: prec = 3/5
+    # MAP = (1 + 2/3 + 3/5) / 3
+    expected = (1.0 + 2.0 / 3.0 + 3.0 / 5.0) / 3.0
+    assert abs(fease.mean_average_precision([1, 2, 3, 4, 5], {1, 3, 5}) - expected) < 1e-10
+
+    # Perfect ranking → 1.0
+    assert abs(fease.mean_average_precision([1, 2, 3], {1, 2, 3}) - 1.0) < 1e-10
+
+    # No hits → 0.0
+    assert abs(fease.mean_average_precision([1, 2, 3], {4, 5, 6}) - 0.0) < 1e-10
+
+
+def test_coverage():
+    """Tests coverage across multiple user recommendation lists."""
+    # 3 users, 10 total items, 6 unique recommended
+    all_recs = [[0, 1, 2], [2, 3, 4], [4, 5]]
+    assert abs(fease.coverage(all_recs, 10) - 0.6) < 1e-10
+
+    # Full coverage
+    assert abs(fease.coverage([[0, 1], [2, 3], [4]], 5) - 1.0) < 1e-10
+
+    # Duplicates across users don't inflate coverage
+    assert abs(fease.coverage([[0, 1], [0, 1], [0, 1]], 10) - 0.2) < 1e-10
+
+    # Empty recommendations → 0.0
+    assert abs(fease.coverage([[], []], 10) - 0.0) < 1e-10
+
+
+def test_hit_rate_at_k():
+    """Tests hit rate@K."""
+    # Hit within k
+    assert abs(fease.hit_rate_at_k([10, 20, 30], {20, 40}, 3) - 1.0) < 1e-10
+
+    # No hit
+    assert abs(fease.hit_rate_at_k([10, 20, 30], {40, 50}, 3) - 0.0) < 1e-10
+
+    # Hit outside k
+    assert abs(fease.hit_rate_at_k([10, 20, 30, 40], {40}, 2) - 0.0) < 1e-10
+    assert abs(fease.hit_rate_at_k([10, 20, 30, 40], {40}, 4) - 1.0) < 1e-10

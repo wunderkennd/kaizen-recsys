@@ -2,16 +2,30 @@
 
 from rust_fease_recommender import (
     FeaseModel,
+    FeaseRegistry,
     build_and_train,
+    coverage,
+    hit_rate_at_k,
     load_model,
+    mean_average_precision,
+    ndcg_at_k,
+    precision_at_k,
+    recall_at_k,
     validate_data,
 )
 from cr_fease.schemas import EngagementSchema, MetadataSchema
 
 __all__ = [
     "FeaseModel",
+    "FeaseRegistry",
     "build_and_train",
+    "coverage",
+    "hit_rate_at_k",
     "load_model",
+    "mean_average_precision",
+    "ndcg_at_k",
+    "precision_at_k",
+    "recall_at_k",
     "validate_data",
     "EngagementSchema",
     "MetadataSchema",

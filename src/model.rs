@@ -6,6 +6,7 @@
 //! It's called by `src/lib.rs` to perform the actual math.
 
 use crate::data_pipeline::Mappings;
+use crate::weighting::WeightingConfig;
 use anyhow::{Result, anyhow};
 use nalgebra::{DMatrix, DVector};
 use sprs::{CsMat, TriMat};
@@ -42,6 +43,7 @@ pub struct RustFeaseModel {
     pub meta_weight: f64,
     /// Mappings to convert between string IDs and numeric indices
     pub mappings: Mappings,
+    pub weighting_config: Option<WeightingConfig>,
 }
 
 impl RustFeaseModel {
@@ -69,6 +71,7 @@ impl RustFeaseModel {
             lambda_,
             meta_weight,
             mappings,
+            weighting_config: None,
         }
     }
 
@@ -225,10 +228,6 @@ impl RustFeaseModel {
         Ok(())
     }
 
-    /// Validates the trained model, checking for common issues.
-    ///
-    /// Returns a `ValidationReport` with pass/fail status and diagnostic messages.
-    /// Checks:
     /// Prunes small entries from the S matrix, setting values with
     /// |value| < threshold to zero. This increases sparsity and can
     /// reduce noise from near-zero weights.
@@ -249,6 +248,10 @@ impl RustFeaseModel {
         );
     }
 
+    /// Validates the trained model, checking for common issues.
+    ///
+    /// Returns a `ValidationReport` with pass/fail status and diagnostic messages.
+    /// Checks:
     /// - S matrix dimensions match expected (M+K)²
     /// - Diagonal entries are near-zero
     /// - No NaN or Inf values in S
@@ -612,6 +615,7 @@ mod tests {
             lambda_: 100.0,
             meta_weight: 0.0,
             mappings: dummy_mappings(),
+            weighting_config: None,
         };
 
         // --- 1. Warm User: interacts with Item 0, has Feature 1 ---
@@ -666,6 +670,7 @@ mod tests {
             lambda_: 100.0,
             meta_weight: 0.0,
             mappings: dummy_mappings(),
+            weighting_config: None,
         };
 
         // Similar to Item 0
@@ -748,6 +753,7 @@ mod tests {
             lambda_: 100.0,
             meta_weight: 0.0,
             mappings: dummy_mappings(),
+            weighting_config: None,
         };
 
         let report = model.validate();
@@ -767,6 +773,7 @@ mod tests {
             lambda_: 100.0,
             meta_weight: 0.0,
             mappings: dummy_mappings(),
+            weighting_config: None,
         };
 
         let report = model.validate();

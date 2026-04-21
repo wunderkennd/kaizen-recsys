@@ -73,8 +73,29 @@ ALPHA = 1.0   # Weight for item features
 BETA = 1.0    # Weight for user features
 LAMBDA = 150.0  # L2 regularization
 
+# --- Advanced Weighting Parameters ---
+# Set to 0.0 to disable (backward-compatible defaults).
+# Values below are from the original EaseConfig in db_pipeline.ipynb.
+DECAY_RATE = 0.0          # Exponential temporal decay on interactions (e.g., 0.005)
+IPS_ALPHA = 0.0           # Inverse propensity scoring strength (e.g., 0.5)
+SPARSITY_THRESHOLD = 0.0  # Prune S-matrix entries below this value (e.g., 0.001)
+
+# Event-type weight multipliers. Set to None to disable event weighting.
+# Keys must match the values in the `event_type` column of the interactions table.
+# Example: {"click": 1.0, "cart": 3.0, "purchase": 5.0, "negative": -2.0}
+EVENT_WEIGHTS = None
+
 # --- Feature Engineering Configuration ---
 MIN_WATCH_SECONDS = 30.0
+
+# --- Engagement Column Names ---
+# Column in the engagement table that contains the event type (e.g., "click", "purchase").
+# Set to None if the column does not exist or event weighting is not needed.
+EVENT_TYPE_COL = None      # e.g., "event_type" or "engagement_type"
+
+# Column in the engagement table that contains the event timestamp.
+# Used to compute `days_ago` for temporal decay. Set to None to skip.
+TIMESTAMP_COL = "view_ts"  # e.g., "view_ts", "event_timestamp"
 
 # COMMAND ----------
 
@@ -97,17 +118,34 @@ df_meta = spark.table(METADATA_TABLE)
 # ---
 # A. Create Interactions DataFrame
 # ---
-# schema: ["user_id", "item_id", "value"]
+# Base schema: ["user_id", "item_id", "value"]
+# Optional columns for advanced weighting: "event_type" (str), "days_ago" (float)
 print("Building Interactions table...")
+
+# Start with the base columns
+_interaction_cols = [
+    F.col("anonymous_id").alias("user_id"),
+    F.col("view_media_id").alias("item_id"),
+    # We use log-transform for watch time. Add 1 to avoid log(0).
+    (F.log(F.col("view_seconds_watched") + 1.0)).alias("value"),
+]
+
+# Add event_type column if configured (required for event_weights in Rust)
+if EVENT_TYPE_COL is not None:
+    _interaction_cols.append(F.col(EVENT_TYPE_COL).cast(StringType()).alias("event_type"))
+
+# Add days_ago column if configured (required for decay_rate in Rust)
+if TIMESTAMP_COL is not None and DECAY_RATE > 0.0:
+    _interaction_cols.append(
+        F.datediff(F.current_date(), F.to_date(F.col(TIMESTAMP_COL)))
+        .cast("double")
+        .alias("days_ago")
+    )
+
 df_interactions = (
     df_eng
     .filter(F.col("view_seconds_watched") >= MIN_WATCH_SECONDS)
-    .select(
-        F.col("anonymous_id").alias("user_id"),
-        F.col("view_media_id").alias("item_id"),
-        # We use log-transform for watch time. Add 1 to avoid log(0).
-        (F.log(F.col("view_seconds_watched") + 1.0)).alias("value")
-    )
+    .select(*_interaction_cols)
     .filter(F.col("user_id").isNotNull() & F.col("item_id").isNotNull())
     .distinct() # Or group by user/item and sum/avg value
 )
@@ -311,13 +349,26 @@ print("Starting model training (calling Rust library)...")
 start_train = time.time()
 
 try:
+    # Build keyword arguments for optional weighting params.
+    # Only pass non-default values so the Rust API stays backward-compatible.
+    _train_kwargs = {}
+    if DECAY_RATE > 0.0:
+        _train_kwargs["decay_rate"] = DECAY_RATE
+    if IPS_ALPHA > 0.0:
+        _train_kwargs["ips_alpha"] = IPS_ALPHA
+    if SPARSITY_THRESHOLD > 0.0:
+        _train_kwargs["sparsity_threshold"] = SPARSITY_THRESHOLD
+    if EVENT_WEIGHTS is not None:
+        _train_kwargs["event_weights"] = EVENT_WEIGHTS
+
     model = fease.build_and_train(
         interactions_path=TEMP_I_PATH,
         user_features_path=TEMP_U_PATH,
         item_features_path=TEMP_T_PATH,
         alpha=ALPHA,
         beta=BETA,
-        lambda_=LAMBDA  # Note the trailing underscore
+        lambda_=LAMBDA,  # Note the trailing underscore
+        **_train_kwargs,
     )
 
     print(f"Training complete in {time.time() - start_train:.2f}s")

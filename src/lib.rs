@@ -5,11 +5,13 @@
 use model::RustFeaseModel; // The internal Rust struct
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyFloat, PyList, PyString};
+use std::collections::HashSet;
 use std::path::Path;
 use std::time::Instant;
 
 mod data_pipeline;
 mod data_validation;
+pub mod metrics;
 mod model;
 mod schemas;
 mod serialization;
@@ -96,15 +98,14 @@ impl FeaseModel {
                 .predict(&user_interactions, &user_features, self.model.beta);
 
         // --- 3. Process and sort results ---
+        // Build a set of interacted items for O(1) lookup
+        let interacted: HashSet<usize> = user_interactions.iter().map(|(idx, _)| *idx).collect();
+
         let mut results_with_idx: Vec<(usize, f64)> = scores
             .into_iter()
             .enumerate()
             // Don't recommend items the user has already interacted with
-            .filter(|(idx, _score)| {
-                !user_interactions
-                    .iter()
-                    .any(|(interacted_idx, _)| *interacted_idx == *idx)
-            })
+            .filter(|(idx, _score)| !interacted.contains(idx))
             .collect();
 
         // Sort by score, descending.
@@ -187,8 +188,10 @@ impl FeaseModel {
             });
         }
 
-        // Run batch prediction with top-K filtering
-        let batch_results = serving::predict_batch_top_k(&self.model, &batch_inputs, top_k);
+        // Run batch prediction with top-K filtering.
+        // Release the GIL so other Python threads can proceed during rayon parallel work.
+        let batch_results =
+            py.detach(|| serving::predict_batch_top_k(&self.model, &batch_inputs, top_k));
 
         // Convert results back to Python
         let py_outer = PyList::empty(py);
@@ -515,6 +518,8 @@ fn build_and_train(
         train_start.elapsed().as_secs_f32()
     );
 
+    rust_model.weighting_config = weighting_config;
+
     // --- 2b. Apply sparsity pruning ---
     if sparsity_threshold > 0.0 {
         rust_model.prune_sparse(sparsity_threshold);
@@ -546,6 +551,222 @@ fn build_and_train(
     Ok(model)
 }
 
+/// A Python-accessible registry for territory-based multi-model routing.
+///
+/// This wraps the Rust `FeaseModelRegistry`, allowing Python callers to register
+/// multiple trained `FeaseModel` instances (one per territory/region) and route
+/// predictions to the correct model based on a territory key.
+///
+/// Example:
+///     >>> registry = FeaseRegistry(fallback_territory="US")
+///     >>> registry.register("US", us_model)
+///     >>> registry.register("BR", br_model)
+///     >>> scores = registry.predict("US", [(0, 1.0)], [(0, 1.0)])
+///     >>> top_recs = registry.predict_top_k("JP", [(0, 1.0)], 10)  # falls back to US
+#[pyclass]
+struct FeaseRegistry {
+    inner: serving::FeaseModelRegistry,
+}
+
+#[pymethods]
+impl FeaseRegistry {
+    /// Creates a new, empty registry.
+    ///
+    /// Args:
+    ///     fallback_territory (str, optional): If set, unknown territories will
+    ///         fall back to this territory's model instead of raising an error.
+    #[new]
+    #[pyo3(signature = (fallback_territory=None))]
+    fn new(fallback_territory: Option<String>) -> Self {
+        let inner = match fallback_territory {
+            Some(fb) => serving::FeaseModelRegistry::with_fallback(fb),
+            None => serving::FeaseModelRegistry::new(),
+        };
+        FeaseRegistry { inner }
+    }
+
+    /// Registers a trained FeaseModel for a territory.
+    ///
+    /// The model is cloned into the registry, so the original FeaseModel remains
+    /// usable independently.
+    ///
+    /// Args:
+    ///     territory (str): Territory key (e.g., "US", "BR", "EMEA").
+    ///     model (FeaseModel): A trained model to associate with this territory.
+    fn register(&mut self, territory: String, model: &FeaseModel) {
+        self.inner.register(territory, model.model.clone());
+    }
+
+    /// Removes and returns True if a model was registered for the given territory.
+    ///
+    /// Args:
+    ///     territory (str): Territory key to remove.
+    ///
+    /// Returns:
+    ///     bool: True if a model was removed, False if no model was registered.
+    fn unregister(&mut self, territory: &str) -> bool {
+        self.inner.unregister(territory).is_some()
+    }
+
+    /// Lists all registered territory names.
+    ///
+    /// Returns:
+    ///     list[str]: Territory keys in arbitrary order.
+    fn territories(&self) -> Vec<String> {
+        self.inner
+            .territories()
+            .into_iter()
+            .map(|s| s.to_string())
+            .collect()
+    }
+
+    /// Returns the number of registered models.
+    fn __len__(&self) -> usize {
+        self.inner.len()
+    }
+
+    /// Returns True if any models are registered.
+    fn __bool__(&self) -> bool {
+        !self.inner.is_empty()
+    }
+
+    /// Predicts scores for a user in a specific territory (index-based).
+    ///
+    /// This is the low-level API using numeric indices. For string-based predictions,
+    /// retrieve the model and call its `predict` method directly.
+    ///
+    /// Args:
+    ///     territory (str): Territory key to route to.
+    ///     user_interactions (list[tuple[int, float]]): (item_index, value) pairs.
+    ///     user_features (list[tuple[int, float]], optional): (feature_index, value) pairs.
+    ///
+    /// Returns:
+    ///     list[float]: Predicted scores for all items (length = num_items).
+    ///
+    /// Raises:
+    ///     ValueError: If the territory is unknown and no fallback is set.
+    #[pyo3(signature = (territory, user_interactions, user_features=None))]
+    fn predict(
+        &self,
+        territory: &str,
+        user_interactions: Vec<(usize, f64)>,
+        user_features: Option<Vec<(usize, f64)>>,
+    ) -> PyResult<Vec<f64>> {
+        let features = user_features.unwrap_or_default();
+        self.inner
+            .predict(territory, &user_interactions, &features)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))
+    }
+
+    /// Predicts top-K items for a user in a territory, excluding interacted items.
+    ///
+    /// Args:
+    ///     territory (str): Territory key to route to.
+    ///     user_interactions (list[tuple[int, float]]): (item_index, value) pairs.
+    ///     top_k (int): Number of top items to return.
+    ///     user_features (list[tuple[int, float]], optional): (feature_index, value) pairs.
+    ///
+    /// Returns:
+    ///     list[tuple[int, float]]: Top-K (item_index, score) pairs, sorted descending.
+    ///
+    /// Raises:
+    ///     ValueError: If the territory is unknown and no fallback is set.
+    #[pyo3(signature = (territory, user_interactions, top_k, user_features=None))]
+    fn predict_top_k(
+        &self,
+        territory: &str,
+        user_interactions: Vec<(usize, f64)>,
+        top_k: usize,
+        user_features: Option<Vec<(usize, f64)>>,
+    ) -> PyResult<Vec<(usize, f64)>> {
+        let features = user_features.unwrap_or_default();
+        let model = self.inner.get_model(territory).ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                "No model registered for territory '{}' (and no fallback available)",
+                territory
+            ))
+        })?;
+
+        let scores = model.predict(&user_interactions, &features, model.beta);
+        let interacted_indices: Vec<usize> =
+            user_interactions.iter().map(|(idx, _)| *idx).collect();
+
+        Ok(serving::filter_sort_top_k(
+            scores,
+            &interacted_indices,
+            top_k,
+        ))
+    }
+
+    /// Predicts similar items for a given item index in a specific territory.
+    ///
+    /// Args:
+    ///     territory (str): Territory key to route to.
+    ///     item_idx (int): The item index to find similar items for.
+    ///     top_k (int): Number of similar items to return.
+    ///
+    /// Returns:
+    ///     list[tuple[int, float]]: (item_index, score) pairs, sorted descending.
+    ///
+    /// Raises:
+    ///     ValueError: If the territory is unknown and no fallback is set.
+    #[pyo3(signature = (territory, item_idx, top_k=20))]
+    fn predict_similar_items(
+        &self,
+        territory: &str,
+        item_idx: usize,
+        top_k: usize,
+    ) -> PyResult<Vec<(usize, f64)>> {
+        self.inner
+            .predict_similar_items(territory, item_idx, top_k)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))
+    }
+}
+
+// --- Ranking Evaluation Metrics (PyO3 wrappers) ---
+
+/// Precision@K: fraction of top-K recommendations that are relevant.
+#[pyfunction]
+#[pyo3(signature = (recommended, relevant, k))]
+fn precision_at_k(recommended: Vec<usize>, relevant: HashSet<usize>, k: usize) -> f64 {
+    metrics::precision_at_k(&recommended, &relevant, k)
+}
+
+/// Recall@K: fraction of relevant items captured in the top-K recommendations.
+#[pyfunction]
+#[pyo3(signature = (recommended, relevant, k))]
+fn recall_at_k(recommended: Vec<usize>, relevant: HashSet<usize>, k: usize) -> f64 {
+    metrics::recall_at_k(&recommended, &relevant, k)
+}
+
+/// NDCG@K: Normalized Discounted Cumulative Gain at K (binary relevance).
+#[pyfunction]
+#[pyo3(signature = (recommended, relevant, k))]
+fn ndcg_at_k(recommended: Vec<usize>, relevant: HashSet<usize>, k: usize) -> f64 {
+    metrics::ndcg_at_k(&recommended, &relevant, k)
+}
+
+/// Mean Average Precision over the full recommendation list.
+#[pyfunction]
+#[pyo3(signature = (recommended, relevant))]
+fn mean_average_precision(recommended: Vec<usize>, relevant: HashSet<usize>) -> f64 {
+    metrics::mean_average_precision(&recommended, &relevant)
+}
+
+/// Coverage: fraction of the item catalog recommended across all users.
+#[pyfunction]
+#[pyo3(signature = (all_recommendations, num_total_items))]
+fn coverage(all_recommendations: Vec<Vec<usize>>, num_total_items: usize) -> f64 {
+    metrics::coverage(&all_recommendations, num_total_items)
+}
+
+/// Hit Rate@K: 1.0 if any item in top-K is relevant, else 0.0.
+#[pyfunction]
+#[pyo3(signature = (recommended, relevant, k))]
+fn hit_rate_at_k(recommended: Vec<usize>, relevant: HashSet<usize>, k: usize) -> f64 {
+    metrics::hit_rate_at_k(&recommended, &relevant, k)
+}
+
 /// Defines the Python module.
 /// This function is called when Python runs `import rust_fease_recommender`.
 #[pymodule]
@@ -553,6 +774,13 @@ fn rust_fease_recommender(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<
     m.add_function(wrap_pyfunction!(build_and_train, m)?)?;
     m.add_function(wrap_pyfunction!(load_model, m)?)?;
     m.add_function(wrap_pyfunction!(validate_data, m)?)?;
+    m.add_function(wrap_pyfunction!(precision_at_k, m)?)?;
+    m.add_function(wrap_pyfunction!(recall_at_k, m)?)?;
+    m.add_function(wrap_pyfunction!(ndcg_at_k, m)?)?;
+    m.add_function(wrap_pyfunction!(mean_average_precision, m)?)?;
+    m.add_function(wrap_pyfunction!(coverage, m)?)?;
+    m.add_function(wrap_pyfunction!(hit_rate_at_k, m)?)?;
     m.add_class::<FeaseModel>()?;
+    m.add_class::<FeaseRegistry>()?;
     Ok(())
 }
