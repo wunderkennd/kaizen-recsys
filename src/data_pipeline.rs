@@ -268,10 +268,8 @@ fn build_triplets(
 
     let mut triplets = Vec::with_capacity(df.height());
 
-    for ((opt_row_str, opt_col_str), opt_val) in row_series
-        .into_iter()
-        .zip(col_series.into_iter())
-        .zip(val_iter)
+    for ((opt_row_str, opt_col_str), opt_val) in
+        row_series.into_iter().zip(col_series).zip(val_iter)
     {
         if let (Some(row_str), Some(col_str), Some(val)) = (opt_row_str, opt_col_str, opt_val) {
             // Look up the indices. If not found, skip (shouldn't happen if maps

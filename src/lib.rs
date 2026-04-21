@@ -11,11 +11,12 @@ use std::time::Instant;
 
 mod data_pipeline;
 mod data_validation;
+pub mod evaluation;
 pub mod metrics;
 mod model;
-mod schemas;
 mod serialization;
 mod serving;
+pub mod tuning;
 mod weighting;
 
 /// A Python-accessible class that holds the trained FEASE model.
@@ -264,6 +265,64 @@ impl FeaseModel {
         Ok((report.passed, py_messages))
     }
 
+    /// Evaluates this model against test data, computing recommendation metrics.
+    ///
+    /// Args:
+    ///     test_interactions_path (str): Path to test interactions Parquet/CSV.
+    ///     train_interactions_path (str): Path to train interactions Parquet/CSV.
+    ///     k_values (list[int], optional): K values to evaluate at.
+    ///         Defaults to [5, 10, 20, 50].
+    ///
+    /// Returns:
+    ///     dict: An evaluation report with keys:
+    ///         - "num_users" (int)
+    ///         - "num_interactions" (int)
+    ///         - "coverage" (float)
+    ///         - "metrics" (list[dict]): Per-K metrics, each with keys:
+    ///           "k", "precision", "recall", "ndcg", "map", "hit_rate"
+    #[pyo3(signature = (test_interactions_path, train_interactions_path, user_features_path=None, k_values=None))]
+    fn evaluate<'py>(
+        &self,
+        py: Python<'py>,
+        test_interactions_path: &str,
+        train_interactions_path: &str,
+        user_features_path: Option<&str>,
+        k_values: Option<Vec<usize>>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let config = evaluation::EvalConfig {
+            k_values: k_values.unwrap_or_else(|| vec![5, 10, 20, 50]),
+        };
+
+        let report = evaluation::evaluate_model(
+            &self.model,
+            test_interactions_path,
+            train_interactions_path,
+            user_features_path,
+            &config,
+        )
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+
+        let result = PyDict::new(py);
+        result.set_item("num_users", report.num_users)?;
+        result.set_item("num_interactions", report.num_interactions)?;
+        result.set_item("coverage", report.coverage)?;
+
+        let metrics_list = PyList::empty(py);
+        for m in &report.metrics_at_k {
+            let m_dict = PyDict::new(py);
+            m_dict.set_item("k", m.k)?;
+            m_dict.set_item("precision", m.precision)?;
+            m_dict.set_item("recall", m.recall)?;
+            m_dict.set_item("ndcg", m.ndcg)?;
+            m_dict.set_item("map", m.map)?;
+            m_dict.set_item("hit_rate", m.hit_rate)?;
+            metrics_list.append(m_dict)?;
+        }
+        result.set_item("metrics", metrics_list)?;
+
+        Ok(result)
+    }
+
     /// Saves the trained model to a binary file.
     ///
     /// Args:
@@ -376,6 +435,108 @@ fn validate_data<'py>(
     let py_messages = PyList::new(py, &messages)?;
 
     Ok((report.all_passed(), py_messages))
+}
+
+/// Splits interaction data randomly per user into train and test sets.
+///
+/// Args:
+///     interactions_path (str): Path to interactions Parquet/CSV file.
+///     train_output (str): Output path for the train split.
+///     test_output (str): Output path for the test split.
+///     test_ratio (float): Fraction of each user's interactions to hold out (0.0-1.0).
+///     seed (int): Random seed for reproducibility.
+///
+/// Returns:
+///     tuple[int, int, int, int]: (train_interactions, test_interactions, train_users, test_users)
+#[pyfunction]
+#[pyo3(signature = (interactions_path, train_output, test_output, test_ratio=0.2, seed=42))]
+fn random_split(
+    interactions_path: &str,
+    train_output: &str,
+    test_output: &str,
+    test_ratio: f64,
+    seed: u64,
+) -> PyResult<(usize, usize, usize, usize)> {
+    let stats = evaluation::random_split(
+        interactions_path,
+        train_output,
+        test_output,
+        test_ratio,
+        seed,
+    )
+    .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+    Ok((
+        stats.train_interactions,
+        stats.test_interactions,
+        stats.train_users,
+        stats.test_users,
+    ))
+}
+
+/// Splits interaction data by time: recent interactions (days_ago <= cutoff) go to test.
+///
+/// Args:
+///     interactions_path (str): Path to interactions Parquet/CSV file (must have `days_ago` column).
+///     train_output (str): Output path for the train split.
+///     test_output (str): Output path for the test split.
+///     days_ago_cutoff (float): Interactions with days_ago <= this go to test.
+///
+/// Returns:
+///     tuple[int, int, int, int]: (train_interactions, test_interactions, train_users, test_users)
+#[pyfunction]
+#[pyo3(signature = (interactions_path, train_output, test_output, days_ago_cutoff))]
+fn temporal_split(
+    interactions_path: &str,
+    train_output: &str,
+    test_output: &str,
+    days_ago_cutoff: f64,
+) -> PyResult<(usize, usize, usize, usize)> {
+    let stats = evaluation::temporal_split(
+        interactions_path,
+        train_output,
+        test_output,
+        days_ago_cutoff,
+    )
+    .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+    Ok((
+        stats.train_interactions,
+        stats.test_interactions,
+        stats.train_users,
+        stats.test_users,
+    ))
+}
+
+/// Leave-K-Out split: holds out exactly k random interactions per user for test.
+///
+/// Users with fewer than k+1 interactions go entirely to train.
+///
+/// Args:
+///     interactions_path (str): Path to interactions Parquet/CSV file.
+///     train_output (str): Output path for the train split.
+///     test_output (str): Output path for the test split.
+///     k (int): Number of interactions to hold out per user.
+///     seed (int): Random seed for reproducibility.
+///
+/// Returns:
+///     tuple[int, int, int, int]: (train_interactions, test_interactions, train_users, test_users)
+#[pyfunction]
+#[pyo3(signature = (interactions_path, train_output, test_output, k=1, seed=42))]
+fn leave_k_out_split(
+    interactions_path: &str,
+    train_output: &str,
+    test_output: &str,
+    k: usize,
+    seed: u64,
+) -> PyResult<(usize, usize, usize, usize)> {
+    let stats =
+        evaluation::leave_k_out_split(interactions_path, train_output, test_output, k, seed)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+    Ok((
+        stats.train_interactions,
+        stats.test_interactions,
+        stats.train_users,
+        stats.test_users,
+    ))
 }
 
 /// A Python-callable function to build and train the model from file paths.
@@ -767,6 +928,180 @@ fn hit_rate_at_k(recommended: Vec<usize>, relevant: HashSet<usize>, k: usize) ->
     metrics::hit_rate_at_k(&recommended, &relevant, k)
 }
 
+/// Grid search over hyperparameters with k-fold cross-validation.
+///
+/// Args:
+///     interactions_path (str): Path to interactions Parquet/CSV file.
+///     user_features_path (str): Path to user features Parquet/CSV file.
+///     item_features_path (str): Path to item features Parquet/CSV file.
+///     param_grid (dict): Dict of parameter name -> list of values to try.
+///         Keys: "alpha", "beta", "lambda_", "meta_weight", "decay_rate",
+///         "ips_alpha", "sparsity_threshold". Missing keys get default single-element lists.
+///     n_folds (int): Number of cross-validation folds (default 3).
+///     eval_k (int): k for NDCG@k evaluation metric (default 10).
+///     seed (int): Random seed for fold generation (default 42).
+///
+/// Returns:
+///     dict: {"best_params": {...}, "best_score": float, "metric": str,
+///            "trials": [{"params": {...}, "mean_score": float, "fold_scores": [...]}, ...]}
+#[pyfunction]
+#[pyo3(signature = (
+    interactions_path,
+    user_features_path,
+    item_features_path,
+    param_grid,
+    n_folds = 3,
+    eval_k = 10,
+    seed = 42
+))]
+#[allow(clippy::too_many_arguments)]
+fn grid_search_py(
+    py: Python<'_>,
+    interactions_path: &str,
+    user_features_path: &str,
+    item_features_path: &str,
+    param_grid: &Bound<'_, PyDict>,
+    n_folds: usize,
+    eval_k: usize,
+    seed: u64,
+) -> PyResult<Py<PyAny>> {
+    let grid = parse_param_grid(param_grid)?;
+    let result = tuning::grid_search(
+        interactions_path,
+        user_features_path,
+        item_features_path,
+        &grid,
+        n_folds,
+        eval_k,
+        seed,
+    )
+    .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+
+    search_result_to_py(py, &result)
+}
+
+/// Random search over hyperparameters with k-fold cross-validation.
+///
+/// Args:
+///     interactions_path (str): Path to interactions Parquet/CSV file.
+///     user_features_path (str): Path to user features Parquet/CSV file.
+///     item_features_path (str): Path to item features Parquet/CSV file.
+///     param_grid (dict): Dict of parameter name -> list of values to sample from.
+///     n_trials (int): Number of random configurations to evaluate (default 10).
+///     n_folds (int): Number of cross-validation folds (default 3).
+///     eval_k (int): k for NDCG@k evaluation metric (default 10).
+///     seed (int): Random seed for fold generation and sampling (default 42).
+///
+/// Returns:
+///     dict: Same structure as grid_search.
+#[pyfunction]
+#[pyo3(signature = (
+    interactions_path,
+    user_features_path,
+    item_features_path,
+    param_grid,
+    n_trials = 10,
+    n_folds = 3,
+    eval_k = 10,
+    seed = 42
+))]
+#[allow(clippy::too_many_arguments)]
+fn random_search_py(
+    py: Python<'_>,
+    interactions_path: &str,
+    user_features_path: &str,
+    item_features_path: &str,
+    param_grid: &Bound<'_, PyDict>,
+    n_trials: usize,
+    n_folds: usize,
+    eval_k: usize,
+    seed: u64,
+) -> PyResult<Py<PyAny>> {
+    let grid = parse_param_grid(param_grid)?;
+    let result = tuning::random_search(
+        interactions_path,
+        user_features_path,
+        item_features_path,
+        &grid,
+        n_trials,
+        n_folds,
+        eval_k,
+        seed,
+    )
+    .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+
+    search_result_to_py(py, &result)
+}
+
+/// Parses a Python dict into a ParamGrid, using defaults for missing keys.
+fn parse_param_grid(dict: &Bound<'_, PyDict>) -> PyResult<tuning::ParamGrid> {
+    fn extract_vec(dict: &Bound<'_, PyDict>, key: &str, default: f64) -> PyResult<Vec<f64>> {
+        match dict.get_item(key)? {
+            Some(val) => {
+                let list: Vec<f64> = val.extract()?;
+                if list.is_empty() {
+                    Ok(vec![default])
+                } else {
+                    Ok(list)
+                }
+            }
+            None => Ok(vec![default]),
+        }
+    }
+
+    Ok(tuning::ParamGrid {
+        alpha: extract_vec(dict, "alpha", 1.0)?,
+        beta: extract_vec(dict, "beta", 1.0)?,
+        lambda_: extract_vec(dict, "lambda_", 100.0)?,
+        meta_weight: extract_vec(dict, "meta_weight", 0.0)?,
+        decay_rate: extract_vec(dict, "decay_rate", 0.0)?,
+        ips_alpha: extract_vec(dict, "ips_alpha", 0.0)?,
+        sparsity_threshold: extract_vec(dict, "sparsity_threshold", 0.0)?,
+    })
+}
+
+/// Converts a SearchResult into a Python dict.
+fn search_result_to_py(py: Python<'_>, result: &tuning::SearchResult) -> PyResult<Py<PyAny>> {
+    let dict = PyDict::new(py);
+
+    // best_params
+    let bp = PyDict::new(py);
+    bp.set_item("alpha", result.best_params.alpha)?;
+    bp.set_item("beta", result.best_params.beta)?;
+    bp.set_item("lambda_", result.best_params.lambda_)?;
+    bp.set_item("meta_weight", result.best_params.meta_weight)?;
+    bp.set_item("decay_rate", result.best_params.decay_rate)?;
+    bp.set_item("ips_alpha", result.best_params.ips_alpha)?;
+    bp.set_item("sparsity_threshold", result.best_params.sparsity_threshold)?;
+    dict.set_item("best_params", bp)?;
+
+    dict.set_item("best_score", result.best_score)?;
+    dict.set_item("metric", &result.metric_name)?;
+
+    // trials
+    let trials_list = PyList::empty(py);
+    for trial in &result.all_trials {
+        let trial_dict = PyDict::new(py);
+
+        let params_dict = PyDict::new(py);
+        params_dict.set_item("alpha", trial.params.alpha)?;
+        params_dict.set_item("beta", trial.params.beta)?;
+        params_dict.set_item("lambda_", trial.params.lambda_)?;
+        params_dict.set_item("meta_weight", trial.params.meta_weight)?;
+        params_dict.set_item("decay_rate", trial.params.decay_rate)?;
+        params_dict.set_item("ips_alpha", trial.params.ips_alpha)?;
+        params_dict.set_item("sparsity_threshold", trial.params.sparsity_threshold)?;
+
+        trial_dict.set_item("params", params_dict)?;
+        trial_dict.set_item("mean_score", trial.mean_score)?;
+        trial_dict.set_item("fold_scores", trial.fold_scores.clone())?;
+        trials_list.append(trial_dict)?;
+    }
+    dict.set_item("trials", trials_list)?;
+
+    Ok(dict.into())
+}
+
 /// Defines the Python module.
 /// This function is called when Python runs `import rust_fease_recommender`.
 #[pymodule]
@@ -780,6 +1115,11 @@ fn rust_fease_recommender(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<
     m.add_function(wrap_pyfunction!(mean_average_precision, m)?)?;
     m.add_function(wrap_pyfunction!(coverage, m)?)?;
     m.add_function(wrap_pyfunction!(hit_rate_at_k, m)?)?;
+    m.add_function(wrap_pyfunction!(random_split, m)?)?;
+    m.add_function(wrap_pyfunction!(temporal_split, m)?)?;
+    m.add_function(wrap_pyfunction!(leave_k_out_split, m)?)?;
+    m.add_function(wrap_pyfunction!(grid_search_py, m)?)?;
+    m.add_function(wrap_pyfunction!(random_search_py, m)?)?;
     m.add_class::<FeaseModel>()?;
     m.add_class::<FeaseRegistry>()?;
     Ok(())

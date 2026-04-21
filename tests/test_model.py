@@ -579,3 +579,276 @@ def test_hit_rate_at_k():
     # Hit outside k
     assert abs(fease.hit_rate_at_k([10, 20, 30, 40], {40}, 2) - 0.0) < 1e-10
     assert abs(fease.hit_rate_at_k([10, 20, 30, 40], {40}, 4) - 1.0) < 1e-10
+
+
+# --- Evaluation Pipeline Tests ---
+
+@pytest.fixture(scope="session")
+def evaluation_data():
+    """Creates a larger dataset suitable for train/test splitting and evaluation."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        i_path = Path(tmpdir) / "interactions.parquet"
+        u_path = Path(tmpdir) / "user_features.parquet"
+        t_path = Path(tmpdir) / "item_features.parquet"
+
+        # Richer interactions: 5 users, 6 items, multiple interactions each
+        interactions_df = pl.DataFrame(
+            {
+                "user_id": [
+                    "u0", "u0", "u0", "u0",
+                    "u1", "u1", "u1",
+                    "u2", "u2", "u2", "u2",
+                    "u3", "u3", "u3",
+                    "u4", "u4", "u4", "u4", "u4",
+                ],
+                "item_id": [
+                    "G0", "G1", "G2", "G3",
+                    "G0", "G2", "G4",
+                    "G1", "G3", "G4", "G5",
+                    "G0", "G1", "G5",
+                    "G0", "G1", "G2", "G3", "G4",
+                ],
+                "value": [1.0] * 19,
+                "days_ago": [
+                    30.0, 25.0, 5.0, 2.0,
+                    60.0, 3.0, 1.0,
+                    40.0, 20.0, 4.0, 1.0,
+                    50.0, 15.0, 2.0,
+                    35.0, 28.0, 10.0, 3.0, 1.0,
+                ],
+            }
+        )
+
+        user_features_df = pl.DataFrame(
+            {
+                "user_id": ["u0", "u1", "u2", "u3", "u4"],
+                "feature_name": ["plan_Premium", "plan_Free", "plan_Premium", "plan_Free", "plan_Premium"],
+                "value": [1.0] * 5,
+            }
+        )
+
+        item_features_df = pl.DataFrame(
+            {
+                "item_id": ["G0", "G1", "G2", "G3", "G4", "G5"],
+                "feature_name": [
+                    "genre_Action", "genre_Comedy", "genre_Action",
+                    "genre_Drama", "genre_Comedy", "genre_Drama",
+                ],
+                "value": [1.0] * 6,
+            }
+        )
+
+        interactions_df.write_parquet(i_path)
+        user_features_df.write_parquet(u_path)
+        item_features_df.write_parquet(t_path)
+
+        yield str(i_path), str(u_path), str(t_path), tmpdir
+
+
+def test_random_split(evaluation_data):
+    """Tests random split: file creation and sizes."""
+    i_path, _, _, tmpdir = evaluation_data
+    train_out = str(Path(tmpdir) / "random_train.parquet")
+    test_out = str(Path(tmpdir) / "random_test.parquet")
+
+    train_n, test_n, train_u, test_u = fease.random_split(
+        i_path, train_out, test_out, test_ratio=0.25, seed=42
+    )
+
+    assert train_n + test_n == 19  # total interactions preserved
+    assert train_n > 0
+    assert test_n > 0
+    assert os.path.exists(train_out)
+    assert os.path.exists(test_out)
+
+    # Verify parquet files are readable
+    train_df = pl.read_parquet(train_out)
+    test_df = pl.read_parquet(test_out)
+    assert train_df.height == train_n
+    assert test_df.height == test_n
+
+
+def test_leave_k_out_split(evaluation_data):
+    """Tests leave-k-out split: exactly k items held out per eligible user."""
+    i_path, _, _, tmpdir = evaluation_data
+    train_out = str(Path(tmpdir) / "lko_train.parquet")
+    test_out = str(Path(tmpdir) / "lko_test.parquet")
+
+    k = 2
+    train_n, test_n, train_u, test_u = fease.leave_k_out_split(
+        i_path, train_out, test_out, k=k, seed=42
+    )
+
+    assert train_n + test_n == 19
+
+    # Each user in the test set should have exactly k items
+    test_df = pl.read_parquet(test_out)
+    user_counts = test_df.group_by("user_id").agg(pl.col("item_id").count().alias("n"))
+
+    for row in user_counts.iter_rows(named=True):
+        assert row["n"] == k, f"User {row['user_id']} has {row['n']} test items, expected {k}"
+
+
+def test_evaluate_model(evaluation_data):
+    """Tests the full evaluation pipeline: split, train, evaluate."""
+    i_path, u_path, t_path, tmpdir = evaluation_data
+    train_out = str(Path(tmpdir) / "eval_train.parquet")
+    test_out = str(Path(tmpdir) / "eval_test.parquet")
+
+    # Split the data
+    fease.leave_k_out_split(i_path, train_out, test_out, k=1, seed=42)
+
+    # Train a model on the train split
+    model = fease.build_and_train(
+        interactions_path=train_out,
+        user_features_path=u_path,
+        item_features_path=t_path,
+        alpha=1.0,
+        beta=1.0,
+        lambda_=10.0,
+    )
+
+    # Evaluate (pass user features for accurate cold-start metrics)
+    report = model.evaluate(test_out, train_out, user_features_path=u_path, k_values=[2, 5])
+
+    # Verify report structure
+    assert "num_users" in report
+    assert "num_interactions" in report
+    assert "coverage" in report
+    assert "metrics" in report
+
+    assert report["num_users"] > 0
+    assert report["num_interactions"] > 0
+    assert 0.0 <= report["coverage"] <= 1.0
+
+    assert len(report["metrics"]) == 2
+    for m in report["metrics"]:
+        assert "k" in m
+        assert "precision" in m
+        assert "recall" in m
+        assert "ndcg" in m
+        assert "map" in m
+        assert "hit_rate" in m
+        assert m["k"] in [2, 5]
+        # Metrics should be in valid range
+        assert 0.0 <= m["precision"] <= 1.0
+        assert 0.0 <= m["recall"] <= 1.0
+        assert 0.0 <= m["ndcg"] <= 1.0
+        assert 0.0 <= m["map"] <= 1.0
+        assert 0.0 <= m["hit_rate"] <= 1.0
+
+    print("\nEvaluation Report:", report)
+
+
+# --- Hyperparameter Tuning Tests ---
+
+@pytest.fixture(scope="session")
+def tuning_data():
+    """Creates test data with enough users for k-fold cross-validation."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        i_path = Path(tmpdir) / "interactions.parquet"
+        u_path = Path(tmpdir) / "user_features.parquet"
+        t_path = Path(tmpdir) / "item_features.parquet"
+
+        interactions_df = pl.DataFrame(
+            {
+                "user_id": [
+                    "u0", "u0", "u1", "u1", "u2", "u2",
+                    "u3", "u3", "u4", "u4", "u5", "u5",
+                ],
+                "item_id": [
+                    "G0", "G1", "G1", "G2", "G0", "G2",
+                    "G2", "G3", "G0", "G3", "G1", "G3",
+                ],
+                "value": [1.0] * 12,
+            }
+        )
+
+        user_features_df = pl.DataFrame(
+            {
+                "user_id": ["u0", "u1", "u2", "u3", "u4", "u5"],
+                "feature_name": ["plan_A", "plan_B", "plan_A", "plan_B", "plan_A", "plan_B"],
+                "value": [1.0] * 6,
+            }
+        )
+
+        item_features_df = pl.DataFrame(
+            {
+                "item_id": ["G0", "G1", "G2", "G3"],
+                "feature_name": ["genre_X", "genre_Y", "genre_X", "genre_Y"],
+                "value": [1.0] * 4,
+            }
+        )
+
+        interactions_df.write_parquet(i_path)
+        user_features_df.write_parquet(u_path)
+        item_features_df.write_parquet(t_path)
+
+        yield str(i_path), str(u_path), str(t_path)
+
+
+def test_grid_search(tuning_data):
+    """Tests grid search returns correct result structure."""
+    i_path, u_path, t_path = tuning_data
+    result = fease.grid_search_py(
+        i_path, u_path, t_path,
+        param_grid={"lambda_": [10.0, 100.0]},
+        n_folds=2,
+        eval_k=10,
+        seed=42,
+    )
+
+    assert "best_params" in result
+    assert "best_score" in result
+    assert "metric" in result
+    assert "trials" in result
+    assert result["metric"] == "ndcg@10"
+    assert len(result["trials"]) == 2
+
+    # Check best_params structure
+    bp = result["best_params"]
+    assert "alpha" in bp
+    assert "beta" in bp
+    assert "lambda_" in bp
+    assert "meta_weight" in bp
+
+    # Check trial structure
+    trial = result["trials"][0]
+    assert "params" in trial
+    assert "mean_score" in trial
+    assert "fold_scores" in trial
+    assert len(trial["fold_scores"]) == 2
+
+    # best_score should match one of the trial scores
+    trial_scores = [t["mean_score"] for t in result["trials"]]
+    assert result["best_score"] == max(trial_scores)
+
+    print("\nGrid search result:", result)
+
+
+def test_random_search(tuning_data):
+    """Tests random search with n_trials=2 returns correct structure."""
+    i_path, u_path, t_path = tuning_data
+    result = fease.random_search_py(
+        i_path, u_path, t_path,
+        param_grid={"alpha": [0.5, 1.0, 2.0], "lambda_": [10.0, 50.0, 100.0]},
+        n_trials=2,
+        n_folds=2,
+        eval_k=10,
+        seed=42,
+    )
+
+    assert "best_params" in result
+    assert "best_score" in result
+    assert "metric" in result
+    assert "trials" in result
+    assert result["metric"] == "ndcg@10"
+    assert len(result["trials"]) == 2
+
+    for trial in result["trials"]:
+        assert "params" in trial
+        assert "mean_score" in trial
+        assert "fold_scores" in trial
+        assert len(trial["fold_scores"]) == 2
+
+    print("\nRandom search result:", result)

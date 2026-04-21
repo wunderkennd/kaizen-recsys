@@ -73,10 +73,6 @@ src/data_validation.rs — GaussianAnomalyDetector for pre-training data quality
 - `inference.py` — `FeasePredictor` class for loading saved models and serving predictions
 - `fease_train.py` — Databricks end-to-end workflow (PySpark → Parquet → Rust training → predictions)
 
-### `src/schemas/` (Rust)
-
-Legacy schema definitions (account, content, engagement structs). Not wired into the main pipeline.
-
 ## Key Concepts
 
 **Memory efficiency:** The combined matrix Z is never materialized. The Gram matrix G is computed in 4 sparse blocks (G_11, G_12, G_21, G_22), keeping memory at O((M+K)^2) independent of user count N.
@@ -98,6 +94,16 @@ The model trains from three long-format tables (Parquet or CSV):
 - **Interactions**: `user_id`, `item_id`, `value` (+ optional `event_type`, `days_ago`)
 - **User features**: `user_id`, `feature_name`, `value`
 - **Item features**: `item_id`, `feature_name`, `value`
+
+## PR Review Policy
+
+All PRs require a review from Devin (`devin-ai-integration[bot]`) before merging. When creating PRs, always request review:
+
+```bash
+gh pr edit <number> --add-reviewer devin-ai-integration[bot]
+```
+
+Do not merge PRs without an approved review from Devin. This is enforced via branch protection on `main`.
 
 ## Python Module Name
 
