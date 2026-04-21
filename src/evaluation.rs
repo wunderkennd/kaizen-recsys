@@ -476,11 +476,7 @@ pub(crate) fn build_user_features_map(
     let val_col = df.column("value")?.f64()?;
 
     let mut map: AHashMap<String, Vec<(usize, f64)>> = AHashMap::new();
-    for ((user, feat), val) in user_col
-        .into_iter()
-        .zip(feat_col.into_iter())
-        .zip(val_col.into_iter())
-    {
+    for ((user, feat), val) in user_col.into_iter().zip(feat_col).zip(val_col) {
         if let (Some(u), Some(f), Some(v)) = (user, feat, val)
             && let Some(&feat_idx) = mappings.user_feature_to_idx.get(f)
         {

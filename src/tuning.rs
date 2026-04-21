@@ -536,11 +536,7 @@ fn group_user_items(
 
     let mut map: AHashMap<String, Vec<(usize, f64)>> = AHashMap::new();
 
-    for ((user, item), val) in user_col
-        .into_iter()
-        .zip(item_col.into_iter())
-        .zip(val_col.into_iter())
-    {
+    for ((user, item), val) in user_col.into_iter().zip(item_col).zip(val_col) {
         if let (Some(u), Some(i), Some(v)) = (user, item, val)
             && let Some(&item_idx) = mappings.item_to_idx.get(i)
         {
