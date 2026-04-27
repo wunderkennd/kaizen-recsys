@@ -1,7 +1,7 @@
 """Inference utilities for loading and serving a trained FEASE model."""
 
 from typing import Optional
-import rust_fease_recommender as fease
+import cr_fease as fease
 
 
 def load_and_predict(

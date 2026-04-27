@@ -1,6 +1,6 @@
 """cr_fease — Python wrapper for the Rust FEASE recommender."""
 
-from rust_fease_recommender import (
+from cr_fease._native import (
     FeaseModel,
     FeaseRegistry,
     build_and_train,

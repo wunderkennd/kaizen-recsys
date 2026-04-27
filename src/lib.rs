@@ -1103,9 +1103,9 @@ fn search_result_to_py(py: Python<'_>, result: &tuning::SearchResult) -> PyResul
 }
 
 /// Defines the Python module.
-/// This function is called when Python runs `import rust_fease_recommender`.
+/// This function is called when Python runs `import cr_fease._native`.
 #[pymodule]
-fn rust_fease_recommender(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn _native(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(build_and_train, m)?)?;
     m.add_function(wrap_pyfunction!(load_model, m)?)?;
     m.add_function(wrap_pyfunction!(validate_data, m)?)?;
