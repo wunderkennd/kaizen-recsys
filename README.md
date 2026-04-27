@@ -226,36 +226,52 @@ Split data and evaluate model quality with standard ranking metrics:
 
 ### Data Splitting
 
-Each splitter writes the train/test partitions to the paths you supply and returns
-a `(train_interactions, test_interactions, train_users, test_users)` 4-tuple of counts.
+The Python wrappers in `cr_fease` return a `SplitResult` dataclass with named
+attributes for the output paths and the count breakdown — easier to plumb into
+downstream `build_and_train` / `evaluate` calls than the Rust 4-tuple. If you
+omit `train_output`/`test_output`, a temp workspace is allocated for you and
+returned in `result.train_path` / `result.test_path`.
 
 ```python
-# Random train/test split (80/20)
-train_int, test_int, train_users, test_users = fease.random_split(
-    interactions_path="interactions.parquet",
-    train_output="train.parquet",
-    test_output="test.parquet",
+from cr_fease import random_split_safe, temporal_split_safe, leave_k_out_split_safe
+
+# Random split — auto-allocates a temp workspace when paths are omitted
+result = random_split_safe(
+    "interactions.parquet",
     test_ratio=0.2,
     seed=42,
 )
+print(result.train_path, result.test_path)
+print(result.train_interactions, result.test_interactions)
+
+# Or supply an explicit workspace dir
+result = random_split_safe(
+    "interactions.parquet",
+    output_dir="/path/to/workspace",
+    test_ratio=0.2,
+)
 
 # Temporal split (test = interactions within last 7 days)
-train_int, test_int, train_users, test_users = fease.temporal_split(
-    interactions_path="interactions.parquet",
-    train_output="train.parquet",
-    test_output="test.parquet",
+result = temporal_split_safe(
+    "interactions.parquet",
     days_ago_cutoff=7.0,
+    output_dir="/path/to/workspace",
 )
 
 # Leave-K-out (hold out K items per user)
-train_int, test_int, train_users, test_users = fease.leave_k_out_split(
-    interactions_path="interactions.parquet",
-    train_output="train.parquet",
-    test_output="test.parquet",
+result = leave_k_out_split_safe(
+    "interactions.parquet",
     k=1,
     seed=42,
+    output_dir="/path/to/workspace",
 )
 ```
+
+For full control over the file paths, the underlying Rust functions
+(`fease.random_split`, `fease.temporal_split`, `fease.leave_k_out_split`) take
+explicit `train_output` / `test_output` arguments and return a flat
+`(train_interactions, test_interactions, train_users, test_users)` 4-tuple of
+counts.
 
 ### Model Evaluation
 

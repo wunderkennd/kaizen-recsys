@@ -18,6 +18,12 @@ from rust_fease_recommender import (
     temporal_split,
     leave_k_out_split,
 )
+from cr_fease.fease_wrapper import (
+    SplitResult,
+    leave_k_out_split_safe,
+    random_split_safe,
+    temporal_split_safe,
+)
 from cr_fease.schemas import EngagementSchema, MetadataSchema
 
 __all__ = [
@@ -37,6 +43,10 @@ __all__ = [
     "random_split",
     "temporal_split",
     "leave_k_out_split",
+    "SplitResult",
+    "random_split_safe",
+    "temporal_split_safe",
+    "leave_k_out_split_safe",
     "EngagementSchema",
     "MetadataSchema",
 ]
