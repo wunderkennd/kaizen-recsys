@@ -54,6 +54,8 @@ METADATA_TABLE = "your_db.content_metadata"
 
 # --- DBFS Temporary Path Configuration ---
 # The Rust library will read from these /dbfs/ paths.
+# IMPORTANT: this directory is removed by Step 7 cleanup. Do NOT save the
+# trained model here — use MODEL_OUTPUT_DIR below.
 TEMP_DIR = "/dbfs/tmp/fease_model_flexible"
 TEMP_I_PATH = os.path.join(TEMP_DIR, "interactions.parquet")
 TEMP_U_PATH = os.path.join(TEMP_DIR, "user_features.parquet")
@@ -61,6 +63,13 @@ TEMP_T_PATH = os.path.join(TEMP_DIR, "item_features.parquet")
 
 # Make sure the /dbfs/ directory exists
 os.makedirs(TEMP_DIR, exist_ok=True)
+
+# --- Persistent Model Output Configuration ---
+# Trained models are saved here for later inference. This must live OUTSIDE
+# TEMP_DIR so it survives the Step 7 cleanup.
+MODEL_OUTPUT_DIR = "/dbfs/models/fease"
+MODEL_SAVE_PATH = os.path.join(MODEL_OUTPUT_DIR, "model.fease")
+os.makedirs(MODEL_OUTPUT_DIR, exist_ok=True)
 
 # --- Spark Path Configuration ---
 # Spark writes to DBFS paths *without* the /dbfs/ prefix.
@@ -485,8 +494,10 @@ print(f"  Users evaluated: {report['num_users']}, interactions: {report['num_int
 # --
 #
 # Persist the trained model for later inference without re-training.
+# MODEL_SAVE_PATH is defined in the configuration section above and points
+# to MODEL_OUTPUT_DIR (a persistent location), NOT TEMP_DIR which is wiped
+# by Step 7.
 
-MODEL_SAVE_PATH = os.path.join(TEMP_DIR, "model.fease")
 model.save(MODEL_SAVE_PATH)
 print(f"Model saved to {MODEL_SAVE_PATH}")
 
