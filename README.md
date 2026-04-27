@@ -189,6 +189,154 @@ users = [
 batch_results = model.predict_batch(users, top_k=10)
 ```
 
+## Similar Items (MLT)
+
+Find items similar to a given item using the learned S-matrix ("More Like This"):
+
+```python
+similar = model.predict_similar_items("GEXU12345", top_k=10)
+for item_guid, score in similar:
+    print(f"  {item_guid}: {score:.4f}")
+```
+
+## Territory-Aware Model Registry
+
+Maintain multiple trained models keyed by territory/region:
+
+```python
+registry = fease.FeaseRegistry()
+
+# Or with a fallback for unknown territories:
+registry = fease.FeaseRegistry(fallback_territory="US")
+
+# Register models per territory
+registry.register("US", us_model)
+registry.register("BR", br_model)
+
+# Route predictions to the correct model
+recs = registry.predict_top_k("US", interactions, features, top_k=10)
+
+# List registered territories
+print(registry.territories())  # ["US", "BR"]
+```
+
+## Evaluation Pipeline
+
+Split data and evaluate model quality with standard ranking metrics:
+
+### Data Splitting
+
+Each splitter writes the train/test partitions to the paths you supply and returns
+a `(train_interactions, test_interactions, train_users, test_users)` 4-tuple of counts.
+
+```python
+# Random train/test split (80/20)
+train_int, test_int, train_users, test_users = fease.random_split(
+    interactions_path="interactions.parquet",
+    train_output="train.parquet",
+    test_output="test.parquet",
+    test_ratio=0.2,
+    seed=42,
+)
+
+# Temporal split (test = interactions within last 7 days)
+train_int, test_int, train_users, test_users = fease.temporal_split(
+    interactions_path="interactions.parquet",
+    train_output="train.parquet",
+    test_output="test.parquet",
+    days_ago_cutoff=7.0,
+)
+
+# Leave-K-out (hold out K items per user)
+train_int, test_int, train_users, test_users = fease.leave_k_out_split(
+    interactions_path="interactions.parquet",
+    train_output="train.parquet",
+    test_output="test.parquet",
+    k=1,
+    seed=42,
+)
+```
+
+### Model Evaluation
+
+```python
+# Evaluate a trained model on held-out data
+report = model.evaluate(
+    test_interactions_path="test.parquet",
+    train_interactions_path="train.parquet",
+    user_features_path="user_features.parquet",  # optional
+    k_values=[5, 10, 20, 50],
+)
+for m in report["metrics"]:
+    print(f"  @{m['k']}: NDCG={m['ndcg']:.4f}, Recall={m['recall']:.4f}, Precision={m['precision']:.4f}")
+print(f"  Coverage: {report['coverage']:.4f}")
+print(f"  Users evaluated: {report['num_users']}, interactions: {report['num_interactions']}")
+```
+
+### Ranking Metrics (standalone)
+
+```python
+recommended = [10, 5, 3, 8, 1]
+relevant = {3, 8, 15}
+
+fease.precision_at_k(recommended, relevant, k=5)      # 0.4
+fease.recall_at_k(recommended, relevant, k=5)          # 0.667
+fease.ndcg_at_k(recommended, relevant, k=5)            # ...
+fease.mean_average_precision(recommended, relevant)     # ...
+fease.hit_rate_at_k(recommended, relevant, k=5)         # 1.0
+fease.coverage(all_recs_list, num_total_items=1000)     # 0.85
+```
+
+## Hyperparameter Tuning
+
+Optimize hyperparameters with k-fold cross-validation:
+
+### Grid Search
+
+```python
+result = fease.grid_search(
+    interactions_path="interactions.parquet",
+    user_features_path="user_features.parquet",
+    item_features_path="item_features.parquet",
+    param_grid={
+        "alpha": [0.5, 1.0, 2.0],
+        "beta": [0.5, 1.0],
+        "lambda_": [50.0, 100.0, 150.0],
+    },
+    n_folds=5,
+    eval_k=20,          # Optimize NDCG@20
+    seed=42,
+)
+print(f"Best NDCG@20: {result['best_score']:.4f}")
+print(f"Best params: {result['best_params']}")
+```
+
+### Random Search
+
+`random_search` samples uniformly from each list of candidate values (not from a
+continuous `[min, max]` range), so the same `param_grid` shape used by
+`grid_search` works here too.
+
+```python
+result = fease.random_search(
+    interactions_path="interactions.parquet",
+    user_features_path="user_features.parquet",
+    item_features_path="item_features.parquet",
+    param_grid={
+        "alpha": [0.1, 0.5, 1.0, 2.0, 5.0],
+        "beta": [0.1, 0.5, 1.0, 2.0, 5.0],
+        "lambda_": [10.0, 50.0, 100.0, 200.0, 500.0],
+    },
+    n_trials=50,
+    n_folds=5,
+    eval_k=20,
+    seed=42,
+)
+print(f"Best NDCG@20: {result['best_score']:.4f}")
+for trial in result["trials"][:5]:
+    print(f"  Score={trial['mean_score']:.4f}, params={trial['params']}")
+```
+
 ## Data Quality Validation
 
 ```python
