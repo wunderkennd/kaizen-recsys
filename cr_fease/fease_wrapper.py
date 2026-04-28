@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from typing import Dict, Iterator, Optional
 
 import polars as pl
-import rust_fease_recommender as fease
+from cr_fease import _native as fease
 from cr_fease.schemas import EngagementSchema, MetadataSchema
 
 

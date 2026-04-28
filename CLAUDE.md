@@ -116,4 +116,4 @@ Do not merge PRs without an approved review from Devin. This is enforced via bra
 
 ## Python Module Name
 
-The compiled Rust library is importable as `rust_fease_recommender`. The Python package is `cr_fease`.
+The compiled Rust extension is a submodule of the Python package: `cr_fease._native`. The public Python package is `cr_fease`, which re-exports the extension's symbols alongside Python helpers (`SplitResult`, schemas, `fease_wrapper`). End users should import from `cr_fease`, not `cr_fease._native` directly.

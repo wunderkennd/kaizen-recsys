@@ -7,7 +7,7 @@ edition = "2024"
 
 # Define as a Python library
 [lib]
-name = "rust_fease_recommender"
+name = "_native"
 crate-type = ["cdylib"]
 
 [dependencies]

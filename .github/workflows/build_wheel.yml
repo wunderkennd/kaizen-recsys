@@ -47,7 +47,7 @@ jobs:
       run: .venv/bin/maturin develop
 
     - name: Run Python tests
-      run: .venv/bin/python -m pytest tests/ -v
+      run: .venv/bin/pytest tests/ -v
 
   build-wheel:
     needs: lint-and-test
@@ -75,6 +75,12 @@ jobs:
 
     - name: Build the wheel
       run: maturin build --release --out dist
+
+    - name: Verify wheel ships cr_fease/ helpers
+      run: |
+        unzip -l dist/*.whl
+        unzip -l dist/*.whl | grep -E "cr_fease/(_native|__init__|schemas|fease_wrapper)" \
+          || (echo "::error::Wheel missing cr_fease/ helpers" && exit 1)
 
     - name: Upload wheel as artifact
       uses: actions/upload-artifact@v4
