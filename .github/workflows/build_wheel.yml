@@ -47,7 +47,7 @@ jobs:
       run: .venv/bin/maturin develop
 
     - name: Run Python tests
-      run: .venv/bin/pytest tests/ -v
+      run: .venv/bin/python -m pytest tests/ -v
 
   build-wheel:
     needs: lint-and-test

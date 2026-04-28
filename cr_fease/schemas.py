@@ -1,6 +1,6 @@
 # schemas.py
 from enum import Enum
-from typing import Optional
+from typing import ClassVar, Dict, Optional
 from pydantic import BaseModel, Field, field_validator
 import polars as pl
 
@@ -19,7 +19,7 @@ class EngagementSchema(BaseModel):
     """Schema for engagement data validation"""
 
     # Define expected columns and types
-    REQUIRED_COLUMNS = {
+    REQUIRED_COLUMNS: ClassVar[Dict[str, type]] = {
         "anonymous_id": pl.String,
         "view_media_id": pl.String,
         "view_seconds_watched": pl.Float64,
@@ -65,7 +65,7 @@ class EngagementSchema(BaseModel):
 class MetadataSchema(BaseModel):
     """Schema for metadata validation"""
 
-    REQUIRED_COLUMNS = {
+    REQUIRED_COLUMNS: ClassVar[Dict[str, type]] = {
         "media_guid": pl.String,
         "media_type": pl.String,
         "media_audio_language": pl.String,

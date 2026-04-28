@@ -852,3 +852,131 @@ def test_random_search(tuning_data):
         assert len(trial["fold_scores"]) == 2
 
     print("\nRandom search result:", result)
+
+
+# ---------------------------------------------------------------------------
+# SplitResult / *_safe wrapper tests (Option B Python ergonomics layer)
+# ---------------------------------------------------------------------------
+
+
+def test_split_result_explicit_paths(evaluation_data):
+    """random_split_safe returns SplitResult and writes to caller-supplied paths."""
+    from cr_fease import SplitResult, random_split_safe
+
+    i_path, _, _, tmpdir = evaluation_data
+    train_out = str(Path(tmpdir) / "wrap_random_train.parquet")
+    test_out = str(Path(tmpdir) / "wrap_random_test.parquet")
+
+    result = random_split_safe(
+        i_path,
+        train_output=train_out,
+        test_output=test_out,
+        test_ratio=0.25,
+        seed=42,
+    )
+
+    assert isinstance(result, SplitResult)
+    assert result.train_path == train_out
+    assert result.test_path == test_out
+    assert result.train_interactions + result.test_interactions == 19
+    assert result.train_interactions > 0
+    assert result.test_interactions > 0
+    assert os.path.exists(result.train_path)
+    assert os.path.exists(result.test_path)
+
+
+def test_split_result_auto_tempdir(evaluation_data):
+    """random_split_safe allocates a workspace when paths are omitted."""
+    from cr_fease import random_split_safe
+
+    i_path, _, _, _tmpdir = evaluation_data
+
+    result = random_split_safe(i_path, test_ratio=0.25, seed=42)
+
+    assert os.path.exists(result.train_path)
+    assert os.path.exists(result.test_path)
+    # Auto-allocated workspace must live OUTSIDE the user's data dir, not inside it.
+    assert os.path.dirname(result.train_path) == os.path.dirname(result.test_path)
+    assert os.path.dirname(result.train_path) != os.path.dirname(i_path)
+    assert result.train_interactions + result.test_interactions == 19
+
+
+def test_split_result_explicit_output_dir(evaluation_data):
+    """When output_dir is given, files land there with predictable names."""
+    from cr_fease import random_split_safe
+
+    i_path, _, _, tmpdir = evaluation_data
+    workspace = Path(tmpdir) / "explicit_workspace"
+
+    result = random_split_safe(i_path, output_dir=str(workspace), test_ratio=0.25, seed=42)
+
+    assert result.train_path == str(workspace / "train.parquet")
+    assert result.test_path == str(workspace / "test.parquet")
+    assert os.path.exists(result.train_path)
+    assert os.path.exists(result.test_path)
+
+
+def test_split_result_unpacks_as_tuple(evaluation_data):
+    """SplitResult iterates as the original Rust 4-tuple of counts."""
+    from cr_fease import random_split_safe
+
+    i_path, _, _, _tmpdir = evaluation_data
+
+    result = random_split_safe(i_path, test_ratio=0.25, seed=42)
+    train_n, test_n, train_u, test_u = result
+
+    assert train_n == result.train_interactions
+    assert test_n == result.test_interactions
+    assert train_u == result.train_users
+    assert test_u == result.test_users
+
+
+def test_split_result_rejects_partial_paths(evaluation_data):
+    """Providing only one of train_output/test_output is a programming error."""
+    from cr_fease import random_split_safe
+
+    i_path, _, _, tmpdir = evaluation_data
+    train_out = str(Path(tmpdir) / "partial_train.parquet")
+
+    with pytest.raises(ValueError, match="both be provided or both be None"):
+        random_split_safe(i_path, train_output=train_out)
+
+
+def test_temporal_split_safe(evaluation_data):
+    """temporal_split_safe wraps the Rust temporal_split."""
+    from cr_fease import temporal_split_safe
+
+    i_path, _, _, tmpdir = evaluation_data
+    workspace = Path(tmpdir) / "temporal_workspace"
+
+    result = temporal_split_safe(
+        i_path,
+        days_ago_cutoff=7.0,
+        output_dir=str(workspace),
+    )
+
+    assert result.train_path == str(workspace / "train.parquet")
+    assert result.test_path == str(workspace / "test.parquet")
+    assert result.train_interactions + result.test_interactions == 19
+
+
+def test_leave_k_out_split_safe(evaluation_data):
+    """leave_k_out_split_safe writes K test items per user and returns SplitResult."""
+    from cr_fease import leave_k_out_split_safe
+
+    i_path, _, _, tmpdir = evaluation_data
+    workspace = Path(tmpdir) / "lko_workspace"
+
+    result = leave_k_out_split_safe(
+        i_path,
+        k=2,
+        seed=42,
+        output_dir=str(workspace),
+    )
+
+    assert result.train_interactions + result.test_interactions == 19
+
+    test_df = pl.read_parquet(result.test_path)
+    user_counts = test_df.group_by("user_id").agg(pl.col("item_id").count().alias("n"))
+    for row in user_counts.iter_rows(named=True):
+        assert row["n"] == 2, f"User {row['user_id']} has {row['n']} test items, expected 2"
