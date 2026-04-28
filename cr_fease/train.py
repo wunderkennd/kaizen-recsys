@@ -1,7 +1,7 @@
 """Standalone training script for FEASE model."""
 
 import argparse
-import rust_fease_recommender as fease
+import cr_fease as fease
 
 
 def main():

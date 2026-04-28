@@ -84,7 +84,7 @@ maturin build --release
 
 Once built, you can import and use the library directly in Python.
 ```python
-import rust_fease_recommender as fease
+import cr_fease as fease
 import time
 
 # Define paths to your long-format data files

@@ -2,4 +2,18 @@
 .DS_Store
 .idea/
 .target/
-tests/__pycache__/
+
+# Python build artifacts
+__pycache__/
+*.pyc
+*.pyo
+
+# Maturin / wheel build outputs
+dist/
+*.so
+*.pyd
+*.egg-info/
+
+# Virtualenvs
+.venv/
+venv/

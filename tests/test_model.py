@@ -4,7 +4,7 @@ from pathlib import Path
 
 import polars as pl
 import pytest
-import rust_fease_recommender as fease
+import cr_fease as fease
 
 
 @pytest.fixture(scope="session")
@@ -790,7 +790,7 @@ def tuning_data():
 def test_grid_search(tuning_data):
     """Tests grid search returns correct result structure."""
     i_path, u_path, t_path = tuning_data
-    result = fease.grid_search_py(
+    result = fease.grid_search(
         i_path, u_path, t_path,
         param_grid={"lambda_": [10.0, 100.0]},
         n_folds=2,
@@ -829,7 +829,7 @@ def test_grid_search(tuning_data):
 def test_random_search(tuning_data):
     """Tests random search with n_trials=2 returns correct structure."""
     i_path, u_path, t_path = tuning_data
-    result = fease.random_search_py(
+    result = fease.random_search(
         i_path, u_path, t_path,
         param_grid={"alpha": [0.5, 1.0, 2.0], "lambda_": [10.0, 50.0, 100.0]},
         n_trials=2,

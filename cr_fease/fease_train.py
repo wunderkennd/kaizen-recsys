@@ -19,14 +19,14 @@
 # 1. Build your Rust wheel for Linux (e.g., using `maturin build --release`
 #    via Docker, cross-compilation, or a CI/CD pipeline).
 #
-# 2. Upload the generated wheel (e.g., `rust_fease_recommender-0.1.0-cp310-cp310-manylinux_x86_64.whl`)
-#    to a location on DBFS (e.g., /FileStore/libs/rust_fease_recommender-0.1.0-....whl)
+# 2. Upload the generated wheel (e.g., `cr_fease-0.1.0-cp310-cp310-manylinux_x86_64.whl`)
+#    to a location on DBFS (e.g., /FileStore/libs/cr_fease-0.1.0-....whl)
 #
 # 3. Install the library on your cluster. You can do this via the Cluster UI
 #    (Cluster -> Libraries -> Install New -> DBFS/S3 -> path_to.whl)
 #    OR by running a notebook cell *before* this one:
 #
-# %pip install /dbfs/FileStore/libs/rust_fease_recommender-0.1.0-cp310-cp310-linux.whl
+# %pip install /dbfs/FileStore/libs/cr_fease-0.1.0-cp310-cp310-linux.whl
 #
 # After installation, you must detach and re-attach the notebook.
 
@@ -36,10 +36,11 @@ from pyspark.sql import SparkSession, DataFrame
 import pyspark.sql.functions as F
 from pyspark.sql.types import StringType
 
-# Import our Rust library!
-import rust_fease_recommender as fease
+# Import our library! `cr_fease` re-exports the compiled Rust extension
+# (`cr_fease._native`) plus Python helpers (SplitResult, schemas, wrappers).
+import cr_fease as fease
 
-print("Successfully imported 'rust_fease_recommender'")
+print("Successfully imported 'cr_fease'")
 
 # COMMAND ----------
 
