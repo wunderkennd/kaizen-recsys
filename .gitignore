@@ -17,3 +17,15 @@ dist/
 # Virtualenvs
 .venv/
 venv/
+
+# Claude Code per-machine state.
+# Whitelist productive config (settings, custom agents, slash commands) so it
+# can be committed for cross-device reproducibility; ignore everything else
+# (worktrees, .DS_Store, etc.) since it's machine-local or ephemeral.
+.claude/*
+!.claude/settings.json
+!.claude/agents/
+!.claude/commands/
+
+# Auto-memory hook runtime state (logs, PID files) — machine-local only.
+.remember/
