@@ -1,0 +1,113 @@
+name: Release wheels
+
+# Triggered by tag pushes (e.g. `v0.1.0`) or manual dispatch.
+# Builds wheels for 5 platforms in parallel and attaches them to a
+# GitHub Release. Does NOT publish to PyPI.
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag name to attach wheels to (e.g. v0.1.0). Required for workflow_dispatch."
+        required: true
+        type: string
+
+jobs:
+  build-wheels:
+    name: Build wheel — ${{ matrix.os }} / ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux x86_64 — manylinux2014 inside the maturin container
+          - os: ubuntu-latest
+            target: x86_64
+            manylinux: auto
+          # Linux aarch64 — emulated via QEMU in the same container
+          - os: ubuntu-latest
+            target: aarch64
+            manylinux: auto
+          # macOS Intel
+          - os: macos-13
+            target: x86_64
+          # macOS Apple Silicon
+          - os: macos-14
+            target: aarch64
+          # Windows x86_64
+          - os: windows-latest
+            target: x86_64
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Build wheel (maturin-action)
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          # `manylinux: auto` is honored only on Linux runners; macOS/Windows ignore it.
+          manylinux: ${{ matrix.manylinux || '' }}
+          args: --release --out dist
+
+      - name: Inspect wheel contents (sanity)
+        shell: bash
+        run: |
+          ls -la dist/
+          # Confirm the wheel ships the cr_fease/ Python helpers, not just the .so.
+          python -m zipfile -l dist/*.whl | grep -E "cr_fease/(_native|__init__|schemas|fease_wrapper)" \
+            || { echo "::error::Wheel missing cr_fease/ helpers"; exit 1; }
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.os }}-${{ matrix.target }}
+          path: dist/*.whl
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Attach wheels to GitHub Release
+    needs: build-wheels
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all wheel artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: wheel-*
+          merge-multiple: true
+
+      - name: List collected wheels
+        run: ls -la dist/
+
+      - name: Resolve tag name
+        id: tag
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "tag=$TAG_INPUT" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          TAG_INPUT: ${{ inputs.tag }}
+
+
+      - name: Create or update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: ${{ steps.tag.outputs.tag }}
+          generate_release_notes: true
+          files: dist/*.whl
+          fail_on_unmatched_files: true

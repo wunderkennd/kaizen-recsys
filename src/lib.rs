@@ -75,20 +75,20 @@ impl FeaseModel {
 
         // Convert interactions (item_guid -> item_idx)
         for (key, val) in interactions.iter() {
-            let item_guid: &str = key.extract()?;
+            let item_guid: String = key.extract()?;
             let value: f64 = val.extract()?;
             // Silently ignore items not seen in training
-            if let Some(&item_idx) = self.model.mappings.item_to_idx.get(item_guid) {
+            if let Some(&item_idx) = self.model.mappings.item_to_idx.get(&item_guid) {
                 user_interactions.push((item_idx, value));
             }
         }
 
         // Convert features (feature_name -> feature_idx)
         for (key, val) in features.iter() {
-            let feature_name: &str = key.extract()?;
+            let feature_name: String = key.extract()?;
             let value: f64 = val.extract()?;
             // Silently ignore features not seen in training
-            if let Some(&feature_idx) = self.model.mappings.user_feature_to_idx.get(feature_name) {
+            if let Some(&feature_idx) = self.model.mappings.user_feature_to_idx.get(&feature_name) {
                 user_features.push((feature_idx, value));
             }
         }
@@ -161,9 +161,9 @@ impl FeaseModel {
                     .cast()
                     .map_err(|e| PyErr::new::<pyo3::exceptions::PyTypeError, _>(e.to_string()))?;
                 for (key, val) in inter_dict.iter() {
-                    let guid: &str = key.extract()?;
+                    let guid: String = key.extract()?;
                     let value: f64 = val.extract()?;
-                    if let Some(&idx) = self.model.mappings.item_to_idx.get(guid) {
+                    if let Some(&idx) = self.model.mappings.item_to_idx.get(&guid) {
                         interactions.push((idx, value));
                     }
                 }
@@ -175,9 +175,9 @@ impl FeaseModel {
                     .cast()
                     .map_err(|e| PyErr::new::<pyo3::exceptions::PyTypeError, _>(e.to_string()))?;
                 for (key, val) in feat_dict.iter() {
-                    let name: &str = key.extract()?;
+                    let name: String = key.extract()?;
                     let value: f64 = val.extract()?;
-                    if let Some(&idx) = self.model.mappings.user_feature_to_idx.get(name) {
+                    if let Some(&idx) = self.model.mappings.user_feature_to_idx.get(&name) {
                         features.push((idx, value));
                     }
                 }
