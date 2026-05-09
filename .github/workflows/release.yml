@@ -1,8 +1,9 @@
 name: Release wheels
 
 # Triggered by tag pushes (e.g. `v0.1.0`) or manual dispatch.
-# Builds wheels for 5 platforms in parallel and attaches them to a
-# GitHub Release. Does NOT publish to PyPI.
+# Builds wheels for 4 platforms in parallel — Linux x86_64, Linux aarch64,
+# macOS universal2 (Intel + Apple Silicon fat binary), and Windows x86_64 —
+# then attaches them to a GitHub Release. Does NOT publish to PyPI.
 on:
   push:
     tags:
@@ -26,16 +27,19 @@ jobs:
           - os: ubuntu-latest
             target: x86_64
             manylinux: auto
-          # Linux aarch64 — emulated via QEMU in the same container
+          # Linux aarch64 — cross-compiled inside the manylinux container.
+          # CFLAGS_aarch64_unknown_linux_gnu below works around a `ring` build
+          # break (ARM ASM requires __ARM_ARCH to be defined; the cross-compile
+          # gcc shipped in the container omits it).
           - os: ubuntu-latest
             target: aarch64
             manylinux: auto
-          # macOS Intel
-          - os: macos-13
-            target: x86_64
-          # macOS Apple Silicon
+          # macOS universal2 — single fat wheel covering both Intel (x86_64)
+          # and Apple Silicon (aarch64). Built natively on the macos-14 (ARM)
+          # runner, which is plentiful; macos-13 (Intel) runners are scarce
+          # and have caused job-queue starvation in prior runs.
           - os: macos-14
-            target: aarch64
+            target: universal2-apple-darwin
           # Windows x86_64
           - os: windows-latest
             target: x86_64
@@ -56,6 +60,11 @@ jobs:
           # `manylinux: auto` is honored only on Linux runners; macOS/Windows ignore it.
           manylinux: ${{ matrix.manylinux || '' }}
           args: --release --out dist
+        env:
+          # Inject __ARM_ARCH for the aarch64 cross-compile so `ring`'s ARM
+          # assembly stubs compile. Other matrix legs are unaffected — the
+          # env var name is target-specific.
+          CFLAGS_aarch64_unknown_linux_gnu: "-D__ARM_ARCH=8"
 
       - name: Inspect wheel contents (sanity)
         shell: bash
