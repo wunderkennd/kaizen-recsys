@@ -104,6 +104,23 @@ The model trains from three long-format tables (Parquet or CSV):
 - **User features**: `user_id`, `feature_name`, `value`
 - **Item features**: `item_id`, `feature_name`, `value`
 
+## Work tracking
+
+Track multi-step or in-progress work via GitHub Issues, not markdown
+files in the repo. Concretely:
+
+- Do NOT create or maintain `TODO.md`, `STATUS.md`, `ROADMAP.md`, or
+  progress banners inside ADRs / design docs.
+- Open a GitHub Issue for each unit of work; checklists belong in Issue
+  bodies, not in repo files.
+- Link Issues from PRs (`Closes #N`, `Tracks #N`); link ADRs from
+  Issues, not the other way around.
+
+Rationale: status changes frequently and concurrently across agents
+and branches. Tracking it in a single text file produces merge
+conflicts every time two branches touch it; Issue state lives in the
+GitHub API and is conflict-free.
+
 ## PR Review Policy
 
 All PRs require a review from Devin (`devin-ai-integration[bot]`) before merging. When creating PRs, always request review:
