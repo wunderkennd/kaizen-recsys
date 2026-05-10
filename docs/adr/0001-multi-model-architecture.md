@@ -74,6 +74,18 @@ without algorithmic changes. Concretely:
    models, then generalize the cross-cutting consumers. See the phased
    plan below.
 
+6. **Cargo feature gate for ML models**: the `burn` dependency and the
+   `SASRec` / `TwoTower` implementations live behind a `ml-models` Cargo
+   feature, **default off**. The `RecModel` trait, the `ModelInput` enum,
+   and the EASE adapter compile unconditionally. Consumers who only need
+   EASE see no change in their build — same dependency tree, same wheel
+   size, same compile time. Opting in is `cargo build --features
+   ml-models` (or the equivalent maturin flag). The PyO3 layer
+   conditionally compiles `SASRecModel` and `TwoTowerModel` under the
+   same feature; Python callers either get the slim module (EASE only)
+   or the full one. Whether to ship one vs. two wheels on PyPI is
+   deferred to Phase 2, once we can measure real binary sizes.
+
 ## Alternatives considered
 
 ### A. Python-level abstraction with PyTorch
@@ -145,6 +157,8 @@ Skip ML frameworks entirely; implement attention and SGD by hand.
 - Per-model magic bytes in the file format mean `load_model(path)` can
   auto-detect type — Python callers don't need to know which model wrote a
   file.
+- Cargo feature gate means EASE-only users see no change in their build
+  or wheel: the new code is opt-in at compile time, not at runtime.
 
 ### Negative / costs
 - New dependency: `burn` (pre-1.0, expect breaking changes between minor
@@ -169,12 +183,24 @@ Skip ML frameworks entirely; implement attention and SGD by hand.
   to the public Python API. Acceptable given it's an internal Rust
   abstraction.
 
+### Backout / baseline
+
+Commit `812ddbe` on `main` (the merge of PR #19, immediately before this
+architectural work begins) is tagged `pre-multi-model` as an immortal
+reference point. If the multi-model direction has to be unwound, that
+tag is the recovery target. We are explicitly **not** maintaining a
+long-lived parallel "simple EASE" branch — the Cargo feature gate gives
+EASE-only users a slim build on `main`, and the tag covers the "preserve
+a snapshot of the simpler codebase" need. Maintaining a parallel branch
+would force every EASE bugfix to be applied twice without buying
+anything the feature gate doesn't already provide.
+
 ## Phased rollout
 
 | Phase | Scope | Gate |
 |-------|-------|------|
 | **1** | `RecModel` trait + `models/ease.rs` adapter wrapping `RustFeaseModel`. No behavior change. | All existing tests green; `FeaseModel` PyO3 surface byte-identical. |
-| 2 | Add `burn` dep; minimal SASRec forward pass compiles. | `cargo build --release` succeeds; wheel still builds. |
+| 2 | Add `burn` dep as an **optional dependency** gated on the `ml-models` feature; minimal SASRec forward pass compiles. | `cargo build` (no features) builds without pulling burn; `cargo build --features ml-models` succeeds; default wheel size unchanged. |
 | 3 | SASRec training loop + `data/sequences.rs` + Python smoke test. | Overfit-on-tiny-data Rust test passes; Python `train → predict → save → load` roundtrip green. |
 | 4 | Generalize `evaluation::evaluate_model` to `&dyn RecModel`; add `SASRecModel` PyO3 class. | Existing EASE eval still produces identical numbers; SASRec eval runs. |
 | 5 | Two-Tower model + `data/triples.rs` + dense feature loader. | Same gates as Phase 3, plus dense-feature loader unit-tested. |
