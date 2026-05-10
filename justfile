@@ -74,6 +74,46 @@ lint:
 
 check: fmt lint test
 
+# --- Release --------------------------------------------------------------
+
+# Why tag origin/main instead of local HEAD: a release should always pin to
+# what's on the remote — local main may be stale or have uncommitted edits
+# (e.g. unrelated WIP). This recipe always fetches first, then tags the
+# fetched origin/main SHA, so the release wheel content matches what merged.
+
+# Tag origin/main as VERSION and push (e.g. `just release v0.1.0` or `just release v0.2.0-rc1`).
+release VERSION:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if ! [[ "{{VERSION}}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc[0-9]+)?$ ]]; then
+        echo "FAIL: VERSION must match vX.Y.Z or vX.Y.Z-rcN (got: {{VERSION}})" >&2
+        exit 1
+    fi
+    git fetch origin --tags --prune
+    if git rev-parse "{{VERSION}}" >/dev/null 2>&1; then
+        echo "FAIL: tag {{VERSION}} already exists locally" >&2
+        exit 1
+    fi
+    if git ls-remote --tags --exit-code origin "refs/tags/{{VERSION}}" >/dev/null 2>&1; then
+        echo "FAIL: tag {{VERSION}} already exists on origin" >&2
+        exit 1
+    fi
+    SHA=$(git rev-parse origin/main)
+    echo "Tagging origin/main ($SHA) as {{VERSION}} ..."
+    git tag -a "{{VERSION}}" "$SHA" -m "{{VERSION}}
+
+    Release built from origin/main @ $SHA.
+    Wheels published via .github/workflows/release.yml."
+    git push origin "{{VERSION}}"
+    echo
+    echo "Tag pushed. Watch the build with: just release-watch"
+    echo "Release page (populated when build succeeds):"
+    echo "  https://github.com/wunderkennd/fease/releases/tag/{{VERSION}}"
+
+# Watch the most recent release.yml run (useful right after `just release`).
+release-watch:
+    gh run watch $(gh run list --workflow=release.yml --limit 1 --json databaseId --jq '.[0].databaseId') --interval 30
+
 # --- Maintenance ----------------------------------------------------------
 
 # Remove Rust + Python build artifacts. Does NOT touch .venv.
