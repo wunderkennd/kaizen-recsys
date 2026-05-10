@@ -1,6 +1,6 @@
-"""cr_fease — Python wrapper for the Rust FEASE recommender."""
+"""kzn_recsys — Python wrapper for the Rust FEASE recommender."""
 
-from cr_fease._native import (
+from kzn_recsys._native import (
     FeaseModel,
     FeaseRegistry,
     build_and_train,
@@ -18,13 +18,13 @@ from cr_fease._native import (
     temporal_split,
     leave_k_out_split,
 )
-from cr_fease.fease_wrapper import (
+from kzn_recsys.fease_wrapper import (
     SplitResult,
     leave_k_out_split_safe,
     random_split_safe,
     temporal_split_safe,
 )
-from cr_fease.schemas import EngagementSchema, MetadataSchema
+from kzn_recsys.schemas import EngagementSchema, MetadataSchema
 
 __all__ = [
     "FeaseModel",

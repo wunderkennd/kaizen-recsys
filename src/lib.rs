@@ -1103,7 +1103,7 @@ fn search_result_to_py(py: Python<'_>, result: &tuning::SearchResult) -> PyResul
 }
 
 /// Defines the Python module.
-/// This function is called when Python runs `import cr_fease._native`.
+/// This function is called when Python runs `import kzn_recsys._native`.
 #[pymodule]
 fn _native(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(build_and_train, m)?)?;
