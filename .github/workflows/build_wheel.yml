@@ -76,11 +76,11 @@ jobs:
     - name: Build the wheel
       run: maturin build --release --out dist
 
-    - name: Verify wheel ships cr_fease/ helpers
+    - name: Verify wheel ships kzn_recsys/ helpers
       run: |
         unzip -l dist/*.whl
-        unzip -l dist/*.whl | grep -E "cr_fease/(_native|__init__|schemas|fease_wrapper)" \
-          || (echo "::error::Wheel missing cr_fease/ helpers" && exit 1)
+        unzip -l dist/*.whl | grep -E "kzn_recsys/(_native|__init__|schemas|fease_wrapper)" \
+          || (echo "::error::Wheel missing kzn_recsys/ helpers" && exit 1)
 
     - name: Upload wheel as artifact
       uses: actions/upload-artifact@v7

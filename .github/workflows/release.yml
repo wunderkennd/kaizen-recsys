@@ -70,9 +70,9 @@ jobs:
         shell: bash
         run: |
           ls -la dist/
-          # Confirm the wheel ships the cr_fease/ Python helpers, not just the .so.
-          python -m zipfile -l dist/*.whl | grep -E "cr_fease/(_native|__init__|schemas|fease_wrapper)" \
-            || { echo "::error::Wheel missing cr_fease/ helpers"; exit 1; }
+          # Confirm the wheel ships the kzn_recsys/ Python helpers, not just the .so.
+          python -m zipfile -l dist/*.whl | grep -E "kzn_recsys/(_native|__init__|schemas|fease_wrapper)" \
+            || { echo "::error::Wheel missing kzn_recsys/ helpers"; exit 1; }
 
       - name: Upload wheel artifact
         uses: actions/upload-artifact@v7

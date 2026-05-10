@@ -1,7 +1,7 @@
 """Standalone training script for FEASE model."""
 
 import argparse
-import cr_fease as fease
+import kzn_recsys as fease
 
 
 def main():

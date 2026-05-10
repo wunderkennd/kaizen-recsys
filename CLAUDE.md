@@ -69,7 +69,7 @@ src/data_validation.rs — GaussianAnomalyDetector for pre-training data quality
 - **`serving.rs`**: `FeaseModelRegistry` for multi-territory model routing, `predict_batch()` / `predict_batch_top_k()` parallelized via rayon.
 - **`data_validation.rs`**: `GaussianAnomalyDetector` — confidence interval checks for data quality.
 
-### Python Layer (`cr_fease/`)
+### Python Layer (`kzn_recsys/`)
 
 - `__init__.py` — Exports: `FeaseModel`, `FeaseRegistry`, `build_and_train`, `load_model`, `validate_data`, split functions, tuning functions, metrics, `EngagementSchema`, `MetadataSchema`
 - `schemas.py` — Pydantic models for column validation
@@ -116,4 +116,4 @@ Do not merge PRs without an approved review from Devin. This is enforced via bra
 
 ## Python Module Name
 
-The compiled Rust extension is a submodule of the Python package: `cr_fease._native`. The public Python package is `cr_fease`, which re-exports the extension's symbols alongside Python helpers (`SplitResult`, schemas, `fease_wrapper`). End users should import from `cr_fease`, not `cr_fease._native` directly.
+The compiled Rust extension is a submodule of the Python package: `kzn_recsys._native`. The public Python package is `kzn_recsys`, which re-exports the extension's symbols alongside Python helpers (`SplitResult`, schemas, `fease_wrapper`). End users should import from `kzn_recsys`, not `kzn_recsys._native` directly.

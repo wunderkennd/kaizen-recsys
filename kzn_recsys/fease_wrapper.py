@@ -8,8 +8,8 @@ from dataclasses import dataclass
 from typing import Dict, Iterator, Optional
 
 import polars as pl
-from cr_fease import _native as fease
-from cr_fease.schemas import EngagementSchema, MetadataSchema
+from kzn_recsys import _native as fease
+from kzn_recsys.schemas import EngagementSchema, MetadataSchema
 
 
 @dataclass(frozen=True)
