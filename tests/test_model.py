@@ -4,7 +4,7 @@ from pathlib import Path
 
 import polars as pl
 import pytest
-import cr_fease as fease
+import kzn_recsys as fease
 
 
 @pytest.fixture(scope="session")
@@ -861,7 +861,7 @@ def test_random_search(tuning_data):
 
 def test_split_result_explicit_paths(evaluation_data):
     """random_split_safe returns SplitResult and writes to caller-supplied paths."""
-    from cr_fease import SplitResult, random_split_safe
+    from kzn_recsys import SplitResult, random_split_safe
 
     i_path, _, _, tmpdir = evaluation_data
     train_out = str(Path(tmpdir) / "wrap_random_train.parquet")
@@ -887,7 +887,7 @@ def test_split_result_explicit_paths(evaluation_data):
 
 def test_split_result_auto_tempdir(evaluation_data):
     """random_split_safe allocates a workspace when paths are omitted."""
-    from cr_fease import random_split_safe
+    from kzn_recsys import random_split_safe
 
     i_path, _, _, _tmpdir = evaluation_data
 
@@ -903,7 +903,7 @@ def test_split_result_auto_tempdir(evaluation_data):
 
 def test_split_result_explicit_output_dir(evaluation_data):
     """When output_dir is given, files land there with predictable names."""
-    from cr_fease import random_split_safe
+    from kzn_recsys import random_split_safe
 
     i_path, _, _, tmpdir = evaluation_data
     workspace = Path(tmpdir) / "explicit_workspace"
@@ -918,7 +918,7 @@ def test_split_result_explicit_output_dir(evaluation_data):
 
 def test_split_result_unpacks_as_tuple(evaluation_data):
     """SplitResult iterates as the original Rust 4-tuple of counts."""
-    from cr_fease import random_split_safe
+    from kzn_recsys import random_split_safe
 
     i_path, _, _, _tmpdir = evaluation_data
 
@@ -933,7 +933,7 @@ def test_split_result_unpacks_as_tuple(evaluation_data):
 
 def test_split_result_rejects_partial_paths(evaluation_data):
     """Providing only one of train_output/test_output is a programming error."""
-    from cr_fease import random_split_safe
+    from kzn_recsys import random_split_safe
 
     i_path, _, _, tmpdir = evaluation_data
     train_out = str(Path(tmpdir) / "partial_train.parquet")
@@ -944,7 +944,7 @@ def test_split_result_rejects_partial_paths(evaluation_data):
 
 def test_temporal_split_safe(evaluation_data):
     """temporal_split_safe wraps the Rust temporal_split."""
-    from cr_fease import temporal_split_safe
+    from kzn_recsys import temporal_split_safe
 
     i_path, _, _, tmpdir = evaluation_data
     workspace = Path(tmpdir) / "temporal_workspace"
@@ -962,7 +962,7 @@ def test_temporal_split_safe(evaluation_data):
 
 def test_leave_k_out_split_safe(evaluation_data):
     """leave_k_out_split_safe writes K test items per user and returns SplitResult."""
-    from cr_fease import leave_k_out_split_safe
+    from kzn_recsys import leave_k_out_split_safe
 
     i_path, _, _, tmpdir = evaluation_data
     workspace = Path(tmpdir) / "lko_workspace"

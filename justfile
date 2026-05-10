@@ -37,12 +37,12 @@ test-one TEST: develop
 # Layer 1 + 2 — pre-commit dev loop.
 test: test-rust test-python
 
-# Layer 3: Verify the built wheel ships cr_fease/ helpers.
+# Layer 3: Verify the built wheel ships kzn_recsys/ helpers.
 test-wheel: build
     @echo "Inspecting dist/*.whl ..."
-    @unzip -l dist/*.whl | grep -E "cr_fease/(_native|__init__|schemas|fease_wrapper)" \
-        || (echo "FAIL: wheel missing cr_fease/ helpers" && exit 1)
-    @echo "OK: wheel ships cr_fease/ helpers"
+    @unzip -l dist/*.whl | grep -E "kzn_recsys/(_native|__init__|schemas|fease_wrapper)" \
+        || (echo "FAIL: wheel missing kzn_recsys/ helpers" && exit 1)
+    @echo "OK: wheel ships kzn_recsys/ helpers"
 
 # Layer 4: Fresh-venv install + import smoke test (run from /tmp to avoid sys.path shadowing).
 test-fresh: build
@@ -52,9 +52,9 @@ test-fresh: build
     trap "rm -rf '$TMPVENV'" EXIT
     {{python}} -m venv "$TMPVENV"
     "$TMPVENV/bin/pip" install --quiet --upgrade pip
-    "$TMPVENV/bin/pip" install --quiet dist/cr_fease-*.whl
+    "$TMPVENV/bin/pip" install --quiet dist/kzn_recsys-*.whl
     cd /tmp && "$TMPVENV/bin/python" -c "
-    from cr_fease import (
+    from kzn_recsys import (
         build_and_train, FeaseModel, FeaseRegistry, SplitResult,
         EngagementSchema, random_split_safe,
     )
@@ -121,7 +121,7 @@ clean:
     cargo clean
     rm -rf dist/ build/ *.egg-info
     find . -type d -name __pycache__ -prune -exec rm -rf {} +
-    find cr_fease -maxdepth 2 -name "*.so" -delete
+    find kzn_recsys -maxdepth 2 -name "*.so" -delete
 
 # Show what `just test-wheel` would inspect, without grepping.
 wheel-contents: build

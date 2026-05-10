@@ -1,7 +1,7 @@
 """Inference utilities for loading and serving a trained FEASE model."""
 
 from typing import Optional
-import cr_fease as fease
+import kzn_recsys as fease
 
 
 def load_and_predict(

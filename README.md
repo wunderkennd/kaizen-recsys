@@ -84,7 +84,7 @@ maturin build --release
 
 Once built, you can import and use the library directly in Python.
 ```python
-import cr_fease as fease
+import kzn_recsys as fease
 import time
 
 # Define paths to your long-format data files
@@ -226,14 +226,14 @@ Split data and evaluate model quality with standard ranking metrics:
 
 ### Data Splitting
 
-The Python wrappers in `cr_fease` return a `SplitResult` dataclass with named
+The Python wrappers in `kzn_recsys` return a `SplitResult` dataclass with named
 attributes for the output paths and the count breakdown — easier to plumb into
 downstream `build_and_train` / `evaluate` calls than the Rust 4-tuple. If you
 omit `train_output`/`test_output`, a temp workspace is allocated for you and
 returned in `result.train_path` / `result.test_path`.
 
 ```python
-from cr_fease import random_split_safe, temporal_split_safe, leave_k_out_split_safe
+from kzn_recsys import random_split_safe, temporal_split_safe, leave_k_out_split_safe
 
 # Random split — auto-allocates a temp workspace when paths are omitted
 result = random_split_safe(
