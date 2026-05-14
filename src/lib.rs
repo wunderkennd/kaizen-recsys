@@ -14,6 +14,7 @@ mod data_validation;
 pub mod evaluation;
 pub mod metrics;
 mod model;
+mod models;
 mod serialization;
 mod serving;
 pub mod tuning;
