@@ -41,9 +41,9 @@ impl RecModel for EaseAdapter {
                 interactions,
                 user_features,
             } => {
-                let scores =
-                    self.inner
-                        .predict(interactions, user_features, self.inner.beta);
+                let scores = self
+                    .inner
+                    .predict(interactions, user_features, self.inner.beta);
                 Ok(scores.into_iter().map(|x| x as f32).collect())
             }
             ModelInput::Sequence { .. } => Err(anyhow!(
@@ -55,11 +55,7 @@ impl RecModel for EaseAdapter {
         }
     }
 
-    fn predict_similar_items(
-        &self,
-        item_idx: usize,
-        top_k: usize,
-    ) -> Result<Vec<(usize, f32)>> {
+    fn predict_similar_items(&self, item_idx: usize, top_k: usize) -> Result<Vec<(usize, f32)>> {
         Ok(self
             .inner
             .predict_similar_items(item_idx, top_k)

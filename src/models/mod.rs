@@ -75,11 +75,7 @@ pub trait RecModel: Send + Sync {
     /// Top-K items most similar to a given item, by the model's notion of
     /// item similarity. EASE uses the item-item block of S; sequence and
     /// tower models will use embedding similarity.
-    fn predict_similar_items(
-        &self,
-        item_idx: usize,
-        top_k: usize,
-    ) -> Result<Vec<(usize, f32)>>;
+    fn predict_similar_items(&self, item_idx: usize, top_k: usize) -> Result<Vec<(usize, f32)>>;
 
     /// Self-check the model state.
     fn validate(&self) -> ValidationReport;
