@@ -29,6 +29,9 @@ jobs:
     - name: Run clippy
       run: cargo clippy -- -D warnings
 
+    - name: Run clippy (ml-models feature)
+      run: cargo clippy --features ml-models -- -D warnings
+
     - name: Run Rust tests
       run: cargo test
 
