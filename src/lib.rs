@@ -2,6 +2,13 @@
 //! It uses PyO3 to define the Python-callable functions and the `FeaseModel` class.
 //! This is the "bridge" between Python and Rust.
 
+// burn's deeply nested associated types exceed Rust's default recursion
+// limit of 128 when a backend-generic model is instantiated. Bumping it
+// here (rather than in the ml-models module) avoids a confusing build
+// failure when Phase 2b adds the first SASRec model. Harmless when the
+// feature is off. See issue #24 research findings.
+#![recursion_limit = "256"]
+
 use model::RustFeaseModel; // The internal Rust struct
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyFloat, PyList, PyString};

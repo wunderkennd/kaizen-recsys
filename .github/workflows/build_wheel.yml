@@ -32,6 +32,9 @@ jobs:
     - name: Run Rust tests
       run: cargo test
 
+    - name: Run Rust tests (ml-models feature)
+      run: cargo test --features ml-models
+
     - name: Set up Python
       uses: actions/setup-python@v6
       with:
