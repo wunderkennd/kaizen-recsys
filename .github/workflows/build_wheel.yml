@@ -29,8 +29,19 @@ jobs:
     - name: Run clippy
       run: cargo clippy -- -D warnings
 
+    - name: Run clippy (ml-models feature)
+      run: cargo clippy --features ml-models -- -D warnings
+
     - name: Run Rust tests
       run: cargo test
+
+    # Compile-only: --features is additive, so a full `cargo test --features
+    # ml-models` would re-run the entire default suite. Until Phase 2b (#25)
+    # adds SASRec tests behind #[cfg(feature = "ml-models")], --no-run gives
+    # the gated-path compile guard without duplicating the 81 default tests.
+    # Phase 2b switches this back to a real run of the gated tests.
+    - name: Build ml-models-gated tests (compile guard)
+      run: cargo test --features ml-models --no-run
 
     - name: Set up Python
       uses: actions/setup-python@v6

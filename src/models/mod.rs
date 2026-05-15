@@ -20,6 +20,12 @@ use std::path::Path;
 
 pub mod ease;
 
+#[cfg(feature = "ml-models")]
+pub mod sasrec;
+
+#[cfg(feature = "ml-models")]
+pub mod two_tower;
+
 pub use ease::EaseAdapter;
 
 /// What kind of model this is. Used by callers that need to construct

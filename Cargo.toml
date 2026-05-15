@@ -25,4 +25,17 @@ serde_json = "1"
 sprs = "0.11.4"
 tempfile = "3"
 
+# Optional — only pulled in with the `ml-models` feature (ADR-0001 §"Decisions" #6).
+# Pinned to 0.21 per the research findings on issue #24; burn is pre-1.0 and
+# breaks something most minor versions, so bumps are deliberate, not automatic.
+burn = { version = "0.21", optional = true }
+burn-ndarray = { version = "0.21", optional = true }
+
+[features]
+# Gates the burn-based SASRec / Two-Tower models. Default off so EASE-only
+# users keep the slim dependency tree, build time, and wheel size they have
+# today. Backend is CPU (burn-ndarray); burn-tch / burn-wgpu are a future
+# config flag, not a rewrite (ADR-0001 §"Decisions" #2).
+ml-models = ["dep:burn", "dep:burn-ndarray"]
+
 [dev-dependencies]
