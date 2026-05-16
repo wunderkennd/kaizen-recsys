@@ -207,3 +207,25 @@ multi-model work and can land in any order relative to it.
   https://developer.apple.com/documentation/accelerate
 - OpenBLAS: https://www.openblas.net/
 - auditwheel (Linux wheel bundling): https://github.com/pypa/auditwheel
+
+## Amendment — 2026-05-16 (Phase 2 implementation note)
+
+The original decision text above is retained unchanged as the historical
+record. This note reconciles it with what Phase 2 actually shipped (PR #31).
+
+The `fast-blas = ["nalgebra/blas"]` shorthand used in **§Decision #2** and
+the **Phase 2** row of the rollout table is *not* literally realizable:
+**nalgebra 0.34 (our pinned 0.34.1) exposes no `blas` Cargo feature** — its
+LU/Cholesky BLAS delegation lives in the sibling crate `nalgebra-lapack`.
+
+Phase 2 therefore realizes the same decision via an optional
+`nalgebra-lapack` 0.27 dependency (the only release tracking `nalgebra
+^0.34`), declared `default-features = false` to drop its default
+`lapack-netlib` backend, with per-platform backend auto-selection through
+`[target.*]` tables: `lapack-accelerate` on macOS, `lapack-openblas`
+elsewhere. `invert_gram()` in `src/model.rs` cfg-gates the pure-Rust
+`DMatrix::try_inverse` (default) vs. `nalgebra_lapack::LU::inverse()`
+(`fast-blas`). Intent, default-off posture, opt-in build-from-source story,
+and per-platform backends are all unchanged from the decision above; only
+the dependency mechanism differs. See PR #31 for the implementation and
+verification matrix.
