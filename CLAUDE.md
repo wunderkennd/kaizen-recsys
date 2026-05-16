@@ -115,6 +115,15 @@ files in the repo. Concretely:
   bodies, not in repo files.
 - Link Issues from PRs (`Closes #N`, `Tracks #N`); link ADRs from
   Issues, not the other way around.
+- This rule targets *progress/roadmap/status* tracking (what is done,
+  in progress, blocked, or planned), not factual documentation.
+  Describing what the software currently does and how to use it —
+  capability/usage docs, feature-flag behavior, present-tense
+  architecture — is fine and encouraged in `README.md` / ADRs / design
+  docs. The test: state present behavior as fact; do not enumerate
+  per-item completion status or phase banners (`(in progress)`,
+  "not implemented yet", "lands in Phase N"). Roadmap lives in ADRs +
+  Issues.
 
 Rationale: status changes frequently and concurrently across agents
 and branches. Tracking it in a single text file produces merge

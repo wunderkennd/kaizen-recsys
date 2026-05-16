@@ -52,6 +52,40 @@ All four blocks are computed efficiently from the sparse X, U, and T matrices. T
 
 The key takeaway is that the memory bottleneck is O((M+K)^2), which is independent of the number of users (N).
 
+## Multi-Model Architecture
+
+The Rust crate is organized around a `RecModel` trait (`src/models/`) so the
+evaluation, tuning, and serving layers are model-agnostic (they operate on
+`&dyn RecModel`). The architecture and its rationale are described in
+[`docs/adr/0001-multi-model-architecture.md`](docs/adr/0001-multi-model-architecture.md).
+
+- **Python API.** The Python surface (`FeaseModel` / `build_and_train` /
+  `load_model`) is the closed-form EASE model. EASE is wrapped by
+  `EaseAdapter` / `EaseAdapterRef`, which implement `RecModel` with no
+  algorithmic change, so EASE behavior and outputs are unchanged. Everything
+  in the Python sections below uses EASE.
+- **`ml-models` Cargo feature (off by default).** Additional burn-based model
+  code (the `sasrec` / `two_tower` modules) is compiled only when this feature
+  is enabled. With it off — the default — the dependency tree, build time, and
+  wheel size are unchanged, and the published PyPI wheels do not include
+  `burn`. The `RecModel` trait, the `ModelInput` enum, and the EASE adapter
+  compile unconditionally. Opting in is a build-from-source step:
+
+  ```bash
+  maturin develop --features ml-models   # or: cargo build --features ml-models
+  ```
+
+- **Model-agnostic evaluation & tuning.** `evaluation::evaluate_model` is
+  generalized over `&dyn RecModel`; EASE evaluation numbers are unchanged.
+  Hyperparameter tuning (grid / random search with k-fold CV) runs the
+  `(params × fold)` trials in parallel via rayon's global pool
+  ([`docs/adr/0002-training-parallelism.md`](docs/adr/0002-training-parallelism.md))
+  — set `RAYON_NUM_THREADS` to cap concurrency; model output is unchanged,
+  only trial wall-clock and the order of `trials` in the result differ.
+
+Which models the architecture targets, and the order they are introduced, are
+described in ADR-0001; the corresponding work is tracked in GitHub Issues.
+
 ## Building and Using the Python Library
 
 This project is built as a Python library using maturin.
