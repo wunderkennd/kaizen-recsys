@@ -52,6 +52,44 @@ All four blocks are computed efficiently from the sparse X, U, and T matrices. T
 
 The key takeaway is that the memory bottleneck is O((M+K)^2), which is independent of the number of users (N).
 
+## Multi-Model Architecture (in progress)
+
+EASE is the **production model** and the only model exposed to Python today
+(`FeaseModel` / `build_and_train` / `load_model`). Everything documented in the
+Python sections below uses EASE.
+
+Internally, the Rust crate is being generalized to host multiple recommender
+models behind a common `RecModel` trait (`src/models/`), per the phased
+rollout in [`docs/adr/0001-multi-model-architecture.md`](docs/adr/0001-multi-model-architecture.md):
+
+- **EASE** — shipped. The existing closed-form model is wrapped by
+  `EaseAdapter` / `EaseAdapterRef`, which implement `RecModel` with no
+  algorithmic change.
+- **SASRec** (causal self-attention sequence model) — **in progress, not
+  usable yet**. Only a minimal forward pass exists: no training loop, no
+  `RecModel` implementation, and no PyO3 class. It compiles only behind the
+  optional `ml-models` Cargo feature.
+- **Two-Tower** — **not implemented**. The module is a placeholder stub; the
+  model lands in a later phase (ADR-0001, Phase 5).
+
+The burn-based ML models (SASRec / Two-Tower) live behind an optional
+`ml-models` Cargo feature that is **off by default**. EASE-only users keep the
+same dependency tree, build time, and wheel size — the published PyPI wheels do
+not include `burn`. Opting in is a build-from-source step:
+
+```bash
+maturin develop --features ml-models   # or: cargo build --features ml-models
+```
+
+The evaluation harness (`src/evaluation.rs::evaluate_model`) is already
+generalized over `&dyn RecModel`, so it is model-agnostic; EASE evaluation
+numbers are unchanged. Hyperparameter tuning (grid / random search with k-fold
+CV) runs the `(params × fold)` trials in parallel via rayon's global pool
+([`docs/adr/0002-training-parallelism.md`](docs/adr/0002-training-parallelism.md),
+Phase 1) — set `RAYON_NUM_THREADS` to cap concurrency. Model output is
+unchanged; only trial wall-clock and the order of `trials` in the result
+differ.
+
 ## Building and Using the Python Library
 
 This project is built as a Python library using maturin.
