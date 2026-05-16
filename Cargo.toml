@@ -28,7 +28,15 @@ tempfile = "3"
 # Optional — only pulled in with the `ml-models` feature (ADR-0001 §"Decisions" #6).
 # Pinned to 0.21 per the research findings on issue #24; burn is pre-1.0 and
 # breaks something most minor versions, so bumps are deliberate, not automatic.
-burn = { version = "0.21", optional = true }
+# `autodiff` + `train` add the Learner / TrainStep machinery the Phase 3
+# SASRec training loop needs (research doc §3); `ndarray`/`std` keep the
+# CPU backend and std support the Phase 2 forward pass already relied on.
+burn = { version = "0.21", optional = true, default-features = false, features = [
+    "ndarray",
+    "autodiff",
+    "train",
+    "std",
+] }
 burn-ndarray = { version = "0.21", optional = true }
 
 # Optional — only pulled in with the `fast-blas` feature (ADR-0002 §"Decision"
