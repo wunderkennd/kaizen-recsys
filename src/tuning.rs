@@ -14,6 +14,7 @@ use polars::prelude::*;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
@@ -350,10 +351,128 @@ fn evaluate_trial(
 }
 
 // ---------------------------------------------------------------------------
+// Parallel trial runner
+// ---------------------------------------------------------------------------
+
+/// Runs each parameter configuration over all CV folds in parallel and
+/// assembles a deterministic [`SearchResult`].
+///
+/// The `(params × fold)` work product is embarrassingly parallel: each trial
+/// is a pure function of `(params, train_path, test_path)` reading immutable
+/// fold Parquet files written once by [`generate_kfold_splits`]. Parallelism
+/// uses rayon's global pool (honors `RAYON_NUM_THREADS`); no private pool is
+/// constructed, per ADR-0002 §"Risks".
+///
+/// Determinism is preserved despite non-deterministic completion order:
+/// - each trial is keyed by its stable `trial_idx` (the index in `configs`);
+/// - `all_trials` is sorted by `trial_idx` before returning;
+/// - `best_params` is the highest `mean_score`, ties broken on the lowest
+///   `trial_idx`, so the result is independent of execution order.
+fn run_trials_parallel(
+    configs: &[HyperParams],
+    fold_paths: &[(String, String)],
+    user_features_path: &str,
+    item_features_path: &str,
+    eval_k: usize,
+) -> Result<SearchResult> {
+    let total = configs.len();
+    let n_folds = fold_paths.len();
+
+    // Flatten the `(trial, fold)` cartesian product into one flat work list
+    // so the rayon pool sees a single even work product. A nested
+    // `configs.par_iter()` → `fold_paths.par_iter()` would let the outer
+    // parallelism saturate the pool and effectively serialize the inner
+    // fold loop for small fold counts; one flat `par_iter` over the
+    // `total * n_folds` items distributes work evenly.
+    let work: Vec<(usize, usize)> = (0..total)
+        .flat_map(|trial_idx| (0..n_folds).map(move |fold_idx| (trial_idx, fold_idx)))
+        .collect();
+
+    let mut fold_results: Vec<(usize, usize, f64)> = work
+        .par_iter()
+        .map(|&(trial_idx, fold_idx)| -> Result<(usize, usize, f64)> {
+            let (train_path, test_path) = &fold_paths[fold_idx];
+            let score = evaluate_trial(
+                train_path,
+                test_path,
+                user_features_path,
+                item_features_path,
+                &configs[trial_idx],
+                eval_k,
+            )?;
+            Ok((trial_idx, fold_idx, score))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    // Regroup deterministically: sorting by `(trial_idx, fold_idx)` makes
+    // each trial's fold scores independent of parallel completion order, so
+    // `fold_scores[i]` always corresponds to `fold_paths[i]`. Each trial has
+    // exactly `n_folds` consecutive entries, so `chunks(n_folds)` yields the
+    // per-trial groups in ascending `trial_idx` order.
+    fold_results.sort_by_key(|&(trial_idx, fold_idx, _)| (trial_idx, fold_idx));
+
+    let indexed: Vec<(usize, TrialResult)> = fold_results
+        .chunks(n_folds)
+        .enumerate()
+        .map(|(trial_idx, chunk)| {
+            debug_assert!(chunk.iter().all(|&(t, _, _)| t == trial_idx));
+            let fold_scores: Vec<f64> = chunk.iter().map(|&(_, _, s)| s).collect();
+            let mean_score = fold_scores.iter().sum::<f64>() / fold_scores.len() as f64;
+
+            log::info!(
+                "Trial {}/{}: alpha={}, beta={}, lambda_={} -> NDCG@{}={:.4}",
+                trial_idx + 1,
+                total,
+                configs[trial_idx].alpha,
+                configs[trial_idx].beta,
+                configs[trial_idx].lambda_,
+                eval_k,
+                mean_score
+            );
+
+            (
+                trial_idx,
+                TrialResult {
+                    params: configs[trial_idx].clone(),
+                    mean_score,
+                    fold_scores,
+                },
+            )
+        })
+        .collect();
+    // `indexed` is in ascending `trial_idx` order by construction.
+
+    // Pick best deterministically: highest mean_score, ties broken on lowest
+    // trial_idx. `indexed` is now sorted ascending by trial_idx, so a strict
+    // `>` keeps the first-seen (lowest-index) winner among score ties.
+    let mut best_score = f64::NEG_INFINITY;
+    let mut best_params = configs[0].clone();
+    for (_, trial) in &indexed {
+        if trial.mean_score > best_score {
+            best_score = trial.mean_score;
+            best_params = trial.params.clone();
+        }
+    }
+
+    let all_trials: Vec<TrialResult> = indexed.into_iter().map(|(_, trial)| trial).collect();
+
+    Ok(SearchResult {
+        best_params,
+        best_score,
+        all_trials,
+        metric_name: format!("ndcg@{}", eval_k),
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Grid search
 // ---------------------------------------------------------------------------
 
 /// Grid search: evaluates all combinations of parameters in the grid.
+///
+/// The `(params × fold)` trials run in parallel via rayon's global pool
+/// (ADR-0002 Phase 1). The result is deterministic for a fixed `seed` and
+/// grid regardless of thread count: see [`run_trials_parallel`].
 pub fn grid_search(
     interactions_path: &str,
     user_features_path: &str,
@@ -377,56 +496,13 @@ pub fn grid_search(
     // Generate k-fold splits once
     let (_tmp_dir, fold_paths) = generate_kfold_splits(interactions_path, n_folds, seed)?;
 
-    let mut all_trials = Vec::with_capacity(total);
-    let mut best_score = f64::NEG_INFINITY;
-    let mut best_params = combos[0].clone();
-
-    for (i, params) in combos.iter().enumerate() {
-        let mut fold_scores = Vec::with_capacity(n_folds);
-
-        for (train_path, test_path) in &fold_paths {
-            let score = evaluate_trial(
-                train_path,
-                test_path,
-                user_features_path,
-                item_features_path,
-                params,
-                eval_k,
-            )?;
-            fold_scores.push(score);
-        }
-
-        let mean_score = fold_scores.iter().sum::<f64>() / fold_scores.len() as f64;
-
-        log::info!(
-            "Trial {}/{}: alpha={}, beta={}, lambda_={} -> NDCG@{}={:.4}",
-            i + 1,
-            total,
-            params.alpha,
-            params.beta,
-            params.lambda_,
-            eval_k,
-            mean_score
-        );
-
-        if mean_score > best_score {
-            best_score = mean_score;
-            best_params = params.clone();
-        }
-
-        all_trials.push(TrialResult {
-            params: params.clone(),
-            mean_score,
-            fold_scores,
-        });
-    }
-
-    Ok(SearchResult {
-        best_params,
-        best_score,
-        all_trials,
-        metric_name: format!("ndcg@{}", eval_k),
-    })
+    run_trials_parallel(
+        &combos,
+        &fold_paths,
+        user_features_path,
+        item_features_path,
+        eval_k,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -434,6 +510,10 @@ pub fn grid_search(
 // ---------------------------------------------------------------------------
 
 /// Random search: samples n_trials random parameter configurations from the grid.
+///
+/// Config sampling stays sequential so the sampled set is a deterministic
+/// function of `seed`; the resulting `(params × fold)` trials run in parallel
+/// via rayon's global pool (ADR-0002 Phase 1). See [`run_trials_parallel`].
 #[allow(clippy::too_many_arguments)]
 pub fn random_search(
     interactions_path: &str,
@@ -453,7 +533,8 @@ pub fn random_search(
     // Generate k-fold splits once
     let (_tmp_dir, fold_paths) = generate_kfold_splits(interactions_path, n_folds, seed)?;
 
-    // Sample random parameter configs (use seed+1 to decouple from fold generation)
+    // Sample random parameter configs (use seed+1 to decouple from fold generation).
+    // Sampling is sequential so the config set is deterministic for a fixed seed.
     let mut rng = StdRng::seed_from_u64(seed.wrapping_add(1));
     let mut sampled_configs = Vec::with_capacity(n_trials);
     for _ in 0..n_trials {
@@ -469,56 +550,13 @@ pub fn random_search(
         sampled_configs.push(params);
     }
 
-    let mut all_trials = Vec::with_capacity(n_trials);
-    let mut best_score = f64::NEG_INFINITY;
-    let mut best_params = sampled_configs[0].clone();
-
-    for (i, params) in sampled_configs.iter().enumerate() {
-        let mut fold_scores = Vec::with_capacity(n_folds);
-
-        for (train_path, test_path) in &fold_paths {
-            let score = evaluate_trial(
-                train_path,
-                test_path,
-                user_features_path,
-                item_features_path,
-                params,
-                eval_k,
-            )?;
-            fold_scores.push(score);
-        }
-
-        let mean_score = fold_scores.iter().sum::<f64>() / fold_scores.len() as f64;
-
-        log::info!(
-            "Trial {}/{}: alpha={}, beta={}, lambda_={} -> NDCG@{}={:.4}",
-            i + 1,
-            n_trials,
-            params.alpha,
-            params.beta,
-            params.lambda_,
-            eval_k,
-            mean_score
-        );
-
-        if mean_score > best_score {
-            best_score = mean_score;
-            best_params = params.clone();
-        }
-
-        all_trials.push(TrialResult {
-            params: params.clone(),
-            mean_score,
-            fold_scores,
-        });
-    }
-
-    Ok(SearchResult {
-        best_params,
-        best_score,
-        all_trials,
-        metric_name: format!("ndcg@{}", eval_k),
-    })
+    run_trials_parallel(
+        &sampled_configs,
+        &fold_paths,
+        user_features_path,
+        item_features_path,
+        eval_k,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -557,6 +595,83 @@ mod tests {
     use polars::df;
     use std::fs::File;
     use std::path::Path;
+
+    fn make_big_dataset(
+        n_users: usize,
+        n_items: usize,
+    ) -> Result<(String, String, String, tempfile::TempDir)> {
+        let tmp = tempfile::tempdir()?;
+        let mut u = Vec::new();
+        let mut it = Vec::new();
+        let mut v = Vec::new();
+        for ui in 0..n_users {
+            for k in 0..8 {
+                u.push(format!("u{}", ui));
+                it.push(format!("i{}", (ui * 7 + k * 13) % n_items));
+                v.push(1.0_f64);
+            }
+        }
+        let mut interactions = df!("user_id" => u, "item_id" => it, "value" => v)?;
+        let uf_id: Vec<String> = (0..n_users).map(|i| format!("u{}", i)).collect();
+        let uf_fn: Vec<String> = (0..n_users).map(|i| format!("f{}", i % 5)).collect();
+        let uf_v: Vec<f64> = vec![1.0; n_users];
+        let mut user_features = df!("user_id" => uf_id, "feature_name" => uf_fn, "value" => uf_v)?;
+        let if_id: Vec<String> = (0..n_items).map(|i| format!("i{}", i)).collect();
+        let if_fn: Vec<String> = (0..n_items).map(|i| format!("g{}", i % 4)).collect();
+        let if_v: Vec<f64> = vec![1.0; n_items];
+        let mut item_features = df!("item_id" => if_id, "feature_name" => if_fn, "value" => if_v)?;
+        let i_path = create_parquet_in(tmp.path(), "i.parquet", &mut interactions)?;
+        let u_path = create_parquet_in(tmp.path(), "u.parquet", &mut user_features)?;
+        let t_path = create_parquet_in(tmp.path(), "t.parquet", &mut item_features)?;
+        Ok((i_path, u_path, t_path, tmp))
+    }
+
+    /// Non-CI timing harness (run with `--ignored --nocapture`). Compares the
+    /// genuinely-sequential baseline against the rayon `grid_search` in one
+    /// process for a representative grid, and asserts identical best score.
+    #[test]
+    #[ignore]
+    fn bench_parallel_vs_sequential() -> Result<()> {
+        let (i, up, tp, _g) = make_big_dataset(120, 60)?;
+        let grid = ParamGrid {
+            alpha: vec![0.5, 1.0, 2.0],
+            beta: vec![0.5, 1.0],
+            lambda_: vec![10.0, 100.0, 500.0],
+            meta_weight: vec![0.0],
+            decay_rate: vec![0.0],
+            ips_alpha: vec![0.0],
+            sparsity_threshold: vec![0.0],
+        };
+        let (nf, ek, sd) = (4usize, 10usize, 42u64);
+        let t0 = std::time::Instant::now();
+        let seq = sequential_grid_baseline(&i, &up, &tp, &grid, nf, ek, sd)?;
+        let seq_t = t0.elapsed();
+        let t1 = std::time::Instant::now();
+        let par = grid_search(&i, &up, &tp, &grid, nf, ek, sd)?;
+        let par_t = t1.elapsed();
+        eprintln!(
+            "BENCH trials={} folds={} threads={} sequential={:?} parallel={:?} speedup={:.2}x",
+            par.all_trials.len(),
+            nf,
+            rayon::current_num_threads(),
+            seq_t,
+            par_t,
+            seq_t.as_secs_f64() / par_t.as_secs_f64()
+        );
+        // Tolerance, not bit-exact: `evaluate_trial` accumulates NDCG by
+        // iterating an `AHashMap` whose iteration order is randomized per
+        // process (pre-existing behavior, unrelated to this PR's rayon
+        // change). Sub-ULP float drift is expected and rank-irrelevant
+        // (ADR-0002 §Negative). The deterministic CI gate is
+        // `test_parallel_grid_search_matches_sequential` on a fixed small grid.
+        assert!(
+            (par.best_score - seq.best_score).abs() < 1e-9,
+            "parallel best_score {} vs sequential {}",
+            par.best_score,
+            seq.best_score
+        );
+        Ok(())
+    }
 
     /// Helper to create a dummy parquet file in a temp dir and return its path.
     fn create_parquet_in(dir: &Path, name: &str, df: &mut DataFrame) -> Result<String> {
@@ -750,6 +865,158 @@ mod tests {
         // Each trial should have 2 fold scores
         for trial in &result.all_trials {
             assert_eq!(trial.fold_scores.len(), 2);
+        }
+
+        Ok(())
+    }
+
+    /// Sequential baseline mirroring the pre-parallel `for params { for fold }`
+    /// evaluation order. Used to assert the rayon `grid_search` produces a
+    /// bit-identical `SearchResult` (ADR-0002 Phase 1 acceptance gate).
+    fn sequential_grid_baseline(
+        i_path: &str,
+        u_path: &str,
+        t_path: &str,
+        grid: &ParamGrid,
+        n_folds: usize,
+        eval_k: usize,
+        seed: u64,
+    ) -> Result<SearchResult> {
+        let combos = cartesian_product(grid);
+        let (_tmp_dir, fold_paths) = generate_kfold_splits(i_path, n_folds, seed)?;
+
+        let mut all_trials = Vec::with_capacity(combos.len());
+        let mut best_score = f64::NEG_INFINITY;
+        let mut best_params = combos[0].clone();
+
+        for params in &combos {
+            let mut fold_scores = Vec::with_capacity(n_folds);
+            for (train_path, test_path) in &fold_paths {
+                fold_scores.push(evaluate_trial(
+                    train_path, test_path, u_path, t_path, params, eval_k,
+                )?);
+            }
+            let mean_score = fold_scores.iter().sum::<f64>() / fold_scores.len() as f64;
+            if mean_score > best_score {
+                best_score = mean_score;
+                best_params = params.clone();
+            }
+            all_trials.push(TrialResult {
+                params: params.clone(),
+                mean_score,
+                fold_scores,
+            });
+        }
+
+        Ok(SearchResult {
+            best_params,
+            best_score,
+            all_trials,
+            metric_name: format!("ndcg@{}", eval_k),
+        })
+    }
+
+    /// Regression test (ADR-0002 Phase 1 / issue #28):
+    /// the parallel `grid_search` must produce identical `best_params`,
+    /// `best_score`, and per-trial scores as the sequential baseline for a
+    /// fixed seed and small grid, and `all_trials` must be in `trial_idx`
+    /// (cartesian-product) order.
+    #[test]
+    fn test_parallel_grid_search_matches_sequential() -> Result<()> {
+        let (i_path, u_path, t_path, _tmpdir) = create_test_dataset()?;
+
+        // Small grid with multiple varying axes -> several distinct trials.
+        let grid = ParamGrid {
+            alpha: vec![0.5, 1.0],
+            beta: vec![1.0],
+            lambda_: vec![10.0, 100.0, 500.0],
+            meta_weight: vec![0.0],
+            decay_rate: vec![0.0],
+            ips_alpha: vec![0.0],
+            sparsity_threshold: vec![0.0],
+        };
+        let n_folds = 2;
+        let eval_k = 10;
+        let seed = 42;
+
+        let parallel = grid_search(&i_path, &u_path, &t_path, &grid, n_folds, eval_k, seed)?;
+        let sequential =
+            sequential_grid_baseline(&i_path, &u_path, &t_path, &grid, n_folds, eval_k, seed)?;
+
+        // Same number of trials and same metric name.
+        assert_eq!(parallel.all_trials.len(), sequential.all_trials.len());
+        assert_eq!(parallel.metric_name, sequential.metric_name);
+
+        // The decision output -- best_params -- must be identical. This is
+        // the determinism guarantee that matters: which configuration the
+        // search picks must not depend on thread count or completion order
+        // (ADR-0002 §Negative "Determinism under parallel tuning").
+        assert_eq!(parallel.best_params.alpha, sequential.best_params.alpha);
+        assert_eq!(parallel.best_params.beta, sequential.best_params.beta);
+        assert_eq!(parallel.best_params.lambda_, sequential.best_params.lambda_);
+
+        // best_score within tight tolerance. Scores are NOT pinned bit-exact:
+        // the closed-form solve runs through nalgebra's rayon-enabled dense
+        // LA, so sub-ULP float drift from FMA ordering is expected and
+        // rank-irrelevant (ADR-0002 §Risks). Tolerance is far below any
+        // value that could flip best_params.
+        const TOL: f64 = 1e-9;
+        assert!(
+            (parallel.best_score - sequential.best_score).abs() < TOL,
+            "parallel best_score {} vs sequential {}",
+            parallel.best_score,
+            sequential.best_score
+        );
+
+        // all_trials must be returned in cartesian-product (trial_idx) order
+        // -- this ordering IS pinned exactly, it's the core determinism
+        // guarantee of the parallel runner -- and per-trial scores must match
+        // the sequential baseline within tolerance.
+        let expected_combos = cartesian_product(&grid);
+        for (idx, (p_trial, s_trial)) in parallel
+            .all_trials
+            .iter()
+            .zip(sequential.all_trials.iter())
+            .enumerate()
+        {
+            assert_eq!(
+                p_trial.params.alpha, expected_combos[idx].alpha,
+                "all_trials[{}] not in trial_idx order (alpha)",
+                idx
+            );
+            assert_eq!(
+                p_trial.params.lambda_, expected_combos[idx].lambda_,
+                "all_trials[{}] not in trial_idx order (lambda_)",
+                idx
+            );
+            assert!(
+                (p_trial.mean_score - s_trial.mean_score).abs() < TOL,
+                "trial {} mean_score mismatch: parallel {} vs sequential {}",
+                idx,
+                p_trial.mean_score,
+                s_trial.mean_score
+            );
+            assert_eq!(
+                p_trial.fold_scores.len(),
+                s_trial.fold_scores.len(),
+                "trial {} fold count mismatch",
+                idx
+            );
+            for (f, (pf, sf)) in p_trial
+                .fold_scores
+                .iter()
+                .zip(s_trial.fold_scores.iter())
+                .enumerate()
+            {
+                assert!(
+                    (pf - sf).abs() < TOL,
+                    "trial {} fold {} score mismatch: parallel {} vs sequential {}",
+                    idx,
+                    f,
+                    pf,
+                    sf
+                );
+            }
         }
 
         Ok(())
