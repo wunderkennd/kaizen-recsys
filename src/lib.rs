@@ -301,8 +301,14 @@ impl FeaseModel {
             k_values: k_values.unwrap_or_else(|| vec![5, 10, 20, 50]),
         };
 
+        // The evaluation harness is generalized over `&dyn RecModel`
+        // (Phase 4a, issue #30). Wrap the concrete EASE model in a
+        // borrowing adapter; the math is identical so PyO3 outputs stay
+        // byte-identical (only a single `as f32` score round-trip), and
+        // borrowing avoids deep-cloning the S matrix on every call.
+        let adapter = crate::models::EaseAdapterRef::new(&self.model);
         let report = evaluation::evaluate_model(
-            &self.model,
+            &adapter,
             test_interactions_path,
             train_interactions_path,
             user_features_path,
@@ -974,16 +980,23 @@ fn grid_search_py(
     seed: u64,
 ) -> PyResult<Py<PyAny>> {
     let grid = parse_param_grid(param_grid)?;
-    let result = tuning::grid_search(
-        interactions_path,
-        user_features_path,
-        item_features_path,
-        &grid,
-        n_folds,
-        eval_k,
-        seed,
-    )
-    .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+    // Release the GIL: the search is rayon-parallelized pure Rust work that
+    // never touches Python objects, so holding the GIL would needlessly
+    // block other Python threads for the whole (now longer, parallel) run.
+    // Mirrors the `predict_batch` pattern above.
+    let result = py
+        .detach(|| {
+            tuning::grid_search(
+                interactions_path,
+                user_features_path,
+                item_features_path,
+                &grid,
+                n_folds,
+                eval_k,
+                seed,
+            )
+        })
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
 
     search_result_to_py(py, &result)
 }
@@ -1026,17 +1039,21 @@ fn random_search_py(
     seed: u64,
 ) -> PyResult<Py<PyAny>> {
     let grid = parse_param_grid(param_grid)?;
-    let result = tuning::random_search(
-        interactions_path,
-        user_features_path,
-        item_features_path,
-        &grid,
-        n_trials,
-        n_folds,
-        eval_k,
-        seed,
-    )
-    .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+    // Release the GIL during the rayon-parallelized search (see grid_search_py).
+    let result = py
+        .detach(|| {
+            tuning::random_search(
+                interactions_path,
+                user_features_path,
+                item_features_path,
+                &grid,
+                n_trials,
+                n_folds,
+                eval_k,
+                seed,
+            )
+        })
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
 
     search_result_to_py(py, &result)
 }
