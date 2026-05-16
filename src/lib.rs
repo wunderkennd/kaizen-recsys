@@ -301,8 +301,13 @@ impl FeaseModel {
             k_values: k_values.unwrap_or_else(|| vec![5, 10, 20, 50]),
         };
 
+        // The evaluation harness is generalized over `&dyn RecModel`
+        // (Phase 4a, issue #30). Wrap the concrete EASE model in its
+        // adapter; the math is identical so PyO3 outputs stay
+        // byte-identical (only a single `as f32` score round-trip).
+        let adapter = crate::models::EaseAdapter::new(self.model.clone());
         let report = evaluation::evaluate_model(
-            &self.model,
+            &adapter,
             test_interactions_path,
             train_interactions_path,
             user_features_path,

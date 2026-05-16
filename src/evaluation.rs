@@ -6,7 +6,7 @@
 
 use crate::data_pipeline::Mappings;
 use crate::metrics;
-use crate::model::RustFeaseModel;
+use crate::models::{ModelInput, RecModel};
 use ahash::AHashMap;
 use anyhow::{Result, anyhow};
 use polars::prelude::*;
@@ -298,15 +298,19 @@ pub fn leave_k_out_split(
 
 /// Evaluates a trained model against test interactions.
 ///
+/// The harness is generalized over `&dyn RecModel` (Phase 4a / issue #30):
+/// it works for any model implementing the trait, not just the concrete
+/// `RustFeaseModel`. EASE callers pass an `EaseAdapter`.
+///
 /// For each user in the test set who also exists in the model's mappings:
 /// 1. Gets the user's TEST interactions (ground truth relevant items)
 /// 2. Gets the user's TRAIN interactions (to generate predictions from)
-/// 3. Calls model.predict() with train interactions
+/// 3. Calls `model.predict_scores(ModelInput::Sparse { .. })`
 /// 4. Ranks items, excludes train items
 /// 5. Computes all metrics against test items
 /// 6. Averages across users
 pub fn evaluate_model(
-    model: &RustFeaseModel,
+    model: &dyn RecModel,
     test_interactions_path: &str,
     train_interactions_path: &str,
     user_features_path: Option<&str>,
@@ -317,10 +321,12 @@ pub fn evaluate_model(
     let test_df = read_interactions_df(test_interactions_path)?;
     let train_df = read_interactions_df(train_interactions_path)?;
 
+    let mappings = model.item_mapping();
+
     // Load user features if provided
     let user_features_map: AHashMap<String, Vec<(usize, f64)>> =
         if let Some(uf_path) = user_features_path {
-            build_user_features_map(uf_path, &model.mappings)?
+            build_user_features_map(uf_path, mappings)?
         } else {
             AHashMap::new()
         };
@@ -332,7 +338,7 @@ pub fn evaluate_model(
     let mut test_user_items: AHashMap<String, HashSet<usize>> = AHashMap::new();
     for i in 0..test_df.height() {
         if let (Some(uid), Some(iid)) = (test_user_col.get(i), test_item_col.get(i))
-            && let Some(&item_idx) = model.mappings.item_to_idx.get(iid)
+            && let Some(&item_idx) = mappings.item_to_idx.get(iid)
         {
             test_user_items
                 .entry(uid.to_string())
@@ -352,7 +358,7 @@ pub fn evaluate_model(
             train_user_col.get(i),
             train_item_col.get(i),
             train_val_col.get(i),
-        ) && let Some(&item_idx) = model.mappings.item_to_idx.get(iid)
+        ) && let Some(&item_idx) = mappings.item_to_idx.get(iid)
         {
             train_user_interactions
                 .entry(uid.to_string())
@@ -377,7 +383,7 @@ pub fn evaluate_model(
 
     for (uid, relevant_items) in &test_user_items {
         // The user must exist in the model's mappings
-        if !model.mappings.user_to_idx.contains_key(uid.as_str()) {
+        if !mappings.user_to_idx.contains_key(uid.as_str()) {
             continue;
         }
 
@@ -391,15 +397,20 @@ pub fn evaluate_model(
             .cloned()
             .unwrap_or_default();
 
-        // Predict scores
-        let scores = model.predict(&user_interactions, &user_features, model.beta);
+        // Predict scores. The `RecModel` trait standardizes on f32; the
+        // EASE math is identical and only pays a single `as f32` cast per
+        // element on output (the regression test guards this within 1e-9).
+        let scores = model.predict_scores(ModelInput::Sparse {
+            interactions: &user_interactions,
+            user_features: &user_features,
+        })?;
 
         // Build set of train items to exclude
         let train_item_set: HashSet<usize> =
             user_interactions.iter().map(|(idx, _)| *idx).collect();
 
         // Rank items, excluding train items
-        let mut ranked: Vec<(usize, f64)> = scores
+        let mut ranked: Vec<(usize, f32)> = scores
             .into_iter()
             .enumerate()
             .filter(|(idx, _)| !train_item_set.contains(idx))
@@ -446,7 +457,7 @@ pub fn evaluate_model(
         })
         .collect();
 
-    let cov = metrics::coverage(&all_recs, model.num_items);
+    let cov = metrics::coverage(&all_recs, model.num_items());
 
     let report = EvalReport {
         metrics_at_k,
@@ -713,6 +724,257 @@ mod tests {
         let deser: EvalReport = serde_json::from_str(&json)?;
         assert_eq!(deser.num_users, 100);
         assert_eq!(deser.metrics_at_k[0].k, 5);
+
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 4a regression (issue #30): evaluating via `&dyn RecModel`
+    // (EaseAdapter) must produce metrics numerically identical to the
+    // pre-change concrete (`&RustFeaseModel::predict`, f64) path. The only
+    // difference the generalization introduces is a single `as f32` score
+    // round-trip in the adapter; the 1e-9 tolerance guards exactly that and
+    // nothing else (the surrounding ranking/metric math is unchanged).
+    // -----------------------------------------------------------------------
+
+    use crate::data_pipeline::Mappings;
+    use crate::model::RustFeaseModel;
+    use crate::models::EaseAdapter;
+    use nalgebra::DMatrix;
+
+    fn regression_mappings() -> Mappings {
+        let mut m = Mappings {
+            user_to_idx: Default::default(),
+            idx_to_user: Default::default(),
+            item_to_idx: Default::default(),
+            idx_to_item: Default::default(),
+            user_feature_to_idx: Default::default(),
+            idx_to_user_feature: Default::default(),
+            item_feature_to_idx: Default::default(),
+            idx_to_item_feature: Default::default(),
+        };
+        for (i, u) in ["u1", "u2", "u3"].iter().enumerate() {
+            m.user_to_idx.insert(u.to_string(), i);
+            m.idx_to_user.insert(i, u.to_string());
+        }
+        for (i, it) in ["i1", "i2", "i3", "i4", "i5"].iter().enumerate() {
+            m.item_to_idx.insert(it.to_string(), i);
+            m.idx_to_item.insert(i, it.to_string());
+        }
+        m
+    }
+
+    fn regression_model() -> RustFeaseModel {
+        let n_items = 5;
+        let n_user_features = 0;
+        let total = n_items + n_user_features;
+        // A non-trivial, symmetric item-item S so rankings are not all ties.
+        let mut s = DMatrix::<f64>::zeros(total, total);
+        let weights = [
+            (0, 1, 0.9),
+            (0, 2, 0.4),
+            (0, 3, 0.7),
+            (1, 2, 0.6),
+            (1, 4, 0.3),
+            (2, 3, 0.8),
+            (2, 4, 0.5),
+            (3, 4, 0.2),
+        ];
+        for &(a, b, w) in &weights {
+            s[(a, b)] = w;
+            s[(b, a)] = w;
+        }
+        RustFeaseModel {
+            s_matrix: s,
+            num_items: n_items,
+            num_user_features: n_user_features,
+            num_item_features: 0,
+            alpha: 1.0,
+            beta: 1.0,
+            lambda_: 100.0,
+            meta_weight: 0.0,
+            mappings: regression_mappings(),
+            weighting_config: None,
+        }
+    }
+
+    /// Recompute an `EvalReport` using the pre-change concrete f64 path.
+    /// Mirrors `evaluate_model`'s logic exactly, but calls
+    /// `RustFeaseModel::predict` directly (no adapter, no f32 cast). This is
+    /// the baseline the generalized path must match within 1e-9.
+    fn baseline_concrete_report(
+        model: &RustFeaseModel,
+        test_path: &str,
+        train_path: &str,
+        config: &EvalConfig,
+    ) -> Result<EvalReport> {
+        let test_df = read_interactions_df(test_path)?;
+        let train_df = read_interactions_df(train_path)?;
+
+        let test_user_col = test_df.column("user_id")?.str()?;
+        let test_item_col = test_df.column("item_id")?.str()?;
+        let mut test_user_items: AHashMap<String, HashSet<usize>> = AHashMap::new();
+        for i in 0..test_df.height() {
+            if let (Some(uid), Some(iid)) = (test_user_col.get(i), test_item_col.get(i))
+                && let Some(&item_idx) = model.mappings.item_to_idx.get(iid)
+            {
+                test_user_items
+                    .entry(uid.to_string())
+                    .or_default()
+                    .insert(item_idx);
+            }
+        }
+
+        let train_user_col = train_df.column("user_id")?.str()?;
+        let train_item_col = train_df.column("item_id")?.str()?;
+        let train_val_col = train_df.column("value")?.f64()?;
+        let mut train_user_interactions: AHashMap<String, Vec<(usize, f64)>> = AHashMap::new();
+        for i in 0..train_df.height() {
+            if let (Some(uid), Some(iid), Some(val)) = (
+                train_user_col.get(i),
+                train_item_col.get(i),
+                train_val_col.get(i),
+            ) && let Some(&item_idx) = model.mappings.item_to_idx.get(iid)
+            {
+                train_user_interactions
+                    .entry(uid.to_string())
+                    .or_default()
+                    .push((item_idx, val));
+            }
+        }
+
+        let max_k = config.k_values.iter().copied().max().unwrap_or(10);
+        let num_k = config.k_values.len();
+        let mut sum_precision = vec![0.0; num_k];
+        let mut sum_recall = vec![0.0; num_k];
+        let mut sum_ndcg = vec![0.0; num_k];
+        let mut sum_map = vec![0.0; num_k];
+        let mut sum_hit_rate = vec![0.0; num_k];
+        let mut all_recs: Vec<Vec<usize>> = Vec::new();
+        let mut num_users_evaluated = 0usize;
+        let mut total_test_interactions = 0usize;
+
+        for (uid, relevant_items) in &test_user_items {
+            if !model.mappings.user_to_idx.contains_key(uid.as_str()) {
+                continue;
+            }
+            let user_interactions = train_user_interactions
+                .get(uid.as_str())
+                .cloned()
+                .unwrap_or_default();
+            let user_features: Vec<(usize, f64)> = Vec::new();
+
+            let scores = model.predict(&user_interactions, &user_features, model.beta);
+            let train_item_set: HashSet<usize> =
+                user_interactions.iter().map(|(idx, _)| *idx).collect();
+            let mut ranked: Vec<(usize, f64)> = scores
+                .into_iter()
+                .enumerate()
+                .filter(|(idx, _)| !train_item_set.contains(idx))
+                .collect();
+            ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            let recommended: Vec<usize> = ranked.iter().take(max_k).map(|(idx, _)| *idx).collect();
+
+            for (ki, &k) in config.k_values.iter().enumerate() {
+                sum_precision[ki] += metrics::precision_at_k(&recommended, relevant_items, k);
+                sum_recall[ki] += metrics::recall_at_k(&recommended, relevant_items, k);
+                sum_ndcg[ki] += metrics::ndcg_at_k(&recommended, relevant_items, k);
+                sum_map[ki] += metrics::mean_average_precision(
+                    &recommended[..k.min(recommended.len())],
+                    relevant_items,
+                );
+                sum_hit_rate[ki] += metrics::hit_rate_at_k(&recommended, relevant_items, k);
+            }
+            all_recs.push(recommended);
+            num_users_evaluated += 1;
+            total_test_interactions += relevant_items.len();
+        }
+
+        let n = num_users_evaluated as f64;
+        let metrics_at_k: Vec<MetricsAtK> = config
+            .k_values
+            .iter()
+            .enumerate()
+            .map(|(ki, &k)| MetricsAtK {
+                k,
+                precision: sum_precision[ki] / n,
+                recall: sum_recall[ki] / n,
+                ndcg: sum_ndcg[ki] / n,
+                map: sum_map[ki] / n,
+                hit_rate: sum_hit_rate[ki] / n,
+            })
+            .collect();
+        Ok(EvalReport {
+            metrics_at_k,
+            coverage: metrics::coverage(&all_recs, model.num_items),
+            num_users: num_users_evaluated,
+            num_interactions: total_test_interactions,
+        })
+    }
+
+    #[test]
+    fn test_evaluate_via_dyn_recmodel_matches_concrete_baseline() -> Result<()> {
+        let dir = TempDir::new()?;
+        let train_path = dir.path().join("train.parquet");
+        let test_path = dir.path().join("test.parquet");
+
+        let mut train_df = df!(
+            "user_id" => ["u1", "u1", "u2", "u3", "u3"],
+            "item_id" => ["i1", "i2", "i1", "i3", "i4"],
+            "value" =>   [1.0_f64, 1.0, 1.0, 1.0, 1.0],
+        )?;
+        let mut test_df = df!(
+            "user_id" => ["u1", "u2", "u2", "u3"],
+            "item_id" => ["i3", "i2", "i4", "i5"],
+            "value" =>   [1.0_f64, 1.0, 1.0, 1.0],
+        )?;
+        create_test_parquet(&mut train_df, train_path.to_str().unwrap())?;
+        create_test_parquet(&mut test_df, test_path.to_str().unwrap())?;
+
+        let config = EvalConfig {
+            k_values: vec![1, 2, 3],
+        };
+
+        let model = regression_model();
+        let baseline = baseline_concrete_report(
+            &model,
+            test_path.to_str().unwrap(),
+            train_path.to_str().unwrap(),
+            &config,
+        )?;
+
+        // Generalized path: evaluate through `&dyn RecModel` (EaseAdapter).
+        let adapter = EaseAdapter::new(model);
+        let via_trait: &dyn RecModel = &adapter;
+        let report = evaluate_model(
+            via_trait,
+            test_path.to_str().unwrap(),
+            train_path.to_str().unwrap(),
+            None,
+            &config,
+        )?;
+
+        assert_eq!(report.num_users, baseline.num_users);
+        assert_eq!(report.num_interactions, baseline.num_interactions);
+        assert!(
+            (report.coverage - baseline.coverage).abs() < 1e-9,
+            "coverage mismatch: trait={} baseline={}",
+            report.coverage,
+            baseline.coverage
+        );
+        assert_eq!(report.metrics_at_k.len(), baseline.metrics_at_k.len());
+        for (t, b) in report.metrics_at_k.iter().zip(baseline.metrics_at_k.iter()) {
+            assert_eq!(t.k, b.k);
+            assert!(
+                (t.precision - b.precision).abs() < 1e-9,
+                "precision@{}",
+                t.k
+            );
+            assert!((t.recall - b.recall).abs() < 1e-9, "recall@{}", t.k);
+            assert!((t.ndcg - b.ndcg).abs() < 1e-9, "ndcg@{}", t.k);
+            assert!((t.map - b.map).abs() < 1e-9, "map@{}", t.k);
+            assert!((t.hit_rate - b.hit_rate).abs() < 1e-9, "hit_rate@{}", t.k);
+        }
 
         Ok(())
     }
