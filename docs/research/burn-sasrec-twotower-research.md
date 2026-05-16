@@ -203,7 +203,7 @@ Same-item-in-batch: if `v_j == v_i` for some `i≠j`, it's a **false negative**
 `item_id_j == item_id_i`. Typically L2-normalize tower outputs and divide
 logits by a temperature `τ`.
 
-## Actionable takeaways
+## Design conclusions
 
 - Target `burn = "0.21"` (nn moved to `burn-nn`, facade re-exports intact).
 - Use built-in `MultiHeadAttention` + `generate_autoregressive_mask`.
