@@ -35,13 +35,16 @@ jobs:
     - name: Run Rust tests
       run: cargo test
 
-    # Compile-only: --features is additive, so a full `cargo test --features
-    # ml-models` would re-run the entire default suite. Until Phase 2b (#25)
-    # adds SASRec tests behind #[cfg(feature = "ml-models")], --no-run gives
-    # the gated-path compile guard without duplicating the 81 default tests.
-    # Phase 2b switches this back to a real run of the gated tests.
-    - name: Build ml-models-gated tests (compile guard)
-      run: cargo test --features ml-models --no-run
+    # The gated SASRec tests now run for real. The `sasrec` filter
+    # restricts execution to those tests, since --features is additive and
+    # an unfiltered run would re-execute the default suite covered above.
+    # NOTE: cargo matches this filter against the full test path, so it
+    # relies on the `models::sasrec` module path (the test fn names do not
+    # contain "sasrec"). If that module is renamed/moved, update this
+    # filter — otherwise it would silently match zero tests and pass
+    # vacuously.
+    - name: Run ml-models-gated tests (SASRec)
+      run: cargo test --features ml-models sasrec
 
     - name: Set up Python
       uses: actions/setup-python@v6
