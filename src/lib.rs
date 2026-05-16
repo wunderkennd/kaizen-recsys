@@ -974,16 +974,23 @@ fn grid_search_py(
     seed: u64,
 ) -> PyResult<Py<PyAny>> {
     let grid = parse_param_grid(param_grid)?;
-    let result = tuning::grid_search(
-        interactions_path,
-        user_features_path,
-        item_features_path,
-        &grid,
-        n_folds,
-        eval_k,
-        seed,
-    )
-    .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+    // Release the GIL: the search is rayon-parallelized pure Rust work that
+    // never touches Python objects, so holding the GIL would needlessly
+    // block other Python threads for the whole (now longer, parallel) run.
+    // Mirrors the `predict_batch` pattern above.
+    let result = py
+        .detach(|| {
+            tuning::grid_search(
+                interactions_path,
+                user_features_path,
+                item_features_path,
+                &grid,
+                n_folds,
+                eval_k,
+                seed,
+            )
+        })
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
 
     search_result_to_py(py, &result)
 }
@@ -1026,17 +1033,21 @@ fn random_search_py(
     seed: u64,
 ) -> PyResult<Py<PyAny>> {
     let grid = parse_param_grid(param_grid)?;
-    let result = tuning::random_search(
-        interactions_path,
-        user_features_path,
-        item_features_path,
-        &grid,
-        n_trials,
-        n_folds,
-        eval_k,
-        seed,
-    )
-    .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+    // Release the GIL during the rayon-parallelized search (see grid_search_py).
+    let result = py
+        .detach(|| {
+            tuning::random_search(
+                interactions_path,
+                user_features_path,
+                item_features_path,
+                &grid,
+                n_trials,
+                n_folds,
+                eval_k,
+                seed,
+            )
+        })
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
 
     search_result_to_py(py, &result)
 }

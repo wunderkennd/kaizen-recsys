@@ -376,52 +376,71 @@ fn run_trials_parallel(
     eval_k: usize,
 ) -> Result<SearchResult> {
     let total = configs.len();
+    let n_folds = fold_paths.len();
 
-    // Evaluate every (params, fold) pair in parallel, keyed by trial_idx.
-    let mut indexed: Vec<(usize, TrialResult)> = configs
+    // Flatten the `(trial, fold)` cartesian product into one flat work list
+    // so the rayon pool sees a single even work product. A nested
+    // `configs.par_iter()` → `fold_paths.par_iter()` would let the outer
+    // parallelism saturate the pool and effectively serialize the inner
+    // fold loop for small fold counts; one flat `par_iter` over the
+    // `total * n_folds` items distributes work evenly.
+    let work: Vec<(usize, usize)> = (0..total)
+        .flat_map(|trial_idx| (0..n_folds).map(move |fold_idx| (trial_idx, fold_idx)))
+        .collect();
+
+    let mut fold_results: Vec<(usize, usize, f64)> = work
         .par_iter()
-        .enumerate()
-        .map(|(trial_idx, params)| -> Result<(usize, TrialResult)> {
-            let fold_scores: Vec<f64> = fold_paths
-                .par_iter()
-                .map(|(train_path, test_path)| {
-                    evaluate_trial(
-                        train_path,
-                        test_path,
-                        user_features_path,
-                        item_features_path,
-                        params,
-                        eval_k,
-                    )
-                })
-                .collect::<Result<Vec<f64>>>()?;
+        .map(|&(trial_idx, fold_idx)| -> Result<(usize, usize, f64)> {
+            let (train_path, test_path) = &fold_paths[fold_idx];
+            let score = evaluate_trial(
+                train_path,
+                test_path,
+                user_features_path,
+                item_features_path,
+                &configs[trial_idx],
+                eval_k,
+            )?;
+            Ok((trial_idx, fold_idx, score))
+        })
+        .collect::<Result<Vec<_>>>()?;
 
+    // Regroup deterministically: sorting by `(trial_idx, fold_idx)` makes
+    // each trial's fold scores independent of parallel completion order, so
+    // `fold_scores[i]` always corresponds to `fold_paths[i]`. Each trial has
+    // exactly `n_folds` consecutive entries, so `chunks(n_folds)` yields the
+    // per-trial groups in ascending `trial_idx` order.
+    fold_results.sort_by_key(|&(trial_idx, fold_idx, _)| (trial_idx, fold_idx));
+
+    let indexed: Vec<(usize, TrialResult)> = fold_results
+        .chunks(n_folds)
+        .enumerate()
+        .map(|(trial_idx, chunk)| {
+            debug_assert!(chunk.iter().all(|&(t, _, _)| t == trial_idx));
+            let fold_scores: Vec<f64> = chunk.iter().map(|&(_, _, s)| s).collect();
             let mean_score = fold_scores.iter().sum::<f64>() / fold_scores.len() as f64;
 
             log::info!(
                 "Trial {}/{}: alpha={}, beta={}, lambda_={} -> NDCG@{}={:.4}",
                 trial_idx + 1,
                 total,
-                params.alpha,
-                params.beta,
-                params.lambda_,
+                configs[trial_idx].alpha,
+                configs[trial_idx].beta,
+                configs[trial_idx].lambda_,
                 eval_k,
                 mean_score
             );
 
-            Ok((
+            (
                 trial_idx,
                 TrialResult {
-                    params: params.clone(),
+                    params: configs[trial_idx].clone(),
                     mean_score,
                     fold_scores,
                 },
-            ))
+            )
         })
-        .collect::<Result<Vec<_>>>()?;
-
-    // Restore deterministic trial order (parallel completion order is not stable).
-    indexed.sort_by_key(|(trial_idx, _)| *trial_idx);
+        .collect();
+    // `indexed` is in ascending `trial_idx` order by construction.
 
     // Pick best deterministically: highest mean_score, ties broken on lowest
     // trial_idx. `indexed` is now sorted ascending by trial_idx, so a strict
