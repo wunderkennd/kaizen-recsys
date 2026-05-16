@@ -101,3 +101,25 @@ jobs:
       with:
         name: linux-wheel
         path: dist/
+
+  fast-blas-link-check:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Check out code
+      uses: actions/checkout@v6
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Cache Rust dependencies
+      uses: Swatinem/rust-cache@v2
+
+    - name: Install system OpenBLAS
+      run: sudo apt-get update && sudo apt-get install -y libopenblas-dev
+
+    - name: Build with fast-blas feature
+      run: cargo build --features fast-blas
+
+    - name: Run Rust tests with fast-blas feature
+      run: cargo test --features fast-blas
