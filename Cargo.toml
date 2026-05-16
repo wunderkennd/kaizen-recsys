@@ -25,4 +25,60 @@ serde_json = "1"
 sprs = "0.11.4"
 tempfile = "3"
 
+# Optional — only pulled in with the `ml-models` feature (ADR-0001 §"Decisions" #6).
+# Pinned to 0.21 per the research findings on issue #24; burn is pre-1.0 and
+# breaks something most minor versions, so bumps are deliberate, not automatic.
+burn = { version = "0.21", optional = true }
+burn-ndarray = { version = "0.21", optional = true }
+
+# Optional — only pulled in with the `fast-blas` feature (ADR-0002 §"Decision"
+# #2, Phase 2). Delegates the dense Gram inversion in `src/model.rs` to a
+# system BLAS/LAPACK. Pinned to 0.27 — the nalgebra-lapack release that
+# depends on `nalgebra ^0.34`, matching our nalgebra 0.34 pin (nalgebra 0.34
+# itself exposes no `blas` feature; LAPACK lives in this sibling crate).
+# `default-features = false` drops its default `lapack-netlib` backend so the
+# concrete backend is selected explicitly per-platform by the target tables
+# below. Absent from the default dependency graph — a standard `cargo build`
+# and the PyPI wheels never see it.
+nalgebra-lapack = { version = "0.27", optional = true, default-features = false }
+
+# Per-platform BLAS/LAPACK backend auto-selection for the `fast-blas` feature.
+# These target tables add a backend feature to the SAME optional
+# `nalgebra-lapack` dep declared above; they only take effect once `fast-blas`
+# (which carries `dep:nalgebra-lapack`) activates that crate, so they stay
+# completely inert in the default build. Net effect: a plain
+# `cargo build --features fast-blas` links Apple Accelerate on macOS (no
+# system install required) and system OpenBLAS everywhere else, with no extra
+# flags.
+[target.'cfg(target_os = "macos")'.dependencies]
+nalgebra-lapack = { version = "0.27", optional = true, default-features = false, features = [
+  "lapack-accelerate",
+] }
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+nalgebra-lapack = { version = "0.27", optional = true, default-features = false, features = [
+  "lapack-openblas",
+] }
+
+[features]
+# Gates the burn-based SASRec / Two-Tower models. Default off so EASE-only
+# users keep the slim dependency tree, build time, and wheel size they have
+# today. Backend is CPU (burn-ndarray); burn-tch / burn-wgpu are a future
+# config flag, not a rewrite (ADR-0001 §"Decisions" #2).
+ml-models = ["dep:burn", "dep:burn-ndarray"]
+
+# Opt-in, DEFAULT OFF (ADR-0002 §"Decision" #2; §"Alternatives B" rejected
+# always-on BLAS over the wheel-bundling cost). Delegates the dense Gram
+# inversion in `src/model.rs` to a system BLAS/LAPACK via nalgebra-lapack.
+# The default build keeps nalgebra's pure-Rust LU; this feature only swaps the
+# inversion backend (same math, BLAS-vs-pure-Rust FP-ordering aside).
+#
+# The concrete LAPACK backend is selected automatically per host by the
+# `[target.*.dependencies]` tables above (Accelerate on macOS, OpenBLAS
+# elsewhere), so a plain `cargo build --features fast-blas` does the right
+# thing on each platform with no extra flags. Users who need a different
+# backend (MKL, Netlib, custom) can depend on `nalgebra-lapack` directly with
+# the matching nalgebra-lapack feature instead.
+fast-blas = ["dep:nalgebra-lapack"]
+
 [dev-dependencies]

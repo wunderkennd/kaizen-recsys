@@ -80,6 +80,58 @@ To build a wheel for distribution:
 bash
 maturin build --release
 ```
+
+### Optional: `fast-blas` backend (opt-in, build-from-source only)
+
+By default FEASE inverts the dense Gram matrix with nalgebra's pure-Rust
+LU. It has **no system dependencies** and is what every published wheel
+uses. For large catalogs (roughly 5K–50K items and up) the inversion
+dominates training wall-clock; the optional `fast-blas` Cargo feature
+delegates that step to a multi-threaded system BLAS/LAPACK, typically
+2–4× faster on the inversion (ADR-0002 §"Decision" #2).
+
+`fast-blas` is **off by default and deliberately not pre-built on
+PyPI**. The standard `pip install` wheels do **not** include BLAS — this
+is intentional (ADR-0002 §"Alternatives B": bundling OpenBLAS into every
+wheel adds 5–50 MB and cross-platform CI cost disproportionate to the
+users who need it). To use it you must **build from source** with the
+feature enabled:
+
+```bash
+# Build the wheel with the BLAS-accelerated inversion
+maturin build --release --features fast-blas
+
+# Or for editable/dev install
+maturin develop --features fast-blas
+```
+
+The model output is unchanged; only the inversion backend differs. BLAS
+implementations differ in floating-point operation ordering, so results
+differ from the pure-Rust path by sub-ulp rounding (ADR-0002 §"Risks").
+Rank order is robust to this; never compare scores bit-exact across
+backends.
+
+**Platform notes — system BLAS requirement:**
+
+| Platform | Backend (auto-selected) | System install needed |
+|----------|-------------------------|-----------------------|
+| **macOS** | Apple Accelerate | **None** — Accelerate ships with the OS. |
+| **Linux** | OpenBLAS | Yes — install OpenBLAS dev libraries, e.g. `apt-get install libopenblas-dev` (Debian/Ubuntu) or `dnf install openblas-devel` (Fedora/RHEL). |
+| **Windows** | OpenBLAS | Yes — install OpenBLAS, e.g. `vcpkg install openblas`, and ensure it is on the linker path. |
+
+The correct backend is selected automatically per host — a plain
+`--features fast-blas` links Accelerate on macOS and OpenBLAS on
+Linux/Windows with no extra flags. If the required system BLAS is
+missing, the failure is a **loud pre-build linker/build-script error**
+(not a silent fallback), so a misconfigured environment fails fast.
+
+> Verified: the no-feature default build and the `fast-blas` feature
+> *wiring* (correct per-platform backend resolution) were verified on
+> Linux. A successful `fast-blas` *link* additionally requires a system
+> OpenBLAS install as noted above. The macOS (Accelerate) and Windows
+> (OpenBLAS) link paths follow the same wiring but were not separately
+> link-verified here.
+
 ### 3. Python Usage Example
 
 Once built, you can import and use the library directly in Python.
