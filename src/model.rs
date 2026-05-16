@@ -196,8 +196,7 @@ impl RustFeaseModel {
             g_reg[(i, i)] += self.lambda_;
         }
 
-        let p = g_reg
-            .try_inverse()
+        let p = invert_gram(g_reg)
             .ok_or_else(|| anyhow!("Failed to invert Gram matrix G. It may be singular."))?;
 
         // ---
@@ -419,6 +418,29 @@ fn sparse_transpose_self_multiply(a: &CsMat<f64>) -> CsMat<f64> {
 fn set_block(mat: &mut DMatrix<f64>, block: &DMatrix<f64>, r_offset: usize, c_offset: usize) {
     mat.view_mut((r_offset, c_offset), (block.nrows(), block.ncols()))
         .copy_from(block);
+}
+
+/// Invert the regularized Gram matrix `(G + λI)`.
+///
+/// Default build: nalgebra's pure-Rust dense LU (`DMatrix::try_inverse`),
+/// single-threaded, no system dependency. With the opt-in `fast-blas` Cargo
+/// feature (ADR-0002 §"Decision" #2) this delegates to a system BLAS/LAPACK
+/// via `nalgebra-lapack`'s LU (OpenBLAS on Linux/Windows, Apple Accelerate on
+/// macOS), which is multi-threaded for large catalogs.
+///
+/// Both paths solve the same linear algebra and return `None` on a singular
+/// matrix. Results differ only by BLAS-vs-pure-Rust floating-point ordering
+/// (ADR-0002 §"Risks"); callers and tests must compare with tolerance, never
+/// bit-exact.
+fn invert_gram(g_reg: DMatrix<f64>) -> Option<DMatrix<f64>> {
+    #[cfg(not(feature = "fast-blas"))]
+    {
+        g_reg.try_inverse()
+    }
+    #[cfg(feature = "fast-blas")]
+    {
+        nalgebra_lapack::LU::new(g_reg).inverse()
+    }
 }
 
 /// Helper function to create a sparse matrix from (row, col, data) triplets.
