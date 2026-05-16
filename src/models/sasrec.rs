@@ -94,18 +94,36 @@ impl<B: Backend> SasRec<B> {
     /// Returns logits `(batch, seq_len, vocab_size)` — position `t`'s
     /// logits depend only on positions `≤ t` thanks to the
     /// autoregressive attention mask.
+    ///
+    /// # Panics
+    ///
+    /// - If `seq_len > max_seq_len`: the learned positional embedding is
+    ///   only defined on `[0, max_seq_len)`. An over-long sequence is a
+    ///   caller error, surfaced explicitly here rather than via a silent
+    ///   clamp or a cryptic shape-mismatch panic. Truncation policy
+    ///   (keep-most-recent) belongs to the Phase 3/4 data path.
+    /// - If any index in `sequence` is `≥ vocab_size`: burn's `Embedding`
+    ///   lookup panics on out-of-range indices, so callers must pass
+    ///   item indices in `[0, vocab_size)`.
     pub fn forward(&self, sequence: Tensor<B, 2, Int>) -> Tensor<B, 3> {
         let [batch_size, seq_len] = sequence.dims();
         let device = sequence.device();
+
+        assert!(
+            seq_len <= self.max_seq_len,
+            "SASRec.forward: seq_len {seq_len} exceeds max_seq_len {} \
+             (positional embedding is only defined on [0, max_seq_len)); \
+             truncate the sequence before calling",
+            self.max_seq_len
+        );
 
         // Item embeddings: (batch, seq_len, d_model).
         let item_embedded = self.item_embedding.forward(sequence);
 
         // Learned positional embeddings for [0, seq_len), broadcast over
-        // the batch. Clamp seq_len defensively against `max_seq_len`.
-        let effective_len = seq_len.min(self.max_seq_len);
-        let positions = Tensor::<B, 1, Int>::arange(0..effective_len as i64, &device)
-            .reshape([1, effective_len]);
+        // the batch. seq_len <= max_seq_len is guaranteed by the assert above.
+        let positions =
+            Tensor::<B, 1, Int>::arange(0..seq_len as i64, &device).reshape([1, seq_len]);
         let positions = positions.repeat_dim(0, batch_size);
         let position_embedded = self.positional_embedding.forward(positions);
 
@@ -173,5 +191,30 @@ mod tests {
             diff < 1e-6,
             "forward pass must be deterministic, max diff = {diff}"
         );
+    }
+
+    #[test]
+    fn forward_shorter_than_max_seq_len() {
+        let device = NdArrayDevice::default();
+        let model: SasRec<TestBackend> = test_config().init(&device);
+
+        let batch = 2;
+        let seq_len = 4; // < max_seq_len = 8
+        let input = Tensor::<TestBackend, 2, Int>::zeros([batch, seq_len], &device);
+
+        let logits = model.forward(input);
+        assert_eq!(logits.dims(), [batch, seq_len, 10]);
+    }
+
+    #[test]
+    #[should_panic(expected = "exceeds max_seq_len")]
+    fn forward_panics_when_seq_len_exceeds_max() {
+        let device = NdArrayDevice::default();
+        let model: SasRec<TestBackend> = test_config().init(&device);
+
+        // seq_len = 12 > max_seq_len = 8: the positional embedding is
+        // undefined past max_seq_len, so this is an explicit caller error.
+        let input = Tensor::<TestBackend, 2, Int>::zeros([2, 12], &device);
+        let _ = model.forward(input);
     }
 }
