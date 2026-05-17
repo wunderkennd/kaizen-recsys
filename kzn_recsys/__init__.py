@@ -26,6 +26,19 @@ from kzn_recsys.fease_wrapper import (
 )
 from kzn_recsys.schemas import EngagementSchema, MetadataSchema
 
+# SASRec is only present when the extension is built with the `ml-models`
+# Cargo feature (default-off; EASE-only wheels omit it and burn).
+try:  # pragma: no cover - import guard, exercised by build matrix
+    from kzn_recsys._native import (  # noqa: F401
+        SASRecModel,
+        build_and_train_sasrec,
+        load_sasrec_model,
+    )
+
+    _HAS_ML_MODELS = True
+except ImportError:
+    _HAS_ML_MODELS = False
+
 __all__ = [
     "FeaseModel",
     "FeaseRegistry",
@@ -50,3 +63,6 @@ __all__ = [
     "EngagementSchema",
     "MetadataSchema",
 ]
+
+if _HAS_ML_MODELS:
+    __all__ += ["SASRecModel", "build_and_train_sasrec", "load_sasrec_model"]
