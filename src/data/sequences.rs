@@ -20,11 +20,9 @@
 //! an error if the `days_ago` column is missing or not numeric. Smaller
 //! `days_ago` == more recent (consistent with `weighting::apply_temporal_decay`).
 
-// Phase 3 builds the sequence data path; its only non-test consumer is
-// the SASRec PyO3 class, which lands in Phase 4 (issue #37). Until then
-// `build_sequences` / `item_to_token` / the `vocab_size` field have no
-// in-crate caller outside tests. Mirrors the same allow + rationale in
-// `models/mod.rs`; it is removed when Phase 4 wires the consumers.
+// `build_sequences`, `item_to_token`, and the `vocab_size` field have no
+// non-test in-crate caller yet; the public surface is dead-code allowed
+// (mirrors the same allow in `data/triples.rs`).
 #![allow(dead_code)]
 
 use anyhow::{Context, Result, bail};
@@ -167,13 +165,10 @@ pub fn build_sequences(
         if hist.len() < 2 {
             continue;
         }
-        // Oldest first: larger `days_ago` == further in the past. Stable
-        // sort keeps ties in their original (file) relative order.
-        hist.sort_by(|a, b| {
-            b.0.partial_cmp(&a.0)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then(std::cmp::Ordering::Equal)
-        });
+        // Oldest first: larger `days_ago` == further in the past.
+        // `sort_by` is stable, so equal-`days_ago` ties keep their
+        // original (file) relative order.
+        hist.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
 
         let items: Vec<i64> = hist.iter().map(|(_, tok)| *tok).collect();
 

@@ -505,6 +505,12 @@ pub fn load_sasrec<B: Backend>(
     let meta: SasRecMeta = bincode::deserialize(&data[pos..pos + meta_len])
         .context("failed to deserialize SASRec metadata")?;
     pos += meta_len;
+    if meta.version != version {
+        bail!(
+            "SASRec metadata version {} disagrees with header version {version}",
+            meta.version
+        );
+    }
 
     need(pos, 8, data.len())?;
     let w_len = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap()) as usize;
