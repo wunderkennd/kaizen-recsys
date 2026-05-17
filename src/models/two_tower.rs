@@ -138,14 +138,21 @@ impl<B: Backend> Tower<B> {
         cat_ids: Tensor<B, 2, Int>,
         cat_mask: Tensor<B, 2>,
         dense: Tensor<B, 2>,
+        id_scale: f64,
     ) -> Tensor<B, 2> {
         let [batch, _] = cat_ids.dims();
         let dim = self.id_embedding.weight.val().dims()[1];
 
+        // `id_scale` is 1.0 for a known id and 0.0 for a cold-start lookup
+        // (no id): scaling the id-embedding term to zero makes the vector
+        // depend only on features instead of borrowing an arbitrary
+        // trained user/item row. A learned cold-start prior is tracked in
+        // issue #45.
         let mut h = self
             .id_embedding
             .forward(ids.reshape([batch, 1]))
-            .reshape([batch, dim]);
+            .reshape([batch, dim])
+            .mul_scalar(id_scale);
 
         if self.has_cat {
             // Mean-pool categorical embeddings over the non-pad slots.
@@ -246,12 +253,14 @@ impl<B: Backend> TwoTower<B> {
             batch.user_cat,
             batch.user_cat_mask,
             batch.user_dense,
+            1.0,
         ); // (B, dim)
         let v = self.item_tower.forward(
             batch.item_ids,
             batch.item_cat,
             batch.item_cat_mask,
             batch.item_dense,
+            1.0,
         ); // (B, dim)
 
         let dim = u.dims()[1];
@@ -636,6 +645,7 @@ fn catalog_matrix(model: &TwoTower<InfB>, meta: &TwoTowerMeta, device: &Dev) -> 
             TensorData::new(dense, [n, meta.item_dense_dim.max(1)]),
             device,
         ),
+        1.0,
     )
 }
 
@@ -761,9 +771,11 @@ impl TrainedTwoTower {
         type B = InfB;
         let dev = &self.device;
 
-        // Cold-start: no id -> use index 0's embedding but rely on
-        // features; the tower sums id + feature contributions, so a
-        // feature-only user still gets a meaningful vector.
+        // Cold-start: with no id, scale the id-embedding contribution to
+        // zero (id_scale = 0.0) so the user vector comes purely from
+        // features — no contamination from any specific trained user row.
+        // A learned cold-start prior is tracked in issue #45.
+        let id_scale = if user_idx.is_some() { 1.0 } else { 0.0 };
         let id = user_idx.unwrap_or(0) as i64;
         let (cat_ids, cat_mask, w) = pad_cat(std::slice::from_ref(&cat_features.to_vec()));
         let d = self.meta.user_dense_dim;
@@ -782,6 +794,7 @@ impl TrainedTwoTower {
             Tensor::<B, 2, Int>::from_data(TensorData::new(cat_ids, [1, w]), dev),
             Tensor::<B, 2>::from_data(TensorData::new(cat_mask, [1, w]), dev),
             Tensor::<B, 2>::from_data(TensorData::new(dense, [1, d.max(1)]), dev),
+            id_scale,
         );
 
         Ok(self.model.score_all(user_vec, self.item_matrix.clone()))
