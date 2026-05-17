@@ -30,7 +30,7 @@ tempfile = "3"
 # breaks something most minor versions, so bumps are deliberate, not automatic.
 # `autodiff` + `train` add the supervised learner / `TrainStep`
 # machinery the SASRec training loop needs; `ndarray`/`std` keep the CPU
-# backend and std support the forward pass already relied on.
+# backend and std support the Two-Tower forward pass also relies on.
 burn = { version = "0.21", optional = true, default-features = false, features = [
     "ndarray",
     "autodiff",
