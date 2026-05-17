@@ -242,6 +242,30 @@ fn build_mapping_from_dfs(
     Ok((unique_strings, idx_to_string))
 }
 
+/// Build user + item string-id mappings from an interactions file alone.
+///
+/// SASRec trains from a single interactions table (no separate
+/// user/item feature files), so it needs a lighter mapping builder than
+/// [`build_matrices`]. Feature mappings are left empty. Item indexing
+/// matches `data::sequences` (catalog idx `0..num_items`; the sequence
+/// token is `idx + 1`).
+#[cfg_attr(not(feature = "ml-models"), allow(dead_code))]
+pub fn build_interaction_mappings(interactions_path: &str) -> Result<Mappings> {
+    let df = read_lazyframe(interactions_path)?.collect()?;
+    let (user_to_idx, idx_to_user) = build_mapping_from_dfs(&[&df], "user_id")?;
+    let (item_to_idx, idx_to_item) = build_mapping_from_dfs(&[&df], "item_id")?;
+    Ok(Mappings {
+        user_to_idx,
+        idx_to_user,
+        item_to_idx,
+        idx_to_item,
+        user_feature_to_idx: AHashMap::new(),
+        idx_to_user_feature: Vec::new(),
+        item_feature_to_idx: AHashMap::new(),
+        idx_to_item_feature: Vec::new(),
+    })
+}
+
 /// Builds a list of (row, col, value) triplets from a DataFrame.
 fn build_triplets(
     df: &DataFrame,

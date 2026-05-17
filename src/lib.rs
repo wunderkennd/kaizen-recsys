@@ -1128,6 +1128,273 @@ fn search_result_to_py(py: Python<'_>, result: &tuning::SearchResult) -> PyResul
     Ok(dict.into())
 }
 
+// --- SASRec PyO3 surface (ml-models feature) -----------------------------
+//
+// Mirrors the `FeaseModel` class (predict / evaluate / save / load) for
+// the burn-based SASRec sequence recommender. Gated on `ml-models` so the
+// default EASE-only build neither pulls burn nor exposes these symbols —
+// the Python package guards the import accordingly.
+
+#[cfg(feature = "ml-models")]
+mod sasrec_py {
+    use super::*;
+    use crate::data::sequences::build_sequences;
+    use crate::models::sasrec::{SasRecConfig, SasRecTrainingConfig, TrainedSasRec, train_sasrec};
+    use crate::models::{ModelInput, RecModel};
+    use burn::backend::ndarray::NdArrayDevice;
+    use burn::backend::{Autodiff, NdArray};
+
+    /// A trained SASRec model, callable from Python.
+    #[pyclass]
+    pub struct SASRecModel {
+        model: TrainedSasRec,
+        #[pyo3(get)]
+        num_items: usize,
+        #[pyo3(get)]
+        max_seq_len: usize,
+    }
+
+    #[pymethods]
+    impl SASRecModel {
+        /// Score recommendations from a chronologically-ordered history.
+        ///
+        /// Args:
+        ///     history (list[str]): Item ids, oldest first. Unknown ids
+        ///         are skipped.
+        ///     top_k (int): Number of recommendations to return.
+        ///
+        /// Returns:
+        ///     list[tuple[str, float]]: (item_id, score), descending,
+        ///     excluding items already in `history`.
+        #[pyo3(signature = (history, top_k=100))]
+        fn predict<'py>(
+            &self,
+            py: Python<'py>,
+            history: &Bound<'_, PyList>,
+            top_k: usize,
+        ) -> PyResult<Bound<'py, PyList>> {
+            let mut hist_idx: Vec<usize> = Vec::with_capacity(history.len());
+            for obj in history.iter() {
+                let id: String = obj.extract()?;
+                if let Some(&idx) = self.model.item_mapping().item_to_idx.get(&id) {
+                    hist_idx.push(idx);
+                }
+            }
+
+            let scores = self
+                .model
+                .predict_scores(ModelInput::Sequence { history: &hist_idx })
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+
+            let seen: HashSet<usize> = hist_idx.iter().copied().collect();
+            let mut ranked: Vec<(usize, f32)> = scores
+                .into_iter()
+                .enumerate()
+                .filter(|(idx, _)| !seen.contains(idx))
+                .collect();
+            ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+            let out = PyList::empty(py);
+            let map = self.model.item_mapping();
+            for (idx, score) in ranked.into_iter().take(top_k) {
+                if let Some(guid) = map.idx_to_item.get(idx) {
+                    out.append((PyString::new(py, guid), PyFloat::new(py, score as f64)))?;
+                }
+            }
+            Ok(out)
+        }
+
+        /// Top-K items most similar to `item_id` by item-embedding cosine.
+        #[pyo3(signature = (item_id, top_k=20))]
+        fn predict_similar_items<'py>(
+            &self,
+            py: Python<'py>,
+            item_id: &str,
+            top_k: usize,
+        ) -> PyResult<Bound<'py, PyList>> {
+            let out = PyList::empty(py);
+            let map = self.model.item_mapping();
+            let Some(&idx) = map.item_to_idx.get(item_id) else {
+                return Ok(out);
+            };
+            let sim = self
+                .model
+                .predict_similar_items(idx, top_k)
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            for (i, score) in sim {
+                if let Some(guid) = map.idx_to_item.get(i) {
+                    out.append((PyString::new(py, guid), PyFloat::new(py, score as f64)))?;
+                }
+            }
+            Ok(out)
+        }
+
+        /// Self-check the model state. Returns `(passed, messages)`.
+        fn validate<'py>(&self, py: Python<'py>) -> PyResult<(bool, Bound<'py, PyList>)> {
+            let report = self.model.validate();
+            Ok((report.passed, PyList::new(py, &report.messages)?))
+        }
+
+        /// Evaluate against test interactions via the generalized
+        /// `&dyn RecModel` harness (same metrics dict as `FeaseModel`).
+        #[pyo3(signature = (test_interactions_path, train_interactions_path, k_values=None))]
+        fn evaluate<'py>(
+            &self,
+            py: Python<'py>,
+            test_interactions_path: &str,
+            train_interactions_path: &str,
+            k_values: Option<Vec<usize>>,
+        ) -> PyResult<Bound<'py, PyDict>> {
+            let config = evaluation::EvalConfig {
+                k_values: k_values.unwrap_or_else(|| vec![5, 10, 20, 50]),
+            };
+            let report = evaluation::evaluate_model(
+                &self.model,
+                test_interactions_path,
+                train_interactions_path,
+                None,
+                &config,
+            )
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+
+            let result = PyDict::new(py);
+            result.set_item("num_users", report.num_users)?;
+            result.set_item("num_interactions", report.num_interactions)?;
+            result.set_item("coverage", report.coverage)?;
+            let metrics_list = PyList::empty(py);
+            for m in &report.metrics_at_k {
+                let d = PyDict::new(py);
+                d.set_item("k", m.k)?;
+                d.set_item("precision", m.precision)?;
+                d.set_item("recall", m.recall)?;
+                d.set_item("ndcg", m.ndcg)?;
+                d.set_item("map", m.map)?;
+                d.set_item("hit_rate", m.hit_rate)?;
+                metrics_list.append(d)?;
+            }
+            result.set_item("metrics", metrics_list)?;
+            Ok(result)
+        }
+
+        /// Persist the model to `path` (framed `FSAT` format).
+        fn save(&self, path: String) -> PyResult<()> {
+            self.model
+                .save(Path::new(&path))
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))
+        }
+    }
+
+    /// Train a SASRec model from a long-format interactions file.
+    ///
+    /// The interactions file must carry a numeric `days_ago` column so
+    /// each user's history can be ordered chronologically (SASRec is
+    /// order-sensitive; the data path fails loudly otherwise).
+    ///
+    /// Args:
+    ///     interactions_path (str): Parquet/CSV with `user_id`,
+    ///         `item_id`, `value`, `days_ago`.
+    ///     embedding_dim, num_heads, num_layers, dropout: architecture.
+    ///     max_seq_len: history length (also the positional-embedding cap).
+    ///     num_epochs, batch_size, learning_rate, patience, seed: training.
+    ///
+    /// Returns:
+    ///     SASRecModel
+    #[pyfunction]
+    #[pyo3(signature = (
+        interactions_path,
+        embedding_dim = 64,
+        max_seq_len = 50,
+        num_heads = 2,
+        num_layers = 2,
+        dropout = 0.2,
+        num_epochs = 50,
+        batch_size = 16,
+        learning_rate = 1e-3,
+        patience = 5,
+        seed = 42
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_and_train_sasrec(
+        interactions_path: String,
+        embedding_dim: usize,
+        max_seq_len: usize,
+        num_heads: usize,
+        num_layers: usize,
+        dropout: f64,
+        num_epochs: usize,
+        batch_size: usize,
+        learning_rate: f64,
+        patience: usize,
+        seed: u64,
+    ) -> PyResult<SASRecModel> {
+        let mappings = data_pipeline::build_interaction_mappings(&interactions_path)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?;
+
+        let dataset = build_sequences(&interactions_path, &mappings, max_seq_len)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?;
+
+        // vocab = catalog items + reserved pad token (see data::sequences).
+        let vocab_size = mappings.idx_to_item.len() + 1;
+        let model_config = SasRecConfig::new(
+            vocab_size,
+            embedding_dim,
+            max_seq_len,
+            num_heads,
+            num_layers,
+        )
+        .with_dropout(dropout);
+        let train_config = SasRecTrainingConfig::new()
+            .with_num_epochs(num_epochs)
+            .with_batch_size(batch_size)
+            .with_learning_rate(learning_rate)
+            .with_patience(patience)
+            .with_seed(seed);
+
+        let device = NdArrayDevice::default();
+        let fitted =
+            train_sasrec::<Autodiff<NdArray<f32>>>(&model_config, &train_config, &dataset, &device)
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+
+        let trained = TrainedSasRec::new(fitted, model_config, mappings);
+        let report = trained.validate();
+        if !report.passed {
+            let msg = format!(
+                "SASRec model validation failed:\n{}",
+                report.messages.join("\n")
+            );
+            return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(msg));
+        }
+        let num_items = RecModel::num_items(&trained);
+        Ok(SASRecModel {
+            model: trained,
+            num_items,
+            max_seq_len,
+        })
+    }
+
+    /// Load a SASRec model previously written by `SASRecModel.save`.
+    #[pyfunction]
+    pub fn load_sasrec_model(path: String) -> PyResult<SASRecModel> {
+        let model = TrainedSasRec::load_from(Path::new(&path))
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
+        let report = model.validate();
+        if !report.passed {
+            let msg = format!(
+                "Loaded SASRec model failed validation:\n{}",
+                report.messages.join("\n")
+            );
+            return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(msg));
+        }
+        let num_items = RecModel::num_items(&model);
+        let max_seq_len = model.config_max_seq_len();
+        Ok(SASRecModel {
+            model,
+            num_items,
+            max_seq_len,
+        })
+    }
+}
+
 /// Defines the Python module.
 /// This function is called when Python runs `import kzn_recsys._native`.
 #[pymodule]
@@ -1148,5 +1415,13 @@ fn _native(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(random_search_py, m)?)?;
     m.add_class::<FeaseModel>()?;
     m.add_class::<FeaseRegistry>()?;
+
+    #[cfg(feature = "ml-models")]
+    {
+        m.add_function(wrap_pyfunction!(sasrec_py::build_and_train_sasrec, m)?)?;
+        m.add_function(wrap_pyfunction!(sasrec_py::load_sasrec_model, m)?)?;
+        m.add_class::<sasrec_py::SASRecModel>()?;
+    }
+
     Ok(())
 }

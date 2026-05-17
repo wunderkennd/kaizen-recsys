@@ -28,6 +28,9 @@ pub mod two_tower;
 
 pub use ease::{EaseAdapter, EaseAdapterRef};
 
+#[cfg(feature = "ml-models")]
+pub use sasrec::TrainedSasRec;
+
 /// What kind of model this is. Used by callers that need to construct
 /// model-appropriate input shapes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
