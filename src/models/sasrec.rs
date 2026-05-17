@@ -528,6 +528,318 @@ pub fn load_sasrec<B: Backend>(
     Ok((model, config))
 }
 
+// --- Trained, ready-to-serve wrapper -------------------------------------
+//
+// The bare `SasRec<B>` module knows item *tokens* (catalog idx + 1) but
+// not item *strings*; the `RecModel` trait and the eval harness work in
+// terms of `Mappings`. `TrainedSasRec` is the `Mappings`-bearing wrapper
+// (analogous to `TrainedTwoTower`) that closes that gap: it owns the
+// fitted inference-backend model, its architecture config, and the
+// string-id mappings, and implements `RecModel` so SASRec flows through
+// the generalized `evaluation::evaluate_model` path unchanged.
+
+use crate::data_pipeline::Mappings;
+use crate::model::ValidationReport;
+use crate::models::{ModelInput, ModelKind, RecModel};
+use burn::backend::NdArray;
+use burn::backend::ndarray::NdArrayDevice;
+
+/// CPU inference backend for a served SASRec model.
+type SasInfB = NdArray<f32>;
+
+/// `TrainedSasRec` file magic. Distinct from EASE's `FEAS`, the bare
+/// SASRec `FSAS`, and Two-Tower's `FTWO` so a loader can auto-detect the
+/// model type from the header.
+pub const TRAINED_SASREC_MAGIC: &[u8; 4] = b"FSAT";
+
+/// Bincode header for a [`TrainedSasRec`] file: the architecture config
+/// plus the string-id mappings needed to translate scores back to
+/// catalog ids.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct TrainedSasRecMeta {
+    version: u32,
+    vocab_size: usize,
+    embedding_dim: usize,
+    max_seq_len: usize,
+    num_heads: usize,
+    num_layers: usize,
+    dropout: f64,
+    idx_to_item: Vec<String>,
+    idx_to_user: Vec<String>,
+}
+
+/// A trained SASRec model on the CPU `NdArray` backend, carrying the
+/// catalog mappings so it satisfies [`RecModel`].
+pub struct TrainedSasRec {
+    model: SasRec<SasInfB>,
+    config: SasRecConfig,
+    mappings: Mappings,
+    device: NdArrayDevice,
+}
+
+impl TrainedSasRec {
+    /// Wrap a fitted model + config + mappings.
+    pub fn new(model: SasRec<SasInfB>, config: SasRecConfig, mappings: Mappings) -> Self {
+        Self {
+            model,
+            config,
+            mappings,
+            device: NdArrayDevice::default(),
+        }
+    }
+
+    /// Number of catalog items. Token `0` is the reserved pad slot, so
+    /// `num_items == vocab_size - 1` (see `data::sequences`).
+    pub fn num_items(&self) -> usize {
+        self.config.vocab_size.saturating_sub(1)
+    }
+
+    /// The model's fixed history / positional-embedding length.
+    pub fn config_max_seq_len(&self) -> usize {
+        self.config.max_seq_len
+    }
+
+    /// Score every catalog item for a chronologically-ordered history of
+    /// catalog item indices (oldest first). Item index `i` maps to token
+    /// `i + 1`; the returned vector has length `num_items` with the pad
+    /// slot (token 0) dropped so positions align with catalog indices.
+    fn score_items(&self, history_idx: &[usize]) -> Vec<f32> {
+        let tokens: Vec<usize> = history_idx
+            .iter()
+            .filter(|&&i| i < self.num_items())
+            .map(|&i| i + 1)
+            .collect();
+        let logits = self.model.score_history(&tokens, &self.device);
+        // Drop the pad slot (token 0); the remaining vocab positions are
+        // catalog items 0..num_items in order.
+        logits.into_iter().skip(1).collect()
+    }
+
+    /// Serialize to the framed `FSAT || version || meta_len || bincode(meta)
+    /// || w_len || burn-recorded params` format (mirrors `serialization.rs`
+    /// and `save_sasrec`, but embeds the mappings).
+    pub fn save_to(&self, path: &Path) -> anyhow::Result<()> {
+        let recorder = BinBytesRecorder::<FullPrecisionSettings>::default();
+        let weights: Vec<u8> = recorder
+            .record(self.model.clone().into_record(), ())
+            .context("failed to record TrainedSasRec params")?;
+
+        let meta = TrainedSasRecMeta {
+            version: SASREC_FORMAT_VERSION,
+            vocab_size: self.config.vocab_size,
+            embedding_dim: self.config.embedding_dim,
+            max_seq_len: self.config.max_seq_len,
+            num_heads: self.config.num_heads,
+            num_layers: self.config.num_layers,
+            dropout: self.config.dropout,
+            idx_to_item: self.mappings.idx_to_item.clone(),
+            idx_to_user: self.mappings.idx_to_user.clone(),
+        };
+        let meta_bytes =
+            bincode::serialize(&meta).context("failed to serialize TrainedSasRec metadata")?;
+
+        let mut out = Vec::with_capacity(4 + 4 + 8 + meta_bytes.len() + 8 + weights.len());
+        out.write_all(TRAINED_SASREC_MAGIC)?;
+        out.write_all(&SASREC_FORMAT_VERSION.to_le_bytes())?;
+        out.write_all(&(meta_bytes.len() as u64).to_le_bytes())?;
+        out.write_all(&meta_bytes)?;
+        out.write_all(&(weights.len() as u64).to_le_bytes())?;
+        out.write_all(&weights)?;
+
+        std::fs::write(path, &out)
+            .with_context(|| format!("failed to write TrainedSasRec to {}", path.display()))?;
+        Ok(())
+    }
+
+    /// Load a model written by [`TrainedSasRec::save_to`].
+    pub fn load_from(path: &Path) -> anyhow::Result<Self> {
+        let data = std::fs::read(path)
+            .with_context(|| format!("failed to read TrainedSasRec from {}", path.display()))?;
+
+        let take = |lo: usize, len: usize| -> anyhow::Result<&[u8]> {
+            let hi = lo
+                .checked_add(len)
+                .filter(|&h| h <= data.len())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "truncated or corrupt TrainedSasRec file: {}",
+                        path.display()
+                    )
+                })?;
+            Ok(&data[lo..hi])
+        };
+
+        if take(0, 4)? != TRAINED_SASREC_MAGIC {
+            bail!(
+                "invalid magic bytes in {}; expected FSAT header",
+                path.display()
+            );
+        }
+        let version = u32::from_le_bytes(take(4, 4)?.try_into().unwrap());
+        if version != SASREC_FORMAT_VERSION {
+            bail!(
+                "unsupported TrainedSasRec format version {version} (expected {SASREC_FORMAT_VERSION})"
+            );
+        }
+        let mut off = 8usize;
+        let meta_len = u64::from_le_bytes(take(off, 8)?.try_into().unwrap()) as usize;
+        off += 8;
+        let meta: TrainedSasRecMeta =
+            bincode::deserialize(take(off, meta_len)?).context("deserialize TrainedSasRecMeta")?;
+        off += meta_len;
+        let w_len = u64::from_le_bytes(take(off, 8)?.try_into().unwrap()) as usize;
+        off += 8;
+        let weights = take(off, w_len)?.to_vec();
+
+        let device = NdArrayDevice::default();
+        let config = SasRecConfig::new(
+            meta.vocab_size,
+            meta.embedding_dim,
+            meta.max_seq_len,
+            meta.num_heads,
+            meta.num_layers,
+        )
+        .with_dropout(meta.dropout);
+
+        let recorder = BinBytesRecorder::<FullPrecisionSettings>::default();
+        let record = recorder
+            .load(weights, &device)
+            .context("failed to load TrainedSasRec params blob")?;
+        let model: SasRec<SasInfB> = config.init(&device).load_record(record);
+
+        let mappings = Mappings {
+            user_to_idx: meta
+                .idx_to_user
+                .iter()
+                .enumerate()
+                .map(|(i, s)| (s.clone(), i))
+                .collect(),
+            idx_to_user: meta.idx_to_user.clone(),
+            item_to_idx: meta
+                .idx_to_item
+                .iter()
+                .enumerate()
+                .map(|(i, s)| (s.clone(), i))
+                .collect(),
+            idx_to_item: meta.idx_to_item.clone(),
+            user_feature_to_idx: ahash::AHashMap::new(),
+            idx_to_user_feature: Vec::new(),
+            item_feature_to_idx: ahash::AHashMap::new(),
+            idx_to_item_feature: Vec::new(),
+        };
+
+        Ok(Self {
+            model,
+            config,
+            mappings,
+            device,
+        })
+    }
+}
+
+impl RecModel for TrainedSasRec {
+    fn kind(&self) -> ModelKind {
+        ModelKind::SasRec
+    }
+
+    fn num_items(&self) -> usize {
+        TrainedSasRec::num_items(self)
+    }
+
+    fn item_mapping(&self) -> &Mappings {
+        &self.mappings
+    }
+
+    fn predict_scores(&self, input: ModelInput<'_>) -> anyhow::Result<Vec<f32>> {
+        match input {
+            ModelInput::Sequence { history } => Ok(self.score_items(history)),
+            // The generalized eval harness only passes `Sparse`. SASRec is
+            // order-sensitive, but the harness's per-user train slice has
+            // no chronology attached, so the interaction item indices are
+            // taken as the user's history in iteration order. This is the
+            // documented behavior that lets SASRec run end-to-end through
+            // `evaluate_model` (the model still scores from real attention
+            // over those items).
+            ModelInput::Sparse { interactions, .. } => {
+                let history: Vec<usize> = interactions.iter().map(|(idx, _)| *idx).collect();
+                Ok(self.score_items(&history))
+            }
+            ModelInput::TowerUser { .. } => Err(anyhow::anyhow!(
+                "SASRec does not support ModelInput::TowerUser; expected Sequence or Sparse"
+            )),
+        }
+    }
+
+    fn predict_similar_items(
+        &self,
+        item_idx: usize,
+        top_k: usize,
+    ) -> anyhow::Result<Vec<(usize, f32)>> {
+        let n = self.num_items();
+        if item_idx >= n {
+            return Err(anyhow::anyhow!(
+                "item_idx {item_idx} out of range (num_items = {n})"
+            ));
+        }
+        // Cosine similarity over the learned item-embedding rows. Token
+        // `idx + 1` is the embedding for catalog item `idx` (token 0 = pad).
+        let weight = self.model.item_embedding.weight.val(); // (vocab, dim)
+        let dim = weight.dims()[1];
+        let norm = weight
+            .clone()
+            .powf_scalar(2.0)
+            .sum_dim(1)
+            .sqrt()
+            .clamp_min(1e-12);
+        let normed = weight / norm; // (vocab, dim), row-normalized
+        let q_tok = item_idx + 1;
+        let q = normed.clone().slice([q_tok..q_tok + 1, 0..dim]);
+        let sims: Vec<f32> = (normed * q.reshape([1, dim]))
+            .sum_dim(1)
+            .reshape([self.config.vocab_size])
+            .into_data()
+            .convert::<f32>()
+            .into_vec()
+            .expect("similarity tensor -> Vec<f32>");
+        let mut ranked: Vec<(usize, f32)> = sims
+            .into_iter()
+            .enumerate()
+            // Skip the pad slot (token 0) and the query item itself.
+            .filter(|(tok, _)| *tok != 0 && *tok != q_tok)
+            .map(|(tok, s)| (tok - 1, s))
+            .collect();
+        ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        ranked.truncate(top_k);
+        Ok(ranked)
+    }
+
+    fn validate(&self) -> ValidationReport {
+        let mut messages = Vec::new();
+        let mut passed = true;
+        if self.num_items() == 0 {
+            passed = false;
+            messages.push("SASRec model has zero catalog items".to_string());
+        }
+        if self.config.max_seq_len == 0 {
+            passed = false;
+            messages.push("SASRec model has max_seq_len == 0".to_string());
+        }
+        if self.mappings.idx_to_item.len() != self.num_items() {
+            passed = false;
+            messages.push(format!(
+                "mappings have {} items but vocab implies {}",
+                self.mappings.idx_to_item.len(),
+                self.num_items()
+            ));
+        }
+        ValidationReport { passed, messages }
+    }
+
+    fn save(&self, path: &Path) -> anyhow::Result<()> {
+        self.save_to(path)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -730,5 +1042,169 @@ mod tests {
         let r = load_sasrec::<TestBackend>(&path, &device);
         assert!(r.is_err());
         assert!(r.unwrap_err().to_string().contains("magic"));
+    }
+
+    // --- TrainedSasRec wrapper + RecModel ---
+
+    use crate::data_pipeline::Mappings;
+    use crate::models::{ModelInput, ModelKind, RecModel};
+
+    /// Mappings for a 4-item catalog (`a,b,c,d` -> idx 0..4). The
+    /// `tiny_dataset` tokens are `idx + 1`, so item idx 3 == token 4.
+    fn tiny_mappings() -> Mappings {
+        let items = ["a", "b", "c", "d"];
+        let users = ["u0"];
+        Mappings {
+            user_to_idx: users
+                .iter()
+                .enumerate()
+                .map(|(i, s)| (s.to_string(), i))
+                .collect(),
+            idx_to_user: users.iter().map(|s| s.to_string()).collect(),
+            item_to_idx: items
+                .iter()
+                .enumerate()
+                .map(|(i, s)| (s.to_string(), i))
+                .collect(),
+            idx_to_item: items.iter().map(|s| s.to_string()).collect(),
+            user_feature_to_idx: Default::default(),
+            idx_to_user_feature: Default::default(),
+            item_feature_to_idx: Default::default(),
+            idx_to_item_feature: Default::default(),
+        }
+    }
+
+    fn trained_tiny() -> TrainedSasRec {
+        let device = NdArrayDevice::default();
+        let ds = tiny_dataset();
+        let mcfg = tiny_model_config();
+        // These wrapper tests assert structural / determinism / roundtrip
+        // properties, not overfit convergence, so a short run suffices.
+        let tcfg = SasRecTrainingConfig::new()
+            .with_num_epochs(10)
+            .with_batch_size(8)
+            .with_learning_rate(1e-2)
+            .with_patience(10);
+        let model = train_sasrec::<TrainBackend>(&mcfg, &tcfg, &ds, &device)
+            .expect("training must succeed");
+        TrainedSasRec::new(model, mcfg, tiny_mappings())
+    }
+
+    #[test]
+    fn recmodel_kind_and_num_items() {
+        let t = trained_tiny();
+        assert_eq!(t.kind(), ModelKind::SasRec);
+        // vocab 5 (tokens 0..=4) -> 4 catalog items.
+        assert_eq!(RecModel::num_items(&t), 4);
+        assert_eq!(t.item_mapping().idx_to_item.len(), 4);
+    }
+
+    #[test]
+    fn recmodel_sequence_input_scores_catalog_items() {
+        let t = trained_tiny();
+        // History items a,b,c (catalog idx 0,1,2). The returned vector has
+        // length `num_items` with the pad slot (token 0) dropped, so its
+        // positions align 1:1 with catalog item indices, and the scores
+        // are finite and deterministic across calls.
+        let scores = t
+            .predict_scores(ModelInput::Sequence {
+                history: &[0, 1, 2],
+            })
+            .expect("Sequence input must be supported");
+        assert_eq!(scores.len(), 4, "scores must align with num_items");
+        assert!(
+            scores.iter().all(|s| s.is_finite()),
+            "scores must be finite: {scores:?}"
+        );
+        let again = t
+            .predict_scores(ModelInput::Sequence {
+                history: &[0, 1, 2],
+            })
+            .unwrap();
+        assert_eq!(scores, again, "scoring must be deterministic");
+    }
+
+    #[test]
+    fn recmodel_sparse_input_supported_for_eval_harness() {
+        let t = trained_tiny();
+        // The eval harness only passes `Sparse`; SASRec treats the
+        // interaction item indices as the history.
+        let inter = [(0usize, 1.0f64), (1, 1.0), (2, 1.0)];
+        let scores = t
+            .predict_scores(ModelInput::Sparse {
+                interactions: &inter,
+                user_features: &[],
+            })
+            .expect("Sparse input must be supported");
+        assert_eq!(scores.len(), 4);
+    }
+
+    #[test]
+    fn recmodel_rejects_tower_input() {
+        let t = trained_tiny();
+        let r = t.predict_scores(ModelInput::TowerUser {
+            user_idx: None,
+            cat_features: &[],
+            dense_features: &[],
+        });
+        assert!(r.is_err(), "SASRec must reject TowerUser input");
+    }
+
+    #[test]
+    fn recmodel_similar_items_excludes_query_and_respects_k() {
+        let t = trained_tiny();
+        let sim = t.predict_similar_items(0, 2).expect("similar");
+        assert!(sim.len() <= 2);
+        assert!(sim.iter().all(|(i, _)| *i != 0));
+        assert!(sim.iter().all(|(i, _)| *i < 4));
+    }
+
+    #[test]
+    fn trained_save_load_roundtrip_identical_scores() {
+        let t = trained_tiny();
+        let before = t
+            .predict_scores(ModelInput::Sequence {
+                history: &[0, 1, 2],
+            })
+            .unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trained.fsat");
+        t.save_to(&path).expect("save");
+        let loaded = TrainedSasRec::load_from(&path).expect("load");
+        assert_eq!(loaded.item_mapping().idx_to_item, vec!["a", "b", "c", "d"]);
+
+        let after = loaded
+            .predict_scores(ModelInput::Sequence {
+                history: &[0, 1, 2],
+            })
+            .unwrap();
+        assert_eq!(before.len(), after.len());
+        for (i, (x, y)) in before.iter().zip(after.iter()).enumerate() {
+            assert!(
+                (x - y).abs() < 1e-5,
+                "score drift at {i} after roundtrip: {x} vs {y}"
+            );
+        }
+    }
+
+    #[test]
+    fn trained_load_rejects_bad_magic() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad.fsat");
+        std::fs::write(&path, b"NOPEnot-a-trained-sasrec").unwrap();
+        let r = TrainedSasRec::load_from(&path);
+        let msg = match r {
+            Ok(_) => panic!("expected load to reject bad magic"),
+            Err(e) => e.to_string(),
+        };
+        assert!(msg.contains("magic"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn trained_validate_passes_for_consistent_model() {
+        let t = trained_tiny();
+        let report = t.validate();
+        assert!(report.passed, "validation messages: {:?}", report.messages);
     }
 }
