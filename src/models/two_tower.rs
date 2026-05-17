@@ -813,6 +813,12 @@ impl TrainedTwoTower {
                 .idx_to_user
                 .iter()
                 .enumerate()
+                // Mirror the train-path invariant (see `load_triples`):
+                // index 0 is the reserved cold-start sentinel and is
+                // deliberately absent from `user_to_idx`, so a loaded
+                // model's mappings match a freshly-trained one and no real
+                // id can resolve to the prior row.
+                .filter(|(i, _)| *i != crate::data::triples::COLD_START_USER_IDX)
                 .map(|(i, s)| (s.clone(), i))
                 .collect(),
             idx_to_user: meta.idx_to_user.clone(),
