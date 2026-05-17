@@ -19,11 +19,9 @@
 //! Everything here is `ml-models`-gated; EASE-only builds never see it.
 
 // The loaders and `FeatureTable` accessors are exercised by this module's
-// tests and by `models::two_tower`, but the Python-facing entrypoint that
-// calls `load_triples`/`load_features` from non-test code is a later
-// phase (issue #38 explicitly defers the PyO3 class). This allow keeps
-// the Phase-5 build warning-clean until that consumer lands; it gets
-// removed when it does — same pattern as `models/mod.rs`.
+// tests and by `models::two_tower`; no non-test in-crate caller invokes
+// them directly, so the public surface is dead-code allowed (mirrors the
+// same allow in `models/mod.rs`).
 #![allow(dead_code)]
 
 use ahash::AHashMap;
@@ -312,7 +310,7 @@ mod tests {
         );
         let data = load_triples(&path).unwrap();
 
-        // 2 users, 3 distinct items SEEN on positive rows (i3 row dropped).
+        // 2 users, 2 distinct items SEEN on positive rows (i3 row dropped).
         assert_eq!(data.num_users(), 2);
         assert_eq!(data.num_items(), 2);
         // 3 positive triples (the value=0.0 row is filtered out).

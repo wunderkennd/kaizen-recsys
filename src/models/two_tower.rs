@@ -1,7 +1,7 @@
 //! Two-Tower — separate user / item embedding networks with categorical
 //! and dense numerical features, trained by in-batch sampled softmax.
 //!
-//! ADR-0001 Phase 5 (issue #38). Replaces the Phase 2a stub.
+//! ADR-0001 (issue #38).
 //!
 //! Architecture (Yi et al., RecSys 2019, "Sampling-Bias-Corrected Neural
 //! Modeling for Large Corpus Item Recommendations"):
@@ -679,15 +679,30 @@ impl TrainedTwoTower {
                 "unsupported Two-Tower format version {version} (expected {FORMAT_VERSION})"
             );
         }
-        let mut off = 8;
-        let meta_len = u64::from_le_bytes(data[off..off + 8].try_into().unwrap()) as usize;
+        // Bounds-checked framed read: a truncated or corrupt file (any
+        // length, including a u64 length prefix that overflows the buffer)
+        // returns Err instead of panicking on an out-of-range slice.
+        let take = |lo: usize, len: usize| -> Result<&[u8]> {
+            let hi = lo
+                .checked_add(len)
+                .filter(|&h| h <= data.len())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "truncated or corrupt Two-Tower model file: {}",
+                        path.display()
+                    )
+                })?;
+            Ok(&data[lo..hi])
+        };
+        let mut off = 8usize;
+        let meta_len = u64::from_le_bytes(take(off, 8)?.try_into().unwrap()) as usize;
         off += 8;
         let meta: TwoTowerMeta =
-            bincode::deserialize(&data[off..off + meta_len]).context("deserialize TwoTowerMeta")?;
+            bincode::deserialize(take(off, meta_len)?).context("deserialize TwoTowerMeta")?;
         off += meta_len;
-        let w_len = u64::from_le_bytes(data[off..off + 8].try_into().unwrap()) as usize;
+        let w_len = u64::from_le_bytes(take(off, 8)?.try_into().unwrap()) as usize;
         off += 8;
-        let weights = data[off..off + w_len].to_vec();
+        let weights = take(off, w_len)?.to_vec();
 
         let device = Dev::default();
         let cfg = TwoTowerConfig::new(
