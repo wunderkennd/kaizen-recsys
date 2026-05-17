@@ -58,11 +58,7 @@ pub struct SequenceDataset {
 impl SequenceDataset {
     /// Number of sequences (one per user with >= 2 interactions).
     pub fn len(&self) -> usize {
-        if self.seq_len == 0 {
-            0
-        } else {
-            self.inputs.len() / self.seq_len
-        }
+        self.inputs.len().checked_div(self.seq_len).unwrap_or(0)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -141,11 +137,7 @@ pub fn build_sequences(
 
     // Group (item_token, days_ago) per user, preserving catalog mapping.
     let mut per_user: ahash::AHashMap<&str, Vec<(f64, i64)>> = ahash::AHashMap::new();
-    for ((u, it), d) in user_col
-        .into_iter()
-        .zip(item_col.into_iter())
-        .zip(days_col.into_iter())
-    {
+    for ((u, it), d) in user_col.into_iter().zip(item_col).zip(days_col) {
         let (Some(u), Some(it), Some(d)) = (u, it, d) else {
             continue;
         };
