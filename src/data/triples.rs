@@ -30,9 +30,24 @@ use polars::prelude::*;
 use std::fs::File;
 use std::path::Path;
 
+/// The reserved user embedding row. Index `0` of the user tower's id
+/// table is a dedicated, *learnable* cold-start prior — it is not a real
+/// user. Real users are interned at indices `1..=N` (see [`load_triples`]).
+/// The model trains this row via id-dropout so a feature-less user gets a
+/// learned average-user prior instead of a hard zero.
+pub const COLD_START_USER_IDX: usize = 0;
+
+/// Sentinel id-string occupying [`COLD_START_USER_IDX`] in
+/// [`TripleData::idx_to_user`]. Never collides with a real id: real ids
+/// are interned only via [`intern`], which assigns indices `>= 1`.
+pub const COLD_START_USER_ID: &str = "<COLD_START>";
+
 /// A single positive training example: user `u` interacted with item `i`.
-/// Indices are into the dense user / item embedding tables (0-based,
-/// contiguous), assigned in first-seen order while reading interactions.
+/// `item_idx` is a 0-based contiguous index into the item embedding table.
+/// `user_idx` is an index into the user embedding table where row
+/// [`COLD_START_USER_IDX`] (= 0) is the reserved cold-start prior and real
+/// users occupy `1..=N`; both are assigned in first-seen order while
+/// reading interactions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Triple {
     pub user_idx: usize,
@@ -41,6 +56,12 @@ pub struct Triple {
 
 /// The full set of training triples plus the id↔index mappings needed to
 /// translate Python-side string ids and to size the embedding tables.
+///
+/// `idx_to_user[0]` is always [`COLD_START_USER_ID`] (the reserved
+/// cold-start prior, not a real user); real users live at `1..=N`.
+/// `user_to_idx` maps only real ids and therefore only ever yields
+/// indices `>= 1`. The item side has no reserved row (see [`load_triples`]
+/// for the rationale).
 #[derive(Debug, Clone)]
 pub struct TripleData {
     pub triples: Vec<Triple>,
@@ -51,6 +72,7 @@ pub struct TripleData {
 }
 
 impl TripleData {
+    /// User embedding table size = reserved cold-start row + real users.
     pub fn num_users(&self) -> usize {
         self.idx_to_user.len()
     }
@@ -155,6 +177,14 @@ fn intern(map: &mut AHashMap<String, usize>, vec: &mut Vec<String>, key: &str) -
 /// treated as a non-positive and dropped — Two-Tower's in-batch softmax
 /// only consumes positives. Indices are assigned in first-seen order to
 /// keep runs deterministic given a deterministic file.
+///
+/// User index `0` is reserved as the learnable cold-start prior
+/// ([`COLD_START_USER_IDX`]); the first real user interns at index `1`.
+/// The item side has **no** reserved row: there is no cold-start-item
+/// query path (`predict_similar_items` takes a known item index and
+/// scoring is always against the known catalog), so a reserved item row
+/// would never be trained or exercised. Keeping the item index space
+/// 0-based contiguous avoids needless complexity.
 pub fn load_triples(interactions_path: &str) -> Result<TripleData> {
     let df = read_dataframe(interactions_path)?;
     let users = str_column(&df, "user_id")?;
@@ -170,7 +200,10 @@ pub fn load_triples(interactions_path: &str) -> Result<TripleData> {
     }
 
     let mut user_to_idx = AHashMap::new();
-    let mut idx_to_user = Vec::new();
+    // Seed the reserved cold-start prior at index 0; real users follow at
+    // 1.. via `intern`. `user_to_idx` deliberately omits the sentinel so
+    // no real id can ever resolve to the cold-start row.
+    let mut idx_to_user = vec![COLD_START_USER_ID.to_string()];
     let mut item_to_idx = AHashMap::new();
     let mut idx_to_item = Vec::new();
     let mut triples = Vec::with_capacity(users.len());
@@ -310,14 +343,22 @@ mod tests {
         );
         let data = load_triples(&path).unwrap();
 
-        // 2 users, 2 distinct items SEEN on positive rows (i3 row dropped).
-        assert_eq!(data.num_users(), 2);
+        // 2 real users + 1 reserved cold-start row; 2 distinct items SEEN
+        // on positive rows (i3 row dropped, no reserved item row).
+        assert_eq!(data.num_users(), 3);
         assert_eq!(data.num_items(), 2);
         // 3 positive triples (the value=0.0 row is filtered out).
         assert_eq!(data.triples.len(), 3);
-        assert_eq!(data.user_to_idx["u1"], 0);
+        // Index 0 is the reserved cold-start prior; real users start at 1.
+        assert_eq!(data.idx_to_user[COLD_START_USER_IDX], COLD_START_USER_ID);
+        assert_eq!(data.user_to_idx["u1"], 1);
+        assert_eq!(data.user_to_idx["u2"], 2);
+        assert!(!data.user_to_idx.contains_key(COLD_START_USER_ID));
+        // Items keep a 0-based contiguous space (no reserved row).
         assert_eq!(data.item_to_idx["i1"], 0);
         assert_eq!(data.item_to_idx["i2"], 1);
+        // Triples reference the shifted user space.
+        assert!(data.triples.iter().all(|t| t.user_idx >= 1));
         std::fs::remove_file(&path).ok();
     }
 
