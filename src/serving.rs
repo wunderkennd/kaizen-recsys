@@ -73,8 +73,8 @@ impl FeaseModelRegistry {
     /// territory via the [`RecModel`] trait object.
     ///
     /// The EASE PyO3 surface registers via [`Self::register`]; this
-    /// trait-object entry point is the seam SASRec/Two-Tower territory
-    /// registration uses once their models are wired (#21).
+    /// trait-object entry point is the seam any `RecModel` (EASE, SASRec,
+    /// Two-Tower) is registered through for territory routing.
     #[allow(dead_code)]
     pub fn register_model(&mut self, territory: String, model: Box<dyn RecModel>) {
         log::info!(

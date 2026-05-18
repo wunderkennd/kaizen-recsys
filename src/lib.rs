@@ -1058,14 +1058,15 @@ fn random_search_py(
 // ---------------------------------------------------------------------------
 //
 // The search machinery (`tuning::grid_search_with` / `random_search_with`)
-// is generic over `tuning::FoldEvaluator`, so each model family gets its
-// own PyO3 entrypoint. EASE is wired end-to-end. SASRec and Two-Tower
-// expose entrypoints with the same signature and result shape; they
-// return a clear runtime error pointing at the `FoldEvaluator` seam,
-// because their search spaces are architecture-specific (embedding dim,
-// depth, learning rate) rather than the EASE-shaped `ParamGrid` — a
-// SASRec/Two-Tower-specific param schema is tracked in #21. This keeps
-// the Python search surface stable and per-model from day one.
+// is generic over `tuning::FoldEvaluator<P>` and `tuning::SearchSpace`, so
+// each model family gets its own PyO3 entrypoint over its own param schema:
+// EASE uses the `(alpha, beta, lambda_, ...)` grid; SASRec uses
+// `(embedding_dim, num_heads, num_layers, dropout, learning_rate,
+// num_epochs)`; Two-Tower uses `(embedding_dim, temperature,
+// learning_rate, id_dropout)`. All three run end-to-end through the shared
+// k-fold + rayon runner and return the same result shape. The
+// burn-backed SASRec / Two-Tower searches require the `ml-models` build
+// feature; an EASE-only build reports that as a build-config error.
 
 /// EASE grid search over hyperparameters with k-fold CV.
 ///
@@ -1141,12 +1142,17 @@ fn random_search_ease(
     )
 }
 
-/// SASRec grid search over hyperparameters with k-fold CV.
+/// SASRec grid search over its architecture/optimizer hyperparameters
+/// with k-fold CV.
 ///
-/// Same signature and result shape as `grid_search_ease`. Returns a
-/// runtime error until a SASRec `tuning::FoldEvaluator` (with an
-/// architecture-specific search space) is wired (#21); the generic
-/// `tuning::grid_search_with` runner already supports it.
+/// `param_grid` keys: "embedding_dim", "num_heads", "num_layers"
+/// (integers), "dropout", "learning_rate" (floats), "num_epochs"
+/// (integers). Missing keys fall back to a single sensible default. The
+/// interactions file must carry a numeric `days_ago` column (SASRec is
+/// order-sensitive). `user_features_path` / `item_features_path` are
+/// accepted for surface parity with EASE but unused: SASRec is a
+/// sequence model. Result shape matches `grid_search_ease`. Requires the
+/// `ml-models` build feature.
 #[pyfunction]
 #[pyo3(signature = (
     interactions_path,
@@ -1168,12 +1174,36 @@ fn grid_search_sasrec(
     eval_k: usize,
     seed: u64,
 ) -> PyResult<Py<PyAny>> {
-    Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-        "SASRec hyperparameter search is not wired yet: it needs an architecture-specific search space rather than the EASE-shaped param grid (tracked in #21). The generic tuning runner already supports it via tuning::FoldEvaluator.",
-    ))
+    #[cfg(feature = "ml-models")]
+    {
+        let grid = parse_sasrec_grid(param_grid)?;
+        let result = py
+            .detach(|| {
+                let evaluator = tuning::SasRecFoldEvaluator::default();
+                tuning::grid_search_with(
+                    &evaluator,
+                    interactions_path,
+                    &grid,
+                    n_folds,
+                    eval_k,
+                    seed,
+                )
+            })
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+        sasrec_search_result_to_py(py, &result)
+    }
+    #[cfg(not(feature = "ml-models"))]
+    {
+        Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+            "SASRec hyperparameter search requires the `ml-models` build feature \
+             (the burn-backed SASRec model is not compiled into this EASE-only build).",
+        ))
+    }
 }
 
-/// SASRec random search over hyperparameters with k-fold CV.
+/// SASRec random search over its architecture/optimizer hyperparameters
+/// with k-fold CV. Same `param_grid` keys and result shape as
+/// `grid_search_sasrec`. Requires the `ml-models` build feature.
 #[pyfunction]
 #[pyo3(signature = (
     interactions_path,
@@ -1197,16 +1227,43 @@ fn random_search_sasrec(
     eval_k: usize,
     seed: u64,
 ) -> PyResult<Py<PyAny>> {
-    Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-        "SASRec hyperparameter search is not wired yet: it needs an architecture-specific search space rather than the EASE-shaped param grid (tracked in #21). The generic tuning runner already supports it via tuning::FoldEvaluator.",
-    ))
+    #[cfg(feature = "ml-models")]
+    {
+        let grid = parse_sasrec_grid(param_grid)?;
+        let result = py
+            .detach(|| {
+                let evaluator = tuning::SasRecFoldEvaluator::default();
+                tuning::random_search_with(
+                    &evaluator,
+                    interactions_path,
+                    &grid,
+                    n_trials,
+                    n_folds,
+                    eval_k,
+                    seed,
+                )
+            })
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+        sasrec_search_result_to_py(py, &result)
+    }
+    #[cfg(not(feature = "ml-models"))]
+    {
+        Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+            "SASRec hyperparameter search requires the `ml-models` build feature \
+             (the burn-backed SASRec model is not compiled into this EASE-only build).",
+        ))
+    }
 }
 
-/// Two-Tower grid search over hyperparameters with k-fold CV.
+/// Two-Tower grid search over its hyperparameters with k-fold CV.
 ///
-/// Same signature and result shape as `grid_search_ease`. Returns a
-/// runtime error until a Two-Tower `tuning::FoldEvaluator` (with an
-/// architecture-specific search space) is wired (#21).
+/// `param_grid` keys: "embedding_dim" (integers), "temperature",
+/// "learning_rate", "id_dropout" (floats). Missing keys fall back to a
+/// single sensible default. The model trains id-only from the
+/// interactions file (the tuning surface takes no side-feature files);
+/// `user_features_path` / `item_features_path` are accepted for surface
+/// parity but unused. Result shape matches `grid_search_ease`. Requires
+/// the `ml-models` build feature.
 #[pyfunction]
 #[pyo3(signature = (
     interactions_path,
@@ -1228,12 +1285,36 @@ fn grid_search_two_tower(
     eval_k: usize,
     seed: u64,
 ) -> PyResult<Py<PyAny>> {
-    Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-        "Two-Tower hyperparameter search is not wired yet: it needs an architecture-specific search space rather than the EASE-shaped param grid (tracked in #21). The generic tuning runner already supports it via tuning::FoldEvaluator.",
-    ))
+    #[cfg(feature = "ml-models")]
+    {
+        let grid = parse_two_tower_grid(param_grid)?;
+        let result = py
+            .detach(|| {
+                let evaluator = tuning::TwoTowerFoldEvaluator::default();
+                tuning::grid_search_with(
+                    &evaluator,
+                    interactions_path,
+                    &grid,
+                    n_folds,
+                    eval_k,
+                    seed,
+                )
+            })
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+        two_tower_search_result_to_py(py, &result)
+    }
+    #[cfg(not(feature = "ml-models"))]
+    {
+        Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+            "Two-Tower hyperparameter search requires the `ml-models` build feature \
+             (the burn-backed Two-Tower model is not compiled into this EASE-only build).",
+        ))
+    }
 }
 
-/// Two-Tower random search over hyperparameters with k-fold CV.
+/// Two-Tower random search over its hyperparameters with k-fold CV. Same
+/// `param_grid` keys and result shape as `grid_search_two_tower`.
+/// Requires the `ml-models` build feature.
 #[pyfunction]
 #[pyo3(signature = (
     interactions_path,
@@ -1257,9 +1338,32 @@ fn random_search_two_tower(
     eval_k: usize,
     seed: u64,
 ) -> PyResult<Py<PyAny>> {
-    Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-        "Two-Tower hyperparameter search is not wired yet: it needs an architecture-specific search space rather than the EASE-shaped param grid (tracked in #21). The generic tuning runner already supports it via tuning::FoldEvaluator.",
-    ))
+    #[cfg(feature = "ml-models")]
+    {
+        let grid = parse_two_tower_grid(param_grid)?;
+        let result = py
+            .detach(|| {
+                let evaluator = tuning::TwoTowerFoldEvaluator::default();
+                tuning::random_search_with(
+                    &evaluator,
+                    interactions_path,
+                    &grid,
+                    n_trials,
+                    n_folds,
+                    eval_k,
+                    seed,
+                )
+            })
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+        two_tower_search_result_to_py(py, &result)
+    }
+    #[cfg(not(feature = "ml-models"))]
+    {
+        Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+            "Two-Tower hyperparameter search requires the `ml-models` build feature \
+             (the burn-backed Two-Tower model is not compiled into this EASE-only build).",
+        ))
+    }
 }
 
 /// Parses a Python dict into a ParamGrid, using defaults for missing keys.
@@ -1328,6 +1432,129 @@ fn search_result_to_py(py: Python<'_>, result: &tuning::SearchResult) -> PyResul
     }
     dict.set_item("trials", trials_list)?;
 
+    Ok(dict.into())
+}
+
+// --- SASRec / Two-Tower search param parsing + result serialization ------
+//
+// ml-models-gated: these only have call sites under the same feature, and
+// their grid types live behind the burn-backed model code.
+
+#[cfg(feature = "ml-models")]
+fn extract_f64_vec(dict: &Bound<'_, PyDict>, key: &str, default: f64) -> PyResult<Vec<f64>> {
+    match dict.get_item(key)? {
+        Some(v) => {
+            let list: Vec<f64> = v.extract()?;
+            Ok(if list.is_empty() { vec![default] } else { list })
+        }
+        None => Ok(vec![default]),
+    }
+}
+
+#[cfg(feature = "ml-models")]
+fn extract_usize_vec(dict: &Bound<'_, PyDict>, key: &str, default: usize) -> PyResult<Vec<usize>> {
+    match dict.get_item(key)? {
+        Some(v) => {
+            let list: Vec<usize> = v.extract()?;
+            Ok(if list.is_empty() { vec![default] } else { list })
+        }
+        None => Ok(vec![default]),
+    }
+}
+
+/// Parse a Python dict into a [`tuning::SasRecParamGrid`], defaulting any
+/// missing axis to a single sensible value.
+#[cfg(feature = "ml-models")]
+fn parse_sasrec_grid(dict: &Bound<'_, PyDict>) -> PyResult<tuning::SasRecParamGrid> {
+    Ok(tuning::SasRecParamGrid {
+        embedding_dim: extract_usize_vec(dict, "embedding_dim", 64)?,
+        num_heads: extract_usize_vec(dict, "num_heads", 2)?,
+        num_layers: extract_usize_vec(dict, "num_layers", 2)?,
+        dropout: extract_f64_vec(dict, "dropout", 0.2)?,
+        learning_rate: extract_f64_vec(dict, "learning_rate", 1e-3)?,
+        num_epochs: extract_usize_vec(dict, "num_epochs", 50)?,
+    })
+}
+
+/// Parse a Python dict into a [`tuning::TwoTowerParamGrid`], defaulting
+/// any missing axis to a single sensible value.
+#[cfg(feature = "ml-models")]
+fn parse_two_tower_grid(dict: &Bound<'_, PyDict>) -> PyResult<tuning::TwoTowerParamGrid> {
+    Ok(tuning::TwoTowerParamGrid {
+        embedding_dim: extract_usize_vec(dict, "embedding_dim", 32)?,
+        temperature: extract_f64_vec(dict, "temperature", 0.05)?,
+        learning_rate: extract_f64_vec(dict, "learning_rate", 0.01)?,
+        id_dropout: extract_f64_vec(dict, "id_dropout", 0.1)?,
+    })
+}
+
+/// Serialize a SASRec [`tuning::SearchResult`] into the same dict shape as
+/// EASE (`best_params` / `best_score` / `metric` / `trials`), with
+/// SASRec's param keys.
+#[cfg(feature = "ml-models")]
+fn sasrec_search_result_to_py(
+    py: Python<'_>,
+    result: &tuning::SearchResult<tuning::SasRecParams>,
+) -> PyResult<Py<PyAny>> {
+    fn params_dict<'py>(py: Python<'py>, p: &tuning::SasRecParams) -> PyResult<Bound<'py, PyDict>> {
+        let d = PyDict::new(py);
+        d.set_item("embedding_dim", p.embedding_dim)?;
+        d.set_item("num_heads", p.num_heads)?;
+        d.set_item("num_layers", p.num_layers)?;
+        d.set_item("dropout", p.dropout)?;
+        d.set_item("learning_rate", p.learning_rate)?;
+        d.set_item("num_epochs", p.num_epochs)?;
+        Ok(d)
+    }
+
+    let dict = PyDict::new(py);
+    dict.set_item("best_params", params_dict(py, &result.best_params)?)?;
+    dict.set_item("best_score", result.best_score)?;
+    dict.set_item("metric", &result.metric_name)?;
+    let trials_list = PyList::empty(py);
+    for trial in &result.all_trials {
+        let trial_dict = PyDict::new(py);
+        trial_dict.set_item("params", params_dict(py, &trial.params)?)?;
+        trial_dict.set_item("mean_score", trial.mean_score)?;
+        trial_dict.set_item("fold_scores", trial.fold_scores.clone())?;
+        trials_list.append(trial_dict)?;
+    }
+    dict.set_item("trials", trials_list)?;
+    Ok(dict.into())
+}
+
+/// Serialize a Two-Tower [`tuning::SearchResult`] into the same dict shape
+/// as EASE, with Two-Tower's param keys.
+#[cfg(feature = "ml-models")]
+fn two_tower_search_result_to_py(
+    py: Python<'_>,
+    result: &tuning::SearchResult<tuning::TwoTowerParams>,
+) -> PyResult<Py<PyAny>> {
+    fn params_dict<'py>(
+        py: Python<'py>,
+        p: &tuning::TwoTowerParams,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let d = PyDict::new(py);
+        d.set_item("embedding_dim", p.embedding_dim)?;
+        d.set_item("temperature", p.temperature)?;
+        d.set_item("learning_rate", p.learning_rate)?;
+        d.set_item("id_dropout", p.id_dropout)?;
+        Ok(d)
+    }
+
+    let dict = PyDict::new(py);
+    dict.set_item("best_params", params_dict(py, &result.best_params)?)?;
+    dict.set_item("best_score", result.best_score)?;
+    dict.set_item("metric", &result.metric_name)?;
+    let trials_list = PyList::empty(py);
+    for trial in &result.all_trials {
+        let trial_dict = PyDict::new(py);
+        trial_dict.set_item("params", params_dict(py, &trial.params)?)?;
+        trial_dict.set_item("mean_score", trial.mean_score)?;
+        trial_dict.set_item("fold_scores", trial.fold_scores.clone())?;
+        trials_list.append(trial_dict)?;
+    }
+    dict.set_item("trials", trials_list)?;
     Ok(dict.into())
 }
 
