@@ -1,23 +1,33 @@
 //! Serving module for territory-aware multi-model support and batch predictions.
 //!
 //! Ports the Python `RFYTerritoryGroupServing` pattern: maintain a dictionary of
-//! trained FEASE models keyed by territory/region, and route predictions to the
+//! trained models keyed by territory/region, and route predictions to the
 //! appropriate model based on a user's territory.
+//!
+//! The registry is generalized over `Box<dyn RecModel>` (issue #39): a
+//! territory may be served by EASE, SASRec, or Two-Tower. Routing and
+//! prediction go through the [`RecModel`] trait, so the registry is
+//! model-agnostic. EASE callers register a `RustFeaseModel` via
+//! [`FeaseModelRegistry::register`] (it is wrapped in an `EaseAdapter`);
+//! other models register through [`FeaseModelRegistry::register_model`].
 //!
 //! Also provides batch prediction for efficiently scoring multiple users at once.
 
 use crate::model::RustFeaseModel;
+use crate::models::{EaseAdapter, ModelInput, RecModel};
 use ahash::AHashMap;
 use anyhow::{Result, anyhow};
 use rayon::prelude::*;
 
-/// A registry of FEASE models keyed by territory/region name.
+/// A registry of recommender models keyed by territory/region name.
 ///
-/// This is the Rust equivalent of Python's `RFYTerritoryGroupServing` — it holds
-/// one trained model per territory group and routes predictions to the correct model.
+/// This is the Rust equivalent of Python's `RFYTerritoryGroupServing` — it
+/// holds one trained model per territory group and routes predictions to
+/// the correct model. Models are stored as `Box<dyn RecModel>` so a
+/// territory can be served by any model family.
 pub struct FeaseModelRegistry {
     /// Map from territory name (e.g., "UNITED_STATES") to trained model.
-    models: AHashMap<String, RustFeaseModel>,
+    models: AHashMap<String, Box<dyn RecModel>>,
     /// Optional fallback territory name for unknown territories.
     fallback_territory: Option<String>,
 }
@@ -42,30 +52,55 @@ impl FeaseModelRegistry {
         }
     }
 
-    /// Registers a trained model for a given territory.
+    /// Registers a trained EASE model for a given territory.
+    ///
+    /// The concrete `RustFeaseModel` is wrapped in an `EaseAdapter` so it
+    /// is stored uniformly as `Box<dyn RecModel>`. Kept for source
+    /// compatibility with existing EASE call sites.
     pub fn register(&mut self, territory: String, model: RustFeaseModel) {
         log::info!(
-            "Registered model for territory '{}' ({}x{} S matrix, {} items)",
+            "Registered EASE model for territory '{}' ({}x{} S matrix, {} items)",
             territory,
             model.s_matrix.nrows(),
             model.s_matrix.ncols(),
             model.num_items,
         );
+        self.models
+            .insert(territory, Box::new(EaseAdapter::new(model)));
+    }
+
+    /// Registers any trained model (EASE, SASRec, Two-Tower) for a
+    /// territory via the [`RecModel`] trait object.
+    ///
+    /// The EASE PyO3 surface registers via [`Self::register`]; this
+    /// trait-object entry point is the seam SASRec/Two-Tower territory
+    /// registration uses once their models are wired (#21).
+    #[allow(dead_code)]
+    pub fn register_model(&mut self, territory: String, model: Box<dyn RecModel>) {
+        log::info!(
+            "Registered {:?} model for territory '{}' ({} items)",
+            model.kind(),
+            territory,
+            model.num_items(),
+        );
         self.models.insert(territory, model);
     }
 
     /// Removes and returns the model for a given territory.
-    pub fn unregister(&mut self, territory: &str) -> Option<RustFeaseModel> {
+    pub fn unregister(&mut self, territory: &str) -> Option<Box<dyn RecModel>> {
         self.models.remove(territory)
     }
 
     /// Returns the model for a given territory (or the fallback if set).
-    pub fn get_model(&self, territory: &str) -> Option<&RustFeaseModel> {
-        self.models.get(territory).or_else(|| {
-            self.fallback_territory
-                .as_ref()
-                .and_then(|fb| self.models.get(fb.as_str()))
-        })
+    pub fn get_model(&self, territory: &str) -> Option<&dyn RecModel> {
+        self.models
+            .get(territory)
+            .or_else(|| {
+                self.fallback_territory
+                    .as_ref()
+                    .and_then(|fb| self.models.get(fb.as_str()))
+            })
+            .map(|b| b.as_ref())
     }
 
     /// Lists all registered territory names.
@@ -84,22 +119,36 @@ impl FeaseModelRegistry {
 
     /// Predicts scores for a user in a specific territory.
     ///
-    /// Routes to the correct territory model. Returns an error if the territory
-    /// is unknown and no fallback is set.
+    /// Routes to the correct territory model and scores it through the
+    /// [`RecModel`] trait. The `RecModel` contract is f32; EASE pays a
+    /// single `as f32` cast per element on output (unchanged math).
+    /// Returns an error if the territory is unknown and no fallback is set,
+    /// or if the routed model does not support sparse input.
     pub fn predict(
         &self,
         territory: &str,
         user_interactions: &[(usize, f64)],
         user_features: &[(usize, f64)],
-    ) -> Result<Vec<f64>> {
-        let model = self.get_model(territory).ok_or_else(|| {
-            anyhow!(
-                "No model registered for territory '{}' (and no fallback available)",
-                territory
-            )
-        })?;
+    ) -> Result<Vec<f32>> {
+        let model = self.route(territory)?;
+        model.predict_scores(ModelInput::Sparse {
+            interactions: user_interactions,
+            user_features,
+        })
+    }
 
-        Ok(model.predict(user_interactions, user_features, model.beta))
+    /// Predicts the top-K items for a user in a territory, excluding the
+    /// items the user has already interacted with.
+    pub fn predict_top_k(
+        &self,
+        territory: &str,
+        user_interactions: &[(usize, f64)],
+        user_features: &[(usize, f64)],
+        top_k: usize,
+    ) -> Result<Vec<(usize, f32)>> {
+        let scores = self.predict(territory, user_interactions, user_features)?;
+        let interacted: Vec<usize> = user_interactions.iter().map(|(idx, _)| *idx).collect();
+        Ok(filter_sort_top_k(scores, &interacted, top_k))
     }
 
     /// Predicts similar items in a specific territory.
@@ -108,15 +157,20 @@ impl FeaseModelRegistry {
         territory: &str,
         item_idx: usize,
         top_k: usize,
-    ) -> Result<Vec<(usize, f64)>> {
-        let model = self.get_model(territory).ok_or_else(|| {
+    ) -> Result<Vec<(usize, f32)>> {
+        let model = self.route(territory)?;
+        model.predict_similar_items(item_idx, top_k)
+    }
+
+    /// Routes a territory to its model (or the fallback), erroring with a
+    /// consistent message when neither exists.
+    fn route(&self, territory: &str) -> Result<&dyn RecModel> {
+        self.get_model(territory).ok_or_else(|| {
             anyhow!(
                 "No model registered for territory '{}' (and no fallback available)",
                 territory
             )
-        })?;
-
-        Ok(model.predict_similar_items(item_idx, top_k))
+        })
     }
 }
 
@@ -135,63 +189,79 @@ pub struct UserInput {
     pub features: Vec<(usize, f64)>,
 }
 
-/// Predicts scores for multiple users in a single call.
+/// Predicts scores for multiple users in a single call, over any
+/// [`RecModel`].
 ///
-/// This is more efficient than calling `predict()` in a loop because it avoids
-/// repeated function-call overhead and allows for potential SIMD/parallelism
-/// in the future.
+/// More efficient than calling `predict()` in a loop: rayon scores users
+/// in parallel. Each user is fed as `ModelInput::Sparse`, so EASE,
+/// SASRec, and Two-Tower all work behind the same call. Returns one score
+/// vector per user, in the same order as `users`. Propagates the first
+/// error if the routed model rejects sparse input.
 ///
-/// Returns a Vec of score vectors, one per user, in the same order as `users`.
+/// The PyO3 batch path uses [`predict_batch_top_k`]; this score-only
+/// variant is kept as a public building block and exercised by tests.
 #[allow(dead_code)]
-pub fn predict_batch(model: &RustFeaseModel, users: &[UserInput]) -> Vec<Vec<f64>> {
+pub fn predict_batch(model: &dyn RecModel, users: &[UserInput]) -> Result<Vec<Vec<f32>>> {
     log::info!("Batch prediction for {} users", users.len());
 
     users
         .par_iter()
-        .map(|user| model.predict(&user.interactions, &user.features, model.beta))
+        .map(|user| {
+            model.predict_scores(ModelInput::Sparse {
+                interactions: &user.interactions,
+                user_features: &user.features,
+            })
+        })
         .collect()
 }
 
-/// Filters scores by removing interacted items, sorts descending, and truncates to top-K.
+/// Filters scores by removing interacted items, sorts descending, and
+/// truncates to top-K.
 ///
-/// Shared logic used by both batch prediction and single-user registry prediction.
-pub fn filter_sort_top_k(
-    scores: Vec<f64>,
+/// Generic over the score scalar (`f32` from the `RecModel` path, `f64`
+/// from the concrete EASE path) so both registry/batch prediction and the
+/// existing concrete EASE serving call site share one implementation.
+pub fn filter_sort_top_k<T: PartialOrd + Copy>(
+    scores: Vec<T>,
     interacted: &[usize],
     top_k: usize,
-) -> Vec<(usize, f64)> {
+) -> Vec<(usize, T)> {
     let interacted_set: ahash::AHashSet<usize> = interacted.iter().copied().collect();
 
-    let mut ranked: Vec<(usize, f64)> = scores
+    let mut ranked: Vec<(usize, T)> = scores
         .into_iter()
         .enumerate()
         .filter(|(idx, _)| !interacted_set.contains(idx))
         .collect();
 
-    ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
+    ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     ranked.truncate(top_k);
     ranked
 }
 
-/// Batch prediction that also returns top-K results per user.
+/// Batch prediction that also returns top-K results per user, over any
+/// [`RecModel`].
 ///
 /// Returns a Vec of Vec<(item_index, score)>, sorted descending by score,
-/// truncated to `top_k` items per user. Excludes items the user has already
-/// interacted with.
+/// truncated to `top_k` items per user. Excludes items the user has
+/// already interacted with.
 pub fn predict_batch_top_k(
-    model: &RustFeaseModel,
+    model: &dyn RecModel,
     users: &[UserInput],
     top_k: usize,
-) -> Vec<Vec<(usize, f64)>> {
+) -> Result<Vec<Vec<(usize, f32)>>> {
     log::info!("Batch top-{} prediction for {} users", top_k, users.len());
 
     users
         .par_iter()
         .map(|user| {
-            let scores = model.predict(&user.interactions, &user.features, model.beta);
+            let scores = model.predict_scores(ModelInput::Sparse {
+                interactions: &user.interactions,
+                user_features: &user.features,
+            })?;
             let interacted_indices: Vec<usize> =
                 user.interactions.iter().map(|(idx, _)| *idx).collect();
-            filter_sort_top_k(scores, &interacted_indices, top_k)
+            Ok(filter_sort_top_k(scores, &interacted_indices, top_k))
         })
         .collect()
 }
@@ -264,7 +334,7 @@ mod tests {
 
         // Unknown territory falls back to US
         let model = registry.get_model("JP").unwrap();
-        assert_eq!(model.num_items, 4);
+        assert_eq!(model.num_items(), 4);
     }
 
     #[test]
@@ -292,17 +362,17 @@ mod tests {
         let scores_br = registry.predict("BR", &[(0, 1.0)], &[]).unwrap();
 
         // BR model has 2x scale, so scores should differ
-        let us_sum: f64 = scores_us.iter().sum();
-        let br_sum: f64 = scores_br.iter().sum();
+        let us_sum: f32 = scores_us.iter().sum();
+        let br_sum: f32 = scores_br.iter().sum();
         assert!(
-            (br_sum - 2.0 * us_sum).abs() < 1e-6,
+            (br_sum - 2.0 * us_sum).abs() < 1e-5,
             "BR scores should be 2x US scores"
         );
     }
 
     #[test]
     fn test_batch_predict() {
-        let model = make_test_model(1.0);
+        let adapter = EaseAdapter::new(make_test_model(1.0));
         let users = vec![
             UserInput {
                 interactions: vec![(0, 1.0)],
@@ -318,7 +388,7 @@ mod tests {
             },
         ];
 
-        let results = predict_batch(&model, &users);
+        let results = predict_batch(&adapter, &users).unwrap();
         assert_eq!(results.len(), 3);
         assert_eq!(results[0].len(), 4); // num_items
         assert_eq!(results[1].len(), 4);
@@ -339,16 +409,18 @@ mod tests {
             },
         ];
 
-        // Batch
-        let batch_results = predict_batch(&model, &users);
+        // Batch through the generalized `&dyn RecModel` path.
+        let adapter = EaseAdapter::new(model.clone());
+        let batch_results = predict_batch(&adapter, &users).unwrap();
 
-        // Sequential
+        // Sequential, concrete f64 path. The `RecModel` contract is f32,
+        // so the comparison tolerance is the single `as f32` cast.
         for (i, user) in users.iter().enumerate() {
             let sequential = model.predict(&user.interactions, &user.features, model.beta);
             assert_eq!(batch_results[i].len(), sequential.len());
             for (a, b) in batch_results[i].iter().zip(sequential.iter()) {
                 assert!(
-                    (a - b).abs() < 1e-12,
+                    ((*a as f64) - b).abs() < 1e-6,
                     "Batch vs sequential mismatch for user {}: {} vs {}",
                     i,
                     a,
@@ -360,13 +432,13 @@ mod tests {
 
     #[test]
     fn test_batch_top_k() {
-        let model = make_test_model(1.0);
+        let adapter = EaseAdapter::new(make_test_model(1.0));
         let users = vec![UserInput {
             interactions: vec![(0, 1.0)],
             features: vec![],
         }];
 
-        let results = predict_batch_top_k(&model, &users, 2);
+        let results = predict_batch_top_k(&adapter, &users, 2).unwrap();
         assert_eq!(results.len(), 1);
         assert!(results[0].len() <= 2);
 
@@ -383,8 +455,8 @@ mod tests {
 
     #[test]
     fn test_batch_empty() {
-        let model = make_test_model(1.0);
-        let results = predict_batch(&model, &[]);
+        let adapter = EaseAdapter::new(make_test_model(1.0));
+        let results = predict_batch(&adapter, &[]).unwrap();
         assert!(results.is_empty());
     }
 
@@ -401,7 +473,7 @@ mod tests {
 
     #[test]
     fn test_filter_sort_top_k() {
-        let scores = vec![0.1, 0.9, 0.5, 0.3];
+        let scores: Vec<f64> = vec![0.1, 0.9, 0.5, 0.3];
         let interacted = vec![0]; // exclude item 0
 
         let result = filter_sort_top_k(scores, &interacted, 2);
@@ -420,7 +492,7 @@ mod tests {
 
     #[test]
     fn test_filter_sort_top_k_empty_interacted() {
-        let scores = vec![0.3, 0.1, 0.9];
+        let scores: Vec<f64> = vec![0.3, 0.1, 0.9];
         let interacted: Vec<usize> = vec![];
 
         let result = filter_sort_top_k(scores, &interacted, 2);

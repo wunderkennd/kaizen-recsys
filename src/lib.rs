@@ -198,10 +198,14 @@ impl FeaseModel {
             });
         }
 
-        // Run batch prediction with top-K filtering.
+        // Run batch prediction with top-K filtering through the
+        // generalized `&dyn RecModel` path. `EaseAdapterRef` borrows the
+        // model (no deep clone of the S matrix).
         // Release the GIL so other Python threads can proceed during rayon parallel work.
-        let batch_results =
-            py.detach(|| serving::predict_batch_top_k(&self.model, &batch_inputs, top_k));
+        let adapter = crate::models::EaseAdapterRef::new(&self.model);
+        let batch_results = py
+            .detach(|| serving::predict_batch_top_k(&adapter, &batch_inputs, top_k))
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
 
         // Convert results back to Python
         let py_outer = PyList::empty(py);
@@ -210,7 +214,7 @@ impl FeaseModel {
             for (idx, score) in user_results {
                 if let Some(guid) = self.model.mappings.idx_to_item.get(idx) {
                     let py_guid = PyString::new(py, guid);
-                    let py_score = PyFloat::new(py, score);
+                    let py_score = PyFloat::new(py, score as f64);
                     py_inner.append((py_guid, py_score))?;
                 }
             }
@@ -831,6 +835,7 @@ impl FeaseRegistry {
         let features = user_features.unwrap_or_default();
         self.inner
             .predict(territory, &user_interactions, &features)
+            .map(|scores| scores.into_iter().map(|s| s as f64).collect())
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))
     }
 
@@ -856,22 +861,10 @@ impl FeaseRegistry {
         user_features: Option<Vec<(usize, f64)>>,
     ) -> PyResult<Vec<(usize, f64)>> {
         let features = user_features.unwrap_or_default();
-        let model = self.inner.get_model(territory).ok_or_else(|| {
-            PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-                "No model registered for territory '{}' (and no fallback available)",
-                territory
-            ))
-        })?;
-
-        let scores = model.predict(&user_interactions, &features, model.beta);
-        let interacted_indices: Vec<usize> =
-            user_interactions.iter().map(|(idx, _)| *idx).collect();
-
-        Ok(serving::filter_sort_top_k(
-            scores,
-            &interacted_indices,
-            top_k,
-        ))
+        self.inner
+            .predict_top_k(territory, &user_interactions, &features, top_k)
+            .map(|ranked| ranked.into_iter().map(|(i, s)| (i, s as f64)).collect())
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))
     }
 
     /// Predicts similar items for a given item index in a specific territory.
@@ -895,6 +888,7 @@ impl FeaseRegistry {
     ) -> PyResult<Vec<(usize, f64)>> {
         self.inner
             .predict_similar_items(territory, item_idx, top_k)
+            .map(|ranked| ranked.into_iter().map(|(i, s)| (i, s as f64)).collect())
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))
     }
 }
@@ -1057,6 +1051,215 @@ fn random_search_py(
         .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
 
     search_result_to_py(py, &result)
+}
+
+// ---------------------------------------------------------------------------
+// Per-model search entrypoints
+// ---------------------------------------------------------------------------
+//
+// The search machinery (`tuning::grid_search_with` / `random_search_with`)
+// is generic over `tuning::FoldEvaluator`, so each model family gets its
+// own PyO3 entrypoint. EASE is wired end-to-end. SASRec and Two-Tower
+// expose entrypoints with the same signature and result shape; they
+// return a clear runtime error pointing at the `FoldEvaluator` seam,
+// because their search spaces are architecture-specific (embedding dim,
+// depth, learning rate) rather than the EASE-shaped `ParamGrid` — a
+// SASRec/Two-Tower-specific param schema is tracked in #21. This keeps
+// the Python search surface stable and per-model from day one.
+
+/// EASE grid search over hyperparameters with k-fold CV.
+///
+/// Identical behavior and result shape to `grid_search`; named explicitly
+/// per model so SASRec/Two-Tower entrypoints can mirror it.
+#[pyfunction]
+#[pyo3(signature = (
+    interactions_path,
+    user_features_path,
+    item_features_path,
+    param_grid,
+    n_folds = 3,
+    eval_k = 10,
+    seed = 42
+))]
+#[allow(clippy::too_many_arguments)]
+fn grid_search_ease(
+    py: Python<'_>,
+    interactions_path: &str,
+    user_features_path: &str,
+    item_features_path: &str,
+    param_grid: &Bound<'_, PyDict>,
+    n_folds: usize,
+    eval_k: usize,
+    seed: u64,
+) -> PyResult<Py<PyAny>> {
+    grid_search_py(
+        py,
+        interactions_path,
+        user_features_path,
+        item_features_path,
+        param_grid,
+        n_folds,
+        eval_k,
+        seed,
+    )
+}
+
+/// EASE random search over hyperparameters with k-fold CV.
+#[pyfunction]
+#[pyo3(signature = (
+    interactions_path,
+    user_features_path,
+    item_features_path,
+    param_grid,
+    n_trials = 10,
+    n_folds = 3,
+    eval_k = 10,
+    seed = 42
+))]
+#[allow(clippy::too_many_arguments)]
+fn random_search_ease(
+    py: Python<'_>,
+    interactions_path: &str,
+    user_features_path: &str,
+    item_features_path: &str,
+    param_grid: &Bound<'_, PyDict>,
+    n_trials: usize,
+    n_folds: usize,
+    eval_k: usize,
+    seed: u64,
+) -> PyResult<Py<PyAny>> {
+    random_search_py(
+        py,
+        interactions_path,
+        user_features_path,
+        item_features_path,
+        param_grid,
+        n_trials,
+        n_folds,
+        eval_k,
+        seed,
+    )
+}
+
+/// SASRec grid search over hyperparameters with k-fold CV.
+///
+/// Same signature and result shape as `grid_search_ease`. Returns a
+/// runtime error until a SASRec `tuning::FoldEvaluator` (with an
+/// architecture-specific search space) is wired (#21); the generic
+/// `tuning::grid_search_with` runner already supports it.
+#[pyfunction]
+#[pyo3(signature = (
+    interactions_path,
+    user_features_path,
+    item_features_path,
+    param_grid,
+    n_folds = 3,
+    eval_k = 10,
+    seed = 42
+))]
+#[allow(clippy::too_many_arguments, unused_variables)]
+fn grid_search_sasrec(
+    py: Python<'_>,
+    interactions_path: &str,
+    user_features_path: &str,
+    item_features_path: &str,
+    param_grid: &Bound<'_, PyDict>,
+    n_folds: usize,
+    eval_k: usize,
+    seed: u64,
+) -> PyResult<Py<PyAny>> {
+    Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+        "SASRec hyperparameter search is not wired yet: it needs an architecture-specific search space rather than the EASE-shaped param grid (tracked in #21). The generic tuning runner already supports it via tuning::FoldEvaluator.",
+    ))
+}
+
+/// SASRec random search over hyperparameters with k-fold CV.
+#[pyfunction]
+#[pyo3(signature = (
+    interactions_path,
+    user_features_path,
+    item_features_path,
+    param_grid,
+    n_trials = 10,
+    n_folds = 3,
+    eval_k = 10,
+    seed = 42
+))]
+#[allow(clippy::too_many_arguments, unused_variables)]
+fn random_search_sasrec(
+    py: Python<'_>,
+    interactions_path: &str,
+    user_features_path: &str,
+    item_features_path: &str,
+    param_grid: &Bound<'_, PyDict>,
+    n_trials: usize,
+    n_folds: usize,
+    eval_k: usize,
+    seed: u64,
+) -> PyResult<Py<PyAny>> {
+    Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+        "SASRec hyperparameter search is not wired yet: it needs an architecture-specific search space rather than the EASE-shaped param grid (tracked in #21). The generic tuning runner already supports it via tuning::FoldEvaluator.",
+    ))
+}
+
+/// Two-Tower grid search over hyperparameters with k-fold CV.
+///
+/// Same signature and result shape as `grid_search_ease`. Returns a
+/// runtime error until a Two-Tower `tuning::FoldEvaluator` (with an
+/// architecture-specific search space) is wired (#21).
+#[pyfunction]
+#[pyo3(signature = (
+    interactions_path,
+    user_features_path,
+    item_features_path,
+    param_grid,
+    n_folds = 3,
+    eval_k = 10,
+    seed = 42
+))]
+#[allow(clippy::too_many_arguments, unused_variables)]
+fn grid_search_two_tower(
+    py: Python<'_>,
+    interactions_path: &str,
+    user_features_path: &str,
+    item_features_path: &str,
+    param_grid: &Bound<'_, PyDict>,
+    n_folds: usize,
+    eval_k: usize,
+    seed: u64,
+) -> PyResult<Py<PyAny>> {
+    Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+        "Two-Tower hyperparameter search is not wired yet: it needs an architecture-specific search space rather than the EASE-shaped param grid (tracked in #21). The generic tuning runner already supports it via tuning::FoldEvaluator.",
+    ))
+}
+
+/// Two-Tower random search over hyperparameters with k-fold CV.
+#[pyfunction]
+#[pyo3(signature = (
+    interactions_path,
+    user_features_path,
+    item_features_path,
+    param_grid,
+    n_trials = 10,
+    n_folds = 3,
+    eval_k = 10,
+    seed = 42
+))]
+#[allow(clippy::too_many_arguments, unused_variables)]
+fn random_search_two_tower(
+    py: Python<'_>,
+    interactions_path: &str,
+    user_features_path: &str,
+    item_features_path: &str,
+    param_grid: &Bound<'_, PyDict>,
+    n_trials: usize,
+    n_folds: usize,
+    eval_k: usize,
+    seed: u64,
+) -> PyResult<Py<PyAny>> {
+    Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+        "Two-Tower hyperparameter search is not wired yet: it needs an architecture-specific search space rather than the EASE-shaped param grid (tracked in #21). The generic tuning runner already supports it via tuning::FoldEvaluator.",
+    ))
 }
 
 /// Parses a Python dict into a ParamGrid, using defaults for missing keys.
@@ -1413,6 +1616,12 @@ fn _native(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(leave_k_out_split, m)?)?;
     m.add_function(wrap_pyfunction!(grid_search_py, m)?)?;
     m.add_function(wrap_pyfunction!(random_search_py, m)?)?;
+    m.add_function(wrap_pyfunction!(grid_search_ease, m)?)?;
+    m.add_function(wrap_pyfunction!(random_search_ease, m)?)?;
+    m.add_function(wrap_pyfunction!(grid_search_sasrec, m)?)?;
+    m.add_function(wrap_pyfunction!(random_search_sasrec, m)?)?;
+    m.add_function(wrap_pyfunction!(grid_search_two_tower, m)?)?;
+    m.add_function(wrap_pyfunction!(random_search_two_tower, m)?)?;
     m.add_class::<FeaseModel>()?;
     m.add_class::<FeaseRegistry>()?;
 
