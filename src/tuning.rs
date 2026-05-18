@@ -1809,6 +1809,7 @@ mod tests {
     /// num_epochs), not a placeholder.
     #[cfg(feature = "ml-models")]
     #[test]
+    #[ignore = "trains real burn models; impractically slow in a debug CI build. Run with: cargo test --release --features ml-models -- --ignored"]
     fn test_sasrec_grid_search_end_to_end() -> Result<()> {
         let (i_path, _tmp) = make_seq_dataset(12, 6, 5)?;
 
@@ -1852,6 +1853,7 @@ mod tests {
     /// runs each through the real evaluator end-to-end.
     #[cfg(feature = "ml-models")]
     #[test]
+    #[ignore = "trains real burn models; impractically slow in a debug CI build. Run with: cargo test --release --features ml-models -- --ignored"]
     fn test_sasrec_random_search_end_to_end() -> Result<()> {
         let (i_path, _tmp) = make_seq_dataset(12, 6, 5)?;
 
@@ -1888,6 +1890,7 @@ mod tests {
     /// schema (embedding_dim / temperature / learning_rate / id_dropout).
     #[cfg(feature = "ml-models")]
     #[test]
+    #[ignore = "trains real burn models; impractically slow in a debug CI build. Run with: cargo test --release --features ml-models -- --ignored"]
     fn test_two_tower_grid_search_end_to_end() -> Result<()> {
         // Two-Tower doesn't need `days_ago`; reuse the seq dataset (extra
         // column is ignored by the triple loader).
@@ -1928,6 +1931,7 @@ mod tests {
     /// and runs each through the real evaluator end-to-end.
     #[cfg(feature = "ml-models")]
     #[test]
+    #[ignore = "trains real burn models; impractically slow in a debug CI build. Run with: cargo test --release --features ml-models -- --ignored"]
     fn test_two_tower_random_search_end_to_end() -> Result<()> {
         let (i_path, _tmp) = make_seq_dataset(12, 6, 5)?;
 
