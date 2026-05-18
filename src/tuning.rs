@@ -1,12 +1,31 @@
-//! Hyperparameter tuning module: grid search and random search over FEASE
-//! hyperparameters with k-fold cross-validation.
+//! Hyperparameter tuning module: grid search and random search with
+//! k-fold cross-validation.
 //!
-//! Uses the existing data pipeline and model training directly. Evaluation
-//! is based on NDCG@k computed over held-out test users.
+//! The search machinery (cartesian product, k-fold split generation,
+//! parallel trial runner) is model-agnostic: it is generic over the
+//! [`FoldEvaluator`] trait, which trains a model on one fold's training
+//! split and scores it against that fold's held-out users. The
+//! optimization target is NDCG@k.
+//!
+//! [`EaseFoldEvaluator`] is the EASE implementation. It builds matrices
+//! via the data pipeline, trains a [`RustFeaseModel`], and scores users
+//! through the [`RecModel`] trait. SASRec and Two-Tower plug in their
+//! own [`FoldEvaluator`] implementations behind the same search
+//! machinery.
+//!
+//! The runner is generic over the parameter type `P` (the [`SearchSpace`]
+//! trait yields the cartesian product and a seeded random sample), so each
+//! model family carries its own architecture-specific schema —
+//! [`HyperParams`]/[`ParamGrid`] for EASE,
+//! [`SasRecParams`]/[`SasRecParamGrid`] for SASRec, and
+//! [`TwoTowerParams`]/[`TwoTowerParamGrid`] for Two-Tower — while sharing
+//! the k-fold split generation, the rayon trial runner, and the
+//! deterministic result assembly.
 
 use crate::data_pipeline::{self, Mappings};
 use crate::evaluation::{build_user_features_map, read_interactions_df, write_parquet};
 use crate::model::RustFeaseModel;
+use crate::models::{EaseAdapter, ModelInput, RecModel};
 use crate::weighting::WeightingConfig;
 use ahash::AHashMap;
 use anyhow::{Result, anyhow};
@@ -45,21 +64,190 @@ pub struct ParamGrid {
     pub sparsity_threshold: Vec<f64>,
 }
 
-/// Result of a single trial in the search.
+/// Result of a single trial in the search, generic over the model's
+/// parameter schema `P` (EASE: [`HyperParams`]; SASRec: [`SasRecParams`];
+/// Two-Tower: [`TwoTowerParams`]).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TrialResult {
-    pub params: HyperParams,
+pub struct TrialResult<P = HyperParams> {
+    pub params: P,
     pub mean_score: f64,
     pub fold_scores: Vec<f64>,
 }
 
-/// Result of a complete search.
+/// Result of a complete search, generic over the parameter schema `P`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SearchResult {
-    pub best_params: HyperParams,
+pub struct SearchResult<P = HyperParams> {
+    pub best_params: P,
     pub best_score: f64,
-    pub all_trials: Vec<TrialResult>,
+    pub all_trials: Vec<TrialResult<P>>,
     pub metric_name: String,
+}
+
+// ---------------------------------------------------------------------------
+// SASRec parameter schema
+// ---------------------------------------------------------------------------
+
+/// A single SASRec hyperparameter configuration. These are the real
+/// architecture / optimizer knobs the burn model takes (see
+/// [`crate::models::sasrec::SasRecConfig`] /
+/// [`crate::models::sasrec::SasRecTrainingConfig`]).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SasRecParams {
+    pub embedding_dim: usize,
+    pub num_heads: usize,
+    pub num_layers: usize,
+    pub dropout: f64,
+    pub learning_rate: f64,
+    pub num_epochs: usize,
+}
+
+/// Search space for SASRec grid / random search. Each field is a vec of
+/// values to try over that architecture knob.
+#[derive(Debug, Clone)]
+pub struct SasRecParamGrid {
+    pub embedding_dim: Vec<usize>,
+    pub num_heads: Vec<usize>,
+    pub num_layers: Vec<usize>,
+    pub dropout: Vec<f64>,
+    pub learning_rate: Vec<f64>,
+    pub num_epochs: Vec<usize>,
+}
+
+// ---------------------------------------------------------------------------
+// Two-Tower parameter schema
+// ---------------------------------------------------------------------------
+
+/// A single Two-Tower hyperparameter configuration — the real knobs the
+/// in-batch sampled-softmax model takes (see
+/// [`crate::models::two_tower::TrainParams`]).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TwoTowerParams {
+    pub embedding_dim: usize,
+    pub temperature: f64,
+    pub learning_rate: f64,
+    pub id_dropout: f64,
+}
+
+/// Search space for Two-Tower grid / random search.
+#[derive(Debug, Clone)]
+pub struct TwoTowerParamGrid {
+    pub embedding_dim: Vec<usize>,
+    pub temperature: Vec<f64>,
+    pub learning_rate: Vec<f64>,
+    pub id_dropout: Vec<f64>,
+}
+
+// ---------------------------------------------------------------------------
+// Search space abstraction
+// ---------------------------------------------------------------------------
+
+/// A model's parameter search space: the only model-specific knowledge the
+/// generic runner needs beyond the [`FoldEvaluator`]. Implementors enumerate
+/// every grid combination (`combinations`) and draw one seeded random
+/// configuration (`sample_one`); the runner owns the k-fold split, the
+/// rayon `(params × fold)` product, and deterministic result assembly.
+pub trait SearchSpace {
+    /// The concrete parameter type this space produces.
+    type Params: Clone + Send + Sync;
+
+    /// Every configuration in the grid, in a deterministic (nested-loop)
+    /// order. Empty iff some axis is empty.
+    fn combinations(&self) -> Vec<Self::Params>;
+
+    /// Draw one configuration, sampling each axis independently from `rng`.
+    fn sample_one(&self, rng: &mut StdRng) -> Self::Params;
+}
+
+impl SearchSpace for ParamGrid {
+    type Params = HyperParams;
+
+    fn combinations(&self) -> Vec<HyperParams> {
+        cartesian_product(self)
+    }
+
+    fn sample_one(&self, rng: &mut StdRng) -> HyperParams {
+        HyperParams {
+            alpha: *self.alpha.choose(rng).unwrap_or(&1.0),
+            beta: *self.beta.choose(rng).unwrap_or(&1.0),
+            lambda_: *self.lambda_.choose(rng).unwrap_or(&100.0),
+            meta_weight: *self.meta_weight.choose(rng).unwrap_or(&0.0),
+            decay_rate: *self.decay_rate.choose(rng).unwrap_or(&0.0),
+            ips_alpha: *self.ips_alpha.choose(rng).unwrap_or(&0.0),
+            sparsity_threshold: *self.sparsity_threshold.choose(rng).unwrap_or(&0.0),
+        }
+    }
+}
+
+impl SearchSpace for SasRecParamGrid {
+    type Params = SasRecParams;
+
+    fn combinations(&self) -> Vec<SasRecParams> {
+        let mut combos = Vec::new();
+        for &embedding_dim in &self.embedding_dim {
+            for &num_heads in &self.num_heads {
+                for &num_layers in &self.num_layers {
+                    for &dropout in &self.dropout {
+                        for &learning_rate in &self.learning_rate {
+                            for &num_epochs in &self.num_epochs {
+                                combos.push(SasRecParams {
+                                    embedding_dim,
+                                    num_heads,
+                                    num_layers,
+                                    dropout,
+                                    learning_rate,
+                                    num_epochs,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        combos
+    }
+
+    fn sample_one(&self, rng: &mut StdRng) -> SasRecParams {
+        SasRecParams {
+            embedding_dim: *self.embedding_dim.choose(rng).unwrap_or(&64),
+            num_heads: *self.num_heads.choose(rng).unwrap_or(&2),
+            num_layers: *self.num_layers.choose(rng).unwrap_or(&2),
+            dropout: *self.dropout.choose(rng).unwrap_or(&0.2),
+            learning_rate: *self.learning_rate.choose(rng).unwrap_or(&1e-3),
+            num_epochs: *self.num_epochs.choose(rng).unwrap_or(&50),
+        }
+    }
+}
+
+impl SearchSpace for TwoTowerParamGrid {
+    type Params = TwoTowerParams;
+
+    fn combinations(&self) -> Vec<TwoTowerParams> {
+        let mut combos = Vec::new();
+        for &embedding_dim in &self.embedding_dim {
+            for &temperature in &self.temperature {
+                for &learning_rate in &self.learning_rate {
+                    for &id_dropout in &self.id_dropout {
+                        combos.push(TwoTowerParams {
+                            embedding_dim,
+                            temperature,
+                            learning_rate,
+                            id_dropout,
+                        });
+                    }
+                }
+            }
+        }
+        combos
+    }
+
+    fn sample_one(&self, rng: &mut StdRng) -> TwoTowerParams {
+        TwoTowerParams {
+            embedding_dim: *self.embedding_dim.choose(rng).unwrap_or(&32),
+            temperature: *self.temperature.choose(rng).unwrap_or(&0.05),
+            learning_rate: *self.learning_rate.choose(rng).unwrap_or(&0.01),
+            id_dropout: *self.id_dropout.choose(rng).unwrap_or(&0.1),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -235,11 +423,194 @@ fn generate_kfold_splits(
 }
 
 // ---------------------------------------------------------------------------
-// Single trial evaluation
+// Fold evaluator trait
 // ---------------------------------------------------------------------------
 
-/// Train and evaluate a single parameter configuration on one fold.
+/// Trains a model on one fold's training split and scores it against that
+/// fold's held-out users, returning mean NDCG@k.
+///
+/// This is the only model-specific seam in the search: the cartesian
+/// product, k-fold split generation, parallel runner, and result assembly
+/// are all generic over `FoldEvaluator<P>`. EASE is [`EaseFoldEvaluator`]
+/// (`P = HyperParams`); SASRec is [`SasRecFoldEvaluator`]
+/// (`P = SasRecParams`) and Two-Tower is [`TwoTowerFoldEvaluator`]
+/// (`P = TwoTowerParams`).
+///
+/// Implementors must be `Send + Sync` so the rayon-parallelized
+/// `(params × fold)` work product can share one evaluator across threads.
+pub trait FoldEvaluator<P>: Send + Sync {
+    /// Train on `train_interactions_path` with `params`, then return mean
+    /// NDCG@`eval_k` over the users in `test_interactions_path`.
+    fn evaluate_fold(
+        &self,
+        train_interactions_path: &str,
+        test_interactions_path: &str,
+        params: &P,
+        eval_k: usize,
+    ) -> Result<f64>;
+}
+
+/// Scores a trained model against held-out test users via the
+/// [`RecModel`] trait and returns mean NDCG@k.
+///
+/// Shared by every [`FoldEvaluator`] so the ranking/exclusion/NDCG logic
+/// stays in one place. The model is reached as `&dyn RecModel`, so the
+/// same scoring path serves EASE, SASRec, and Two-Tower; each evaluator
+/// only differs in how it trains and what `ModelInput` it builds.
+///
+/// `make_input` lets the caller construct the per-user model input
+/// (EASE: `ModelInput::Sparse`; sequence/tower models: their own
+/// variants) from that user's training interactions and features.
+fn score_recmodel_over_test_users<F>(
+    model: &dyn RecModel,
+    train_user_items: &AHashMap<String, Vec<(usize, f64)>>,
+    test_user_items: &AHashMap<String, Vec<(usize, f64)>>,
+    user_features_map: &AHashMap<String, Vec<(usize, f64)>>,
+    eval_k: usize,
+    make_input: F,
+) -> Result<f64>
+where
+    F: for<'a> Fn(&'a [(usize, f64)], &'a [(usize, f64)]) -> ModelInput<'a>,
+{
+    let mut ndcg_sum = 0.0;
+    let mut n_users = 0;
+
+    for (user_id, test_items) in test_user_items {
+        if test_items.is_empty() {
+            continue;
+        }
+
+        let train_items: Vec<(usize, f64)> =
+            train_user_items.get(user_id).cloned().unwrap_or_default();
+        let user_feats: Vec<(usize, f64)> =
+            user_features_map.get(user_id).cloned().unwrap_or_default();
+
+        let scores = model.predict_scores(make_input(&train_items, &user_feats))?;
+        ndcg_sum += rank_and_ndcg(&scores, &train_items, test_items, eval_k);
+        n_users += 1;
+    }
+
+    if n_users == 0 {
+        return Ok(0.0);
+    }
+    Ok(ndcg_sum / n_users as f64)
+}
+
+/// Exclude already-seen training items, rank the catalog by score
+/// (descending), and return NDCG@k against the held-out test items.
+///
+/// Shared by every fold scorer so the ranking / exclusion / NDCG logic
+/// lives in one place regardless of how the model was fed.
+fn rank_and_ndcg(
+    scores: &[f32],
+    train_items: &[(usize, f64)],
+    test_items: &[(usize, f64)],
+    eval_k: usize,
+) -> f64 {
+    let train_item_set: ahash::AHashSet<usize> = train_items.iter().map(|(idx, _)| *idx).collect();
+    let mut ranked: Vec<(usize, f32)> = scores
+        .iter()
+        .copied()
+        .enumerate()
+        .filter(|(idx, _)| !train_item_set.contains(idx))
+        .collect();
+    ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let recommended: Vec<usize> = ranked.iter().map(|(idx, _)| *idx).collect();
+    let relevant: ahash::AHashSet<usize> = test_items.iter().map(|(idx, _)| *idx).collect();
+    ndcg_at_k(&recommended, &relevant, eval_k)
+}
+
+/// Two-Tower fold scorer: resolves each test user to its trained user-tower
+/// row by id and scores the catalog through `ModelInput::TowerUser`.
+///
+/// Two-Tower rejects `ModelInput::Sparse`, and its `TowerUser` variant
+/// borrows owned per-call slices that the `make_input` closure of
+/// [`score_recmodel_over_test_users`] cannot produce, so this is its
+/// dedicated scorer. The rank / exclusion / NDCG core is the shared
+/// [`rank_and_ndcg`]. A user absent from the trained mapping (unseen in
+/// this fold's train split) is scored cold-start (`user_idx = None`),
+/// which exercises the model's reserved cold-start row.
+#[cfg(feature = "ml-models")]
+fn score_two_tower_over_test_users(
+    model: &dyn RecModel,
+    train_user_items: &AHashMap<String, Vec<(usize, f64)>>,
+    test_user_items: &AHashMap<String, Vec<(usize, f64)>>,
+    eval_k: usize,
+) -> Result<f64> {
+    let user_to_idx = &model.item_mapping().user_to_idx;
+    let mut ndcg_sum = 0.0;
+    let mut n_users = 0;
+
+    for (user_id, test_items) in test_user_items {
+        if test_items.is_empty() {
+            continue;
+        }
+        let train_items: Vec<(usize, f64)> =
+            train_user_items.get(user_id).cloned().unwrap_or_default();
+        let user_idx = user_to_idx.get(user_id).copied();
+        let scores = model.predict_scores(ModelInput::TowerUser {
+            user_idx,
+            cat_features: &[],
+            dense_features: &[],
+        })?;
+        ndcg_sum += rank_and_ndcg(&scores, &train_items, test_items, eval_k);
+        n_users += 1;
+    }
+
+    if n_users == 0 {
+        return Ok(0.0);
+    }
+    Ok(ndcg_sum / n_users as f64)
+}
+
+// ---------------------------------------------------------------------------
+// EASE fold evaluator
+// ---------------------------------------------------------------------------
+
+/// EASE [`FoldEvaluator`]: builds X/U/T matrices via the data pipeline,
+/// trains a [`RustFeaseModel`], and scores users through the [`RecModel`]
+/// trait.
+///
+/// The numeric path is byte-identical to the pre-generalization
+/// `evaluate_trial`: EASE's closed-form `predict` is unchanged, and the
+/// only difference the trait introduces is the single `as f32` score
+/// cast in `EaseAdapter` (the same cast Phase 4a's eval already makes).
+/// `test_parallel_grid_search_matches_sequential` and
+/// `test_ease_search_matches_legacy_concrete` guard this within 1e-9.
+pub struct EaseFoldEvaluator {
+    pub user_features_path: String,
+    pub item_features_path: String,
+}
+
+impl FoldEvaluator<HyperParams> for EaseFoldEvaluator {
+    fn evaluate_fold(
+        &self,
+        train_interactions_path: &str,
+        test_interactions_path: &str,
+        params: &HyperParams,
+        eval_k: usize,
+    ) -> Result<f64> {
+        evaluate_trial(
+            train_interactions_path,
+            test_interactions_path,
+            &self.user_features_path,
+            &self.item_features_path,
+            params,
+            eval_k,
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Single trial evaluation (EASE)
+// ---------------------------------------------------------------------------
+
+/// Train and evaluate a single EASE parameter configuration on one fold.
 /// Returns mean NDCG@k across test users for the specified k.
+///
+/// Trains a [`RustFeaseModel`], wraps it in [`EaseAdapter`], and scores it
+/// through the shared `&dyn RecModel` path. EASE's closed-form prediction
+/// math is unchanged; the trait only adds the `as f32` output cast.
 fn evaluate_trial(
     train_interactions_path: &str,
     test_interactions_path: &str,
@@ -302,52 +673,203 @@ fn evaluate_trial(
     // 7. Build user features lookup
     let user_features_map = build_user_features_map(user_features_path, &model.mappings)?;
 
-    // 8. For each test user, predict and compute NDCG@k
-    let mut ndcg_sum = 0.0;
-    let mut n_users = 0;
+    // 8. Score every test user through the shared `&dyn RecModel` path.
+    //    EASE's `predict` math is unchanged; `EaseAdapter` only adds the
+    //    `as f32` output cast (guarded within 1e-9 by the determinism and
+    //    legacy-baseline tests).
+    let adapter = EaseAdapter::new(model);
+    score_recmodel_over_test_users(
+        &adapter,
+        &train_user_items,
+        &test_user_items,
+        &user_features_map,
+        eval_k,
+        |interactions, user_features| ModelInput::Sparse {
+            interactions,
+            user_features,
+        },
+    )
+}
 
-    for (user_id, test_items) in &test_user_items {
-        if test_items.is_empty() {
-            continue;
+// ---------------------------------------------------------------------------
+// SASRec fold evaluator (ml-models)
+// ---------------------------------------------------------------------------
+
+/// SASRec [`FoldEvaluator`]: builds left-padded causal sequences from the
+/// fold's training interactions, trains a burn `SasRec` for the trial's
+/// architecture/optimizer config, wraps it in [`TrainedSasRec`], and scores
+/// held-out users through the shared `&dyn RecModel` path.
+///
+/// SASRec is order-sensitive; the sequence builder requires a numeric
+/// `days_ago` column and orders each user's history chronologically. The
+/// eval harness passes per-user train items as `ModelInput::Sparse`, which
+/// [`TrainedSasRec`] accepts (treating the interaction indices as the
+/// user's history) so SASRec runs end-to-end through the same scorer EASE
+/// uses. `max_seq_len` is fixed per evaluator (not a tuned axis) so every
+/// trial sees the same sequence horizon.
+#[cfg(feature = "ml-models")]
+pub struct SasRecFoldEvaluator {
+    /// History length / positional-embedding cap shared by every trial.
+    pub max_seq_len: usize,
+    /// Mini-batch size for SGD (fixed; not a tuned axis).
+    pub batch_size: usize,
+    /// Early-stopping patience in epochs.
+    pub patience: usize,
+    /// Seed for the training loop (kept fixed so trials are comparable).
+    pub seed: u64,
+}
+
+#[cfg(feature = "ml-models")]
+impl Default for SasRecFoldEvaluator {
+    fn default() -> Self {
+        Self {
+            max_seq_len: 50,
+            batch_size: 16,
+            patience: 5,
+            seed: 42,
         }
-
-        // Get the user's training interactions (may be empty for cold-start users)
-        let train_items: Vec<(usize, f64)> =
-            train_user_items.get(user_id).cloned().unwrap_or_default();
-
-        // Get user features
-        let user_feats: Vec<(usize, f64)> =
-            user_features_map.get(user_id).cloned().unwrap_or_default();
-
-        // Predict scores for all items
-        let scores = model.predict(&train_items, &user_feats, params.beta);
-
-        // Build set of train items to exclude
-        let train_item_set: ahash::AHashSet<usize> =
-            train_items.iter().map(|(idx, _)| *idx).collect();
-
-        // Rank items by score, excluding train items
-        let mut ranked: Vec<(usize, f64)> = scores
-            .into_iter()
-            .enumerate()
-            .filter(|(idx, _)| !train_item_set.contains(idx))
-            .collect();
-        ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
-        let recommended: Vec<usize> = ranked.iter().map(|(idx, _)| *idx).collect();
-
-        // Relevant items = test items for this user
-        let relevant: ahash::AHashSet<usize> = test_items.iter().map(|(idx, _)| *idx).collect();
-
-        ndcg_sum += ndcg_at_k(&recommended, &relevant, eval_k);
-        n_users += 1;
     }
+}
 
-    if n_users == 0 {
-        return Ok(0.0);
+#[cfg(feature = "ml-models")]
+impl FoldEvaluator<SasRecParams> for SasRecFoldEvaluator {
+    fn evaluate_fold(
+        &self,
+        train_interactions_path: &str,
+        test_interactions_path: &str,
+        params: &SasRecParams,
+        eval_k: usize,
+    ) -> Result<f64> {
+        use crate::data::sequences::build_sequences;
+        use crate::models::sasrec::{
+            SasRecConfig, SasRecTrainingConfig, TrainedSasRec, train_sasrec,
+        };
+        use burn::backend::ndarray::NdArrayDevice;
+        use burn::backend::{Autodiff, NdArray};
+
+        let mappings = data_pipeline::build_interaction_mappings(train_interactions_path)?;
+        let dataset = build_sequences(train_interactions_path, &mappings, self.max_seq_len)?;
+
+        let vocab_size = mappings.idx_to_item.len() + 1;
+        let model_config = SasRecConfig::new(
+            vocab_size,
+            params.embedding_dim,
+            self.max_seq_len,
+            params.num_heads,
+            params.num_layers,
+        )
+        .with_dropout(params.dropout);
+        let train_config = SasRecTrainingConfig::new()
+            .with_num_epochs(params.num_epochs)
+            .with_batch_size(self.batch_size)
+            .with_learning_rate(params.learning_rate)
+            .with_patience(self.patience)
+            .with_seed(self.seed);
+
+        let device = NdArrayDevice::default();
+        let fitted = train_sasrec::<Autodiff<NdArray<f32>>>(
+            &model_config,
+            &train_config,
+            &dataset,
+            &device,
+        )?;
+        let trained = TrainedSasRec::new(fitted, model_config, mappings);
+
+        let train_df = read_interactions_df(train_interactions_path)?;
+        let train_user_items = group_user_items(&train_df, trained.item_mapping())?;
+        let test_df = read_interactions_df(test_interactions_path)?;
+        let test_user_items = group_user_items(&test_df, trained.item_mapping())?;
+        // No user-feature file in tuning; SASRec ignores user features.
+        let empty_user_feats: AHashMap<String, Vec<(usize, f64)>> = AHashMap::new();
+
+        score_recmodel_over_test_users(
+            &trained,
+            &train_user_items,
+            &test_user_items,
+            &empty_user_feats,
+            eval_k,
+            |interactions, _user_features| ModelInput::Sparse {
+                interactions,
+                user_features: &[],
+            },
+        )
     }
+}
 
-    Ok(ndcg_sum / n_users as f64)
+// ---------------------------------------------------------------------------
+// Two-Tower fold evaluator (ml-models)
+// ---------------------------------------------------------------------------
+
+/// Two-Tower [`FoldEvaluator`]: loads `(user, positive-item)` triples from
+/// the fold's training interactions (id-only — no side-feature files in the
+/// tuning surface), trains the in-batch sampled-softmax model for the
+/// trial's config, and scores held-out users through the dedicated
+/// [`score_two_tower_over_test_users`] path (Two-Tower needs
+/// `ModelInput::TowerUser`, which the generic `make_input` closure cannot
+/// build). Epochs / batch size are fixed per evaluator; the tuned axes are
+/// `embedding_dim`, `temperature`, `learning_rate`, and `id_dropout`.
+#[cfg(feature = "ml-models")]
+pub struct TwoTowerFoldEvaluator {
+    /// Training epochs (fixed; tuned axes are dim/temp/lr/id_dropout).
+    pub epochs: usize,
+    /// Mini-batch size for the sampled-softmax loss.
+    pub batch_size: usize,
+    /// Seed for the id-dropout RNG (kept fixed so trials are comparable).
+    pub seed: u64,
+}
+
+#[cfg(feature = "ml-models")]
+impl Default for TwoTowerFoldEvaluator {
+    fn default() -> Self {
+        Self {
+            epochs: 50,
+            batch_size: 256,
+            seed: 0,
+        }
+    }
+}
+
+#[cfg(feature = "ml-models")]
+impl FoldEvaluator<TwoTowerParams> for TwoTowerFoldEvaluator {
+    fn evaluate_fold(
+        &self,
+        train_interactions_path: &str,
+        test_interactions_path: &str,
+        params: &TwoTowerParams,
+        eval_k: usize,
+    ) -> Result<f64> {
+        use crate::data::triples::{FeatureTable, load_triples};
+        use crate::models::two_tower::{TrainParams, train};
+
+        let data = load_triples(train_interactions_path)?;
+        // Id-only model: tuning has no user/item feature files. Tables are
+        // sized to the embedding tables (users include the reserved
+        // cold-start row at index 0).
+        let user_ft = FeatureTable::empty(data.num_users());
+        let item_ft = FeatureTable::empty(data.num_items());
+
+        let trained = train(
+            &data,
+            &user_ft,
+            &item_ft,
+            TrainParams {
+                embedding_dim: params.embedding_dim,
+                temperature: params.temperature,
+                learning_rate: params.learning_rate,
+                epochs: self.epochs,
+                batch_size: self.batch_size,
+                id_dropout: params.id_dropout,
+                seed: self.seed,
+            },
+        )?;
+
+        let train_df = read_interactions_df(train_interactions_path)?;
+        let train_user_items = group_user_items(&train_df, trained.item_mapping())?;
+        let test_df = read_interactions_df(test_interactions_path)?;
+        let test_user_items = group_user_items(&test_df, trained.item_mapping())?;
+
+        score_two_tower_over_test_users(&trained, &train_user_items, &test_user_items, eval_k)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -368,13 +890,16 @@ fn evaluate_trial(
 /// - `all_trials` is sorted by `trial_idx` before returning;
 /// - `best_params` is the highest `mean_score`, ties broken on the lowest
 ///   `trial_idx`, so the result is independent of execution order.
-fn run_trials_parallel(
-    configs: &[HyperParams],
+fn run_trials_parallel<P, E>(
+    evaluator: &E,
+    configs: &[P],
     fold_paths: &[(String, String)],
-    user_features_path: &str,
-    item_features_path: &str,
     eval_k: usize,
-) -> Result<SearchResult> {
+) -> Result<SearchResult<P>>
+where
+    P: Clone + Send + Sync,
+    E: FoldEvaluator<P>,
+{
     let total = configs.len();
     let n_folds = fold_paths.len();
 
@@ -392,14 +917,8 @@ fn run_trials_parallel(
         .par_iter()
         .map(|&(trial_idx, fold_idx)| -> Result<(usize, usize, f64)> {
             let (train_path, test_path) = &fold_paths[fold_idx];
-            let score = evaluate_trial(
-                train_path,
-                test_path,
-                user_features_path,
-                item_features_path,
-                &configs[trial_idx],
-                eval_k,
-            )?;
+            let score =
+                evaluator.evaluate_fold(train_path, test_path, &configs[trial_idx], eval_k)?;
             Ok((trial_idx, fold_idx, score))
         })
         .collect::<Result<Vec<_>>>()?;
@@ -411,7 +930,7 @@ fn run_trials_parallel(
     // per-trial groups in ascending `trial_idx` order.
     fold_results.sort_by_key(|&(trial_idx, fold_idx, _)| (trial_idx, fold_idx));
 
-    let indexed: Vec<(usize, TrialResult)> = fold_results
+    let indexed: Vec<(usize, TrialResult<P>)> = fold_results
         .chunks(n_folds)
         .enumerate()
         .map(|(trial_idx, chunk)| {
@@ -420,19 +939,16 @@ fn run_trials_parallel(
             let mean_score = fold_scores.iter().sum::<f64>() / fold_scores.len() as f64;
 
             log::info!(
-                "Trial {}/{}: alpha={}, beta={}, lambda_={} -> NDCG@{}={:.4}",
+                "Trial {}/{} -> NDCG@{}={:.4}",
                 trial_idx + 1,
                 total,
-                configs[trial_idx].alpha,
-                configs[trial_idx].beta,
-                configs[trial_idx].lambda_,
                 eval_k,
                 mean_score
             );
 
             (
                 trial_idx,
-                TrialResult {
+                TrialResult::<P> {
                     params: configs[trial_idx].clone(),
                     mean_score,
                     fold_scores,
@@ -454,7 +970,7 @@ fn run_trials_parallel(
         }
     }
 
-    let all_trials: Vec<TrialResult> = indexed.into_iter().map(|(_, trial)| trial).collect();
+    let all_trials: Vec<TrialResult<P>> = indexed.into_iter().map(|(_, trial)| trial).collect();
 
     Ok(SearchResult {
         best_params,
@@ -468,21 +984,25 @@ fn run_trials_parallel(
 // Grid search
 // ---------------------------------------------------------------------------
 
-/// Grid search: evaluates all combinations of parameters in the grid.
+/// Generic grid search over any [`FoldEvaluator`].
 ///
-/// The `(params × fold)` trials run in parallel via rayon's global pool
-/// (ADR-0002 Phase 1). The result is deterministic for a fixed `seed` and
-/// grid regardless of thread count: see [`run_trials_parallel`].
-pub fn grid_search(
+/// Generates k-fold splits from `interactions_path`, then runs every
+/// grid combination across all folds in parallel via the shared
+/// [`run_trials_parallel`] runner. Model-specific training/scoring is
+/// entirely delegated to `evaluator`.
+pub fn grid_search_with<S, E>(
+    evaluator: &E,
     interactions_path: &str,
-    user_features_path: &str,
-    item_features_path: &str,
-    grid: &ParamGrid,
+    grid: &S,
     n_folds: usize,
     eval_k: usize,
     seed: u64,
-) -> Result<SearchResult> {
-    let combos = cartesian_product(grid);
+) -> Result<SearchResult<S::Params>>
+where
+    S: SearchSpace,
+    E: FoldEvaluator<S::Params>,
+{
+    let combos = grid.combinations();
     let total = combos.len();
     if total == 0 {
         return Err(anyhow!("Parameter grid produced 0 combinations"));
@@ -496,13 +1016,30 @@ pub fn grid_search(
     // Generate k-fold splits once
     let (_tmp_dir, fold_paths) = generate_kfold_splits(interactions_path, n_folds, seed)?;
 
-    run_trials_parallel(
-        &combos,
-        &fold_paths,
-        user_features_path,
-        item_features_path,
-        eval_k,
-    )
+    run_trials_parallel(evaluator, &combos, &fold_paths, eval_k)
+}
+
+/// EASE grid search: evaluates all combinations of parameters in the grid.
+///
+/// The `(params × fold)` trials run in parallel via rayon's global pool
+/// (ADR-0002 Phase 1). The result is deterministic for a fixed `seed` and
+/// grid regardless of thread count: see [`run_trials_parallel`]. This is a
+/// thin wrapper over [`grid_search_with`] using [`EaseFoldEvaluator`], kept
+/// so the existing EASE call sites and determinism guard are unchanged.
+pub fn grid_search(
+    interactions_path: &str,
+    user_features_path: &str,
+    item_features_path: &str,
+    grid: &ParamGrid,
+    n_folds: usize,
+    eval_k: usize,
+    seed: u64,
+) -> Result<SearchResult> {
+    let evaluator = EaseFoldEvaluator {
+        user_features_path: user_features_path.to_string(),
+        item_features_path: item_features_path.to_string(),
+    };
+    grid_search_with(&evaluator, interactions_path, grid, n_folds, eval_k, seed)
 }
 
 // ---------------------------------------------------------------------------
@@ -514,17 +1051,26 @@ pub fn grid_search(
 /// Config sampling stays sequential so the sampled set is a deterministic
 /// function of `seed`; the resulting `(params × fold)` trials run in parallel
 /// via rayon's global pool (ADR-0002 Phase 1). See [`run_trials_parallel`].
+/// Generic random search over any [`FoldEvaluator`].
+///
+/// Config sampling stays sequential so the sampled set is a deterministic
+/// function of `seed`; the resulting `(params × fold)` trials run in
+/// parallel via the shared runner. Model-specific training/scoring is
+/// delegated to `evaluator`.
 #[allow(clippy::too_many_arguments)]
-pub fn random_search(
+pub fn random_search_with<S, E>(
+    evaluator: &E,
     interactions_path: &str,
-    user_features_path: &str,
-    item_features_path: &str,
-    grid: &ParamGrid,
+    grid: &S,
     n_trials: usize,
     n_folds: usize,
     eval_k: usize,
     seed: u64,
-) -> Result<SearchResult> {
+) -> Result<SearchResult<S::Params>>
+where
+    S: SearchSpace,
+    E: FoldEvaluator<S::Params>,
+{
     if n_trials == 0 {
         return Err(anyhow!("n_trials must be >= 1"));
     }
@@ -538,24 +1084,41 @@ pub fn random_search(
     let mut rng = StdRng::seed_from_u64(seed.wrapping_add(1));
     let mut sampled_configs = Vec::with_capacity(n_trials);
     for _ in 0..n_trials {
-        let params = HyperParams {
-            alpha: *grid.alpha.choose(&mut rng).unwrap_or(&1.0),
-            beta: *grid.beta.choose(&mut rng).unwrap_or(&1.0),
-            lambda_: *grid.lambda_.choose(&mut rng).unwrap_or(&100.0),
-            meta_weight: *grid.meta_weight.choose(&mut rng).unwrap_or(&0.0),
-            decay_rate: *grid.decay_rate.choose(&mut rng).unwrap_or(&0.0),
-            ips_alpha: *grid.ips_alpha.choose(&mut rng).unwrap_or(&0.0),
-            sparsity_threshold: *grid.sparsity_threshold.choose(&mut rng).unwrap_or(&0.0),
-        };
-        sampled_configs.push(params);
+        sampled_configs.push(grid.sample_one(&mut rng));
     }
 
-    run_trials_parallel(
-        &sampled_configs,
-        &fold_paths,
-        user_features_path,
-        item_features_path,
+    run_trials_parallel(evaluator, &sampled_configs, &fold_paths, eval_k)
+}
+
+/// EASE random search: samples n_trials random parameter configurations
+/// from the grid.
+///
+/// Thin wrapper over [`random_search_with`] using [`EaseFoldEvaluator`],
+/// kept so existing EASE call sites and the determinism guard are
+/// unchanged. See [`random_search_with`] for determinism details.
+#[allow(clippy::too_many_arguments)]
+pub fn random_search(
+    interactions_path: &str,
+    user_features_path: &str,
+    item_features_path: &str,
+    grid: &ParamGrid,
+    n_trials: usize,
+    n_folds: usize,
+    eval_k: usize,
+    seed: u64,
+) -> Result<SearchResult> {
+    let evaluator = EaseFoldEvaluator {
+        user_features_path: user_features_path.to_string(),
+        item_features_path: item_features_path.to_string(),
+    };
+    random_search_with(
+        &evaluator,
+        interactions_path,
+        grid,
+        n_trials,
+        n_folds,
         eval_k,
+        seed,
     )
 }
 
@@ -870,6 +1433,183 @@ mod tests {
         Ok(())
     }
 
+    /// Legacy EASE fold evaluation: trains a `RustFeaseModel` and scores
+    /// test users through the *concrete f64* `predict` path, exactly as
+    /// `evaluate_trial` did before the `FoldEvaluator`/`RecModel`
+    /// generalization (issue #39). No `EaseAdapter`, no `as f32` cast.
+    /// This is the byte-for-byte reference the generalized EASE search
+    /// must reproduce within float-cast tolerance.
+    fn legacy_concrete_evaluate_trial(
+        train_interactions_path: &str,
+        test_interactions_path: &str,
+        user_features_path: &str,
+        item_features_path: &str,
+        params: &HyperParams,
+        eval_k: usize,
+    ) -> Result<f64> {
+        let weighting =
+            if params.decay_rate > 0.0 || params.ips_alpha > 0.0 || params.sparsity_threshold > 0.0
+            {
+                Some(WeightingConfig {
+                    event_weights: None,
+                    decay_rate: params.decay_rate,
+                    ips_alpha: params.ips_alpha,
+                    sparsity_threshold: params.sparsity_threshold,
+                })
+            } else {
+                None
+            };
+
+        let (x_mat, u_mat, t_mat, mappings) = data_pipeline::build_matrices(
+            train_interactions_path,
+            user_features_path,
+            item_features_path,
+            weighting.as_ref(),
+        )?;
+
+        let mut model = RustFeaseModel::new(
+            x_mat.cols(),
+            u_mat.cols(),
+            t_mat.rows(),
+            params.alpha,
+            params.beta,
+            params.lambda_,
+            params.meta_weight,
+            mappings,
+        );
+        model.train(&x_mat, &u_mat, &t_mat)?;
+        if params.sparsity_threshold > 0.0 {
+            model.prune_sparse(params.sparsity_threshold);
+        }
+
+        let train_df = read_interactions_df(train_interactions_path)?;
+        let train_user_items = group_user_items(&train_df, &model.mappings)?;
+        let test_df = read_interactions_df(test_interactions_path)?;
+        let test_user_items = group_user_items(&test_df, &model.mappings)?;
+        let user_features_map = build_user_features_map(user_features_path, &model.mappings)?;
+
+        let mut ndcg_sum = 0.0;
+        let mut n_users = 0;
+        for (user_id, test_items) in &test_user_items {
+            if test_items.is_empty() {
+                continue;
+            }
+            let train_items: Vec<(usize, f64)> =
+                train_user_items.get(user_id).cloned().unwrap_or_default();
+            let user_feats: Vec<(usize, f64)> =
+                user_features_map.get(user_id).cloned().unwrap_or_default();
+            // Concrete f64 path -- no RecModel, no f32 cast.
+            let scores = model.predict(&train_items, &user_feats, params.beta);
+            let train_item_set: ahash::AHashSet<usize> =
+                train_items.iter().map(|(idx, _)| *idx).collect();
+            let mut ranked: Vec<(usize, f64)> = scores
+                .into_iter()
+                .enumerate()
+                .filter(|(idx, _)| !train_item_set.contains(idx))
+                .collect();
+            ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            let recommended: Vec<usize> = ranked.iter().map(|(idx, _)| *idx).collect();
+            let relevant: ahash::AHashSet<usize> = test_items.iter().map(|(idx, _)| *idx).collect();
+            ndcg_sum += ndcg_at_k(&recommended, &relevant, eval_k);
+            n_users += 1;
+        }
+        if n_users == 0 {
+            return Ok(0.0);
+        }
+        Ok(ndcg_sum / n_users as f64)
+    }
+
+    /// Regression guard (issue #39): generalizing EASE search over the
+    /// `FoldEvaluator`/`RecModel` traits must not change EASE results.
+    /// Compares `grid_search` (now routed through `EaseFoldEvaluator` ->
+    /// `EaseAdapter`) against the legacy concrete f64 evaluation for a
+    /// fixed seed and grid. The only permitted difference is the single
+    /// `as f32` score cast the adapter introduces; tolerance is 1e-9,
+    /// far below any value that could flip `best_params` (same bound the
+    /// Phase 4a eval baseline guard uses).
+    #[test]
+    fn test_ease_search_matches_legacy_concrete() -> Result<()> {
+        let (i_path, u_path, t_path, _tmpdir) = create_test_dataset()?;
+
+        let grid = ParamGrid {
+            alpha: vec![0.5, 1.0],
+            beta: vec![1.0],
+            lambda_: vec![10.0, 100.0, 500.0],
+            meta_weight: vec![0.0],
+            decay_rate: vec![0.0],
+            ips_alpha: vec![0.0],
+            sparsity_threshold: vec![0.0],
+        };
+        let n_folds = 2;
+        let eval_k = 10;
+        let seed = 42;
+
+        let generalized = grid_search(&i_path, &u_path, &t_path, &grid, n_folds, eval_k, seed)?;
+
+        // Legacy concrete baseline: same fold splits, same combos, same
+        // sequential order, but the pre-#39 direct f64 scoring path.
+        let combos = cartesian_product(&grid);
+        let (_tmp_dir, fold_paths) = generate_kfold_splits(&i_path, n_folds, seed)?;
+        let mut legacy_trials = Vec::with_capacity(combos.len());
+        let mut legacy_best_score = f64::NEG_INFINITY;
+        let mut legacy_best = combos[0].clone();
+        for params in &combos {
+            let mut fold_scores = Vec::with_capacity(n_folds);
+            for (tr, te) in &fold_paths {
+                fold_scores.push(legacy_concrete_evaluate_trial(
+                    tr, te, &u_path, &t_path, params, eval_k,
+                )?);
+            }
+            let mean = fold_scores.iter().sum::<f64>() / fold_scores.len() as f64;
+            if mean > legacy_best_score {
+                legacy_best_score = mean;
+                legacy_best = params.clone();
+            }
+            legacy_trials.push((params.clone(), mean, fold_scores));
+        }
+
+        const TOL: f64 = 1e-9;
+        // Decision output must be identical.
+        assert_eq!(generalized.best_params.alpha, legacy_best.alpha);
+        assert_eq!(generalized.best_params.beta, legacy_best.beta);
+        assert_eq!(generalized.best_params.lambda_, legacy_best.lambda_);
+        assert!(
+            (generalized.best_score - legacy_best_score).abs() < TOL,
+            "generalized best_score {} vs legacy concrete {}",
+            generalized.best_score,
+            legacy_best_score
+        );
+        // Per-trial scores must match the legacy concrete path within the
+        // f32-cast tolerance, in cartesian-product order.
+        assert_eq!(generalized.all_trials.len(), legacy_trials.len());
+        for (idx, (g, (_, l_mean, l_folds))) in generalized
+            .all_trials
+            .iter()
+            .zip(legacy_trials.iter())
+            .enumerate()
+        {
+            assert!(
+                (g.mean_score - l_mean).abs() < TOL,
+                "trial {} mean_score: generalized {} vs legacy {}",
+                idx,
+                g.mean_score,
+                l_mean
+            );
+            for (f, (gf, lf)) in g.fold_scores.iter().zip(l_folds.iter()).enumerate() {
+                assert!(
+                    (gf - lf).abs() < TOL,
+                    "trial {} fold {} score: generalized {} vs legacy {}",
+                    idx,
+                    f,
+                    gf,
+                    lf
+                );
+            }
+        }
+
+        Ok(())
+    }
+
     /// Sequential baseline mirroring the pre-parallel `for params { for fold }`
     /// evaluation order. Used to assert the rayon `grid_search` produces a
     /// bit-identical `SearchResult` (ADR-0002 Phase 1 acceptance gate).
@@ -1019,6 +1759,198 @@ mod tests {
             }
         }
 
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // SASRec / Two-Tower end-to-end search (ml-models)
+    // -----------------------------------------------------------------------
+
+    /// A small interactions-only dataset with a `days_ago` column so the
+    /// SASRec sequence builder can order each user's history. `n_users`
+    /// users each with `per_user` chronologically-spaced interactions over
+    /// `n_items` items; every user has >= 2 in-catalog items so no user is
+    /// dropped from a fold's train split.
+    #[cfg(feature = "ml-models")]
+    fn make_seq_dataset(
+        n_users: usize,
+        n_items: usize,
+        per_user: usize,
+    ) -> Result<(String, tempfile::TempDir)> {
+        let tmp = tempfile::tempdir()?;
+        let mut u = Vec::new();
+        let mut it = Vec::new();
+        let mut v = Vec::new();
+        let mut days = Vec::new();
+        for ui in 0..n_users {
+            for k in 0..per_user {
+                u.push(format!("u{}", ui));
+                it.push(format!("i{}", (ui + k) % n_items));
+                v.push(1.0_f64);
+                // Larger days_ago == older; strictly decreasing per user.
+                days.push((per_user - k) as f64);
+            }
+        }
+        let mut df = df!(
+            "user_id" => u,
+            "item_id" => it,
+            "value" => v,
+            "days_ago" => days,
+        )?;
+        let path = create_parquet_in(tmp.path(), "seq.parquet", &mut df)?;
+        Ok((path, tmp))
+    }
+
+    /// SASRec hyperparameter search runs end-to-end: a small real grid +
+    /// k-fold CV trains the burn model per (params × fold) through
+    /// `SasRecFoldEvaluator` and produces best params/score with the EASE
+    /// result shape. Exercises the genuine architecture schema
+    /// (embedding_dim / num_heads / num_layers / dropout / learning_rate /
+    /// num_epochs), not a placeholder.
+    #[cfg(feature = "ml-models")]
+    #[test]
+    fn test_sasrec_grid_search_end_to_end() -> Result<()> {
+        let (i_path, _tmp) = make_seq_dataset(12, 6, 5)?;
+
+        let grid = SasRecParamGrid {
+            embedding_dim: vec![8, 16],
+            num_heads: vec![2],
+            num_layers: vec![1],
+            dropout: vec![0.0],
+            learning_rate: vec![1e-2],
+            num_epochs: vec![3],
+        };
+        let evaluator = SasRecFoldEvaluator {
+            max_seq_len: 8,
+            batch_size: 8,
+            patience: 3,
+            seed: 7,
+        };
+
+        let result = grid_search_with(&evaluator, &i_path, &grid, 2, 5, 42)?;
+
+        // 2 embedding-dim values × 1 each other axis = 2 trials.
+        assert_eq!(result.all_trials.len(), 2);
+        assert_eq!(result.metric_name, "ndcg@5");
+        for trial in &result.all_trials {
+            assert_eq!(trial.fold_scores.len(), 2, "2-fold CV");
+            assert!(trial.mean_score.is_finite());
+            assert!((0.0..=1.0).contains(&trial.mean_score));
+        }
+        // best_score is the max over trials and one of the configs ran.
+        let max = result
+            .all_trials
+            .iter()
+            .map(|t| t.mean_score)
+            .fold(f64::NEG_INFINITY, f64::max);
+        assert!((result.best_score - max).abs() < 1e-12);
+        assert!([8usize, 16].contains(&result.best_params.embedding_dim));
+        Ok(())
+    }
+
+    /// SASRec random search draws `n_trials` configs from the schema and
+    /// runs each through the real evaluator end-to-end.
+    #[cfg(feature = "ml-models")]
+    #[test]
+    fn test_sasrec_random_search_end_to_end() -> Result<()> {
+        let (i_path, _tmp) = make_seq_dataset(12, 6, 5)?;
+
+        let grid = SasRecParamGrid {
+            embedding_dim: vec![8, 16],
+            num_heads: vec![2],
+            num_layers: vec![1, 2],
+            dropout: vec![0.0, 0.1],
+            learning_rate: vec![1e-2],
+            num_epochs: vec![3],
+        };
+        let evaluator = SasRecFoldEvaluator {
+            max_seq_len: 8,
+            batch_size: 8,
+            patience: 3,
+            seed: 1,
+        };
+
+        let n_trials = 3;
+        let result = random_search_with(&evaluator, &i_path, &grid, n_trials, 2, 5, 42)?;
+        assert_eq!(result.all_trials.len(), n_trials);
+        assert_eq!(result.metric_name, "ndcg@5");
+        for trial in &result.all_trials {
+            assert_eq!(trial.fold_scores.len(), 2);
+            assert!(trial.mean_score.is_finite());
+        }
+        Ok(())
+    }
+
+    /// Two-Tower hyperparameter search runs end-to-end: a small real grid
+    /// + k-fold CV trains the in-batch sampled-softmax model per
+    /// (params × fold) through `TwoTowerFoldEvaluator` and produces best
+    /// params/score with the EASE result shape. Exercises the genuine
+    /// schema (embedding_dim / temperature / learning_rate / id_dropout).
+    #[cfg(feature = "ml-models")]
+    #[test]
+    fn test_two_tower_grid_search_end_to_end() -> Result<()> {
+        // Two-Tower doesn't need `days_ago`; reuse the seq dataset (extra
+        // column is ignored by the triple loader).
+        let (i_path, _tmp) = make_seq_dataset(12, 6, 5)?;
+
+        let grid = TwoTowerParamGrid {
+            embedding_dim: vec![8, 16],
+            temperature: vec![0.05],
+            learning_rate: vec![0.05],
+            id_dropout: vec![0.0],
+        };
+        let evaluator = TwoTowerFoldEvaluator {
+            epochs: 10,
+            batch_size: 16,
+            seed: 0,
+        };
+
+        let result = grid_search_with(&evaluator, &i_path, &grid, 2, 5, 42)?;
+
+        assert_eq!(result.all_trials.len(), 2);
+        assert_eq!(result.metric_name, "ndcg@5");
+        for trial in &result.all_trials {
+            assert_eq!(trial.fold_scores.len(), 2);
+            assert!(trial.mean_score.is_finite());
+            assert!((0.0..=1.0).contains(&trial.mean_score));
+        }
+        let max = result
+            .all_trials
+            .iter()
+            .map(|t| t.mean_score)
+            .fold(f64::NEG_INFINITY, f64::max);
+        assert!((result.best_score - max).abs() < 1e-12);
+        assert!([8usize, 16].contains(&result.best_params.embedding_dim));
+        Ok(())
+    }
+
+    /// Two-Tower random search draws `n_trials` configs from the schema
+    /// and runs each through the real evaluator end-to-end.
+    #[cfg(feature = "ml-models")]
+    #[test]
+    fn test_two_tower_random_search_end_to_end() -> Result<()> {
+        let (i_path, _tmp) = make_seq_dataset(12, 6, 5)?;
+
+        let grid = TwoTowerParamGrid {
+            embedding_dim: vec![8, 16],
+            temperature: vec![0.05, 0.1],
+            learning_rate: vec![0.05],
+            id_dropout: vec![0.0, 0.2],
+        };
+        let evaluator = TwoTowerFoldEvaluator {
+            epochs: 10,
+            batch_size: 16,
+            seed: 0,
+        };
+
+        let n_trials = 3;
+        let result = random_search_with(&evaluator, &i_path, &grid, n_trials, 2, 5, 42)?;
+        assert_eq!(result.all_trials.len(), n_trials);
+        assert_eq!(result.metric_name, "ndcg@5");
+        for trial in &result.all_trials {
+            assert_eq!(trial.fold_scores.len(), 2);
+            assert!(trial.mean_score.is_finite());
+        }
         Ok(())
     }
 }

@@ -216,12 +216,17 @@ def test_predict_batch(model):
     batch_results = model.predict_batch(users, top_k=4)
     assert len(batch_results) == 3
 
-    # Compare with sequential predictions
+    # Compare with sequential predictions. predict_batch routes through the
+    # model-agnostic RecModel path, whose score contract is f32 (so EASE,
+    # SASRec, and Two-Tower share one batch path); single-user predict still
+    # returns the concrete f64 scores. The item *ranking* is identical; the
+    # only difference is the single f32 score round-trip, so scores are
+    # compared at the documented f32 tolerance rather than f64-exact.
     for user, batch_recs in zip(users, batch_results):
         seq_recs = model.predict(user["interactions"], user["features"], top_k=4)
         for (bg, bs), (sg, ss) in zip(batch_recs, seq_recs):
             assert bg == sg
-            assert abs(bs - ss) < 1e-10
+            assert abs(bs - ss) < 1e-6
 
 
 def test_validate_data():
