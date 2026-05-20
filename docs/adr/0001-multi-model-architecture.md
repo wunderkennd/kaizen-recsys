@@ -226,8 +226,7 @@ links the remaining phases to tracking issues. The ADR is now **Accepted**:
 the scaffolding it proposed (Phase 1) and the first model's forward pass
 (Phase 2) are merged on `main`, validating the design.
 
-Live phase status is tracked in tracking issue #21. The current snapshot
-(Phases 1–6 merged; Phase 7 docs pass remaining) is recorded there;
+Live phase status is tracked in tracking issue #21;
 status changes go through that issue rather than this ADR.
 
 Note: PR #32 also added the borrowing `EaseAdapterRef` (zero-copy eval),
