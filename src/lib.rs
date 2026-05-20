@@ -2080,7 +2080,10 @@ fn _native(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_function(wrap_pyfunction!(sasrec_py::build_and_train_sasrec, m)?)?;
         m.add_function(wrap_pyfunction!(sasrec_py::load_sasrec_model, m)?)?;
         m.add_class::<sasrec_py::SASRecModel>()?;
-        m.add_function(wrap_pyfunction!(two_tower_py::build_and_train_two_tower, m)?)?;
+        m.add_function(wrap_pyfunction!(
+            two_tower_py::build_and_train_two_tower,
+            m
+        )?)?;
         m.add_function(wrap_pyfunction!(two_tower_py::load_two_tower_model, m)?)?;
         m.add_class::<two_tower_py::TwoTowerModel>()?;
     }
