@@ -85,6 +85,9 @@ evaluation, tuning, and serving layers are model-agnostic (they operate on
 
 Which models the architecture targets, and the order they are introduced, are
 described in ADR-0001; the corresponding work is tracked in GitHub Issues.
+For a side-by-side of what each model assumes about your data, how each handles
+cold-start, and rough hyperparameter starting points, see
+[`docs/guides/model-comparison.md`](docs/guides/model-comparison.md).
 
 ## Building and Using the Python Library
 
@@ -285,9 +288,92 @@ for item_guid, score in similar:
     print(f"  {item_guid}: {score:.4f}")
 ```
 
+## SASRec Usage
+
+SASRec is a self-attentive sequential model for next-item prediction. It
+is compiled only when the extension is built with `--features ml-models`
+(EASE-only wheels skip it). The interactions Parquet/CSV **must**
+include a numeric `days_ago` column — SASRec is order-sensitive and the
+data path fails loudly without it.
+
+```python
+import kzn_recsys as fease
+
+assert fease._HAS_ML_MODELS, "build with `maturin develop --features ml-models`"
+
+model = fease.build_and_train_sasrec(
+    interactions_path="interactions.parquet",  # user_id, item_id, value, days_ago
+    embedding_dim=64,
+    max_seq_len=50,
+    num_heads=2,
+    num_layers=2,
+    dropout=0.2,
+    num_epochs=50,
+    batch_size=16,
+    learning_rate=1e-3,
+    patience=5,
+    seed=42,
+)
+
+# Predict next items given a chronological history (oldest first).
+# Unknown item ids in history are silently skipped.
+recs = model.predict(["GEXU12345", "GR9W56789", "GAB7P0001"], top_k=10)
+for item_id, score in recs:
+    print(f"  {item_id}: {score:.4f}")
+
+# Item-embedding cosine similarity ("more like this").
+similar = model.predict_similar_items("GEXU12345", top_k=10)
+
+# Save / load (framed `FSAS` format).
+model.save("sasrec.fsat")
+loaded = fease.load_sasrec_model("sasrec.fsat")
+```
+
+## Two-Tower Usage
+
+Two-Tower is a dual-tower retrieval model with separate user / item
+encoders. Compiled only with `--features ml-models`. Optional long-format
+user / item feature files are routed into categorical embeddings
+(one-hot rows) and dense MLPs (numeric rows). A reserved cold-start user
+row at index 0 is trained via `id_dropout` to act as a learned
+average-user prior (ADR-0001).
+
+```python
+import kzn_recsys as fease
+
+assert fease._HAS_ML_MODELS
+
+model = fease.build_and_train_two_tower(
+    interactions_path="interactions.parquet",        # user_id, item_id, value
+    user_features_path="user_features.parquet",      # optional
+    item_features_path="item_features.parquet",      # optional
+    embedding_dim=32,
+    temperature=0.05,
+    learning_rate=0.01,
+    epochs=50,
+    batch_size=256,
+    id_dropout=0.1,
+    seed=42,
+)
+
+# Warm user — uses their learned id-row embedding.
+recs = model.predict("u_warm", top_k=10)
+
+# Unknown user — silently falls back to the reserved cold-start row.
+# (Predict-time arbitrary user features are not yet supported.)
+recs_cold = model.predict("u_brand_new", top_k=10)
+
+similar = model.predict_similar_items("GEXU12345", top_k=10)
+
+model.save("two_tower.ftwo")
+loaded = fease.load_two_tower_model("two_tower.ftwo")
+```
+
 ## Territory-Aware Model Registry
 
-Maintain multiple trained models keyed by territory/region:
+Maintain multiple trained models keyed by territory/region. The registry
+is generic over `&dyn RecModel`, so EASE, SASRec, and Two-Tower models
+can coexist in the same registry behind the Rust trait.
 
 ```python
 registry = fease.FeaseRegistry()
@@ -305,6 +391,12 @@ recs = registry.predict_top_k("US", interactions, features, top_k=10)
 # List registered territories
 print(registry.territories())  # ["US", "BR"]
 ```
+
+The Python `FeaseRegistry.register()` / `predict_top_k()` surface
+currently takes EASE-shaped inputs (a sparse interactions dict + a
+features dict); routing trained `SASRecModel` / `TwoTowerModel`
+instances through the same registry from Python is a follow-up. The
+Rust-side registry already accepts any `RecModel` via `register_model()`.
 
 ## Evaluation Pipeline
 
@@ -438,6 +530,57 @@ print(f"Best NDCG@20: {result['best_score']:.4f}")
 for trial in result["trials"][:5]:
     print(f"  Score={trial['mean_score']:.4f}, params={trial['params']}")
 ```
+
+### Per-Model Search (EASE / SASRec / Two-Tower)
+
+`grid_search` / `random_search` above target EASE; the
+`*_ease` / `*_sasrec` / `*_two_tower` functions take each model's own
+hyperparameter grid and run real per-model training under k-fold CV.
+All return the same result dict shape (`best_params`, `best_score`,
+`metric`, `trials`). SASRec / Two-Tower require `--features ml-models`.
+
+```python
+# Same as `grid_search` above (EASE), under the new name.
+result = fease.grid_search_ease(
+    interactions_path="interactions.parquet",
+    user_features_path="user_features.parquet",
+    item_features_path="item_features.parquet",
+    param_grid={"alpha": [0.5, 1.0], "beta": [0.5, 1.0], "lambda_": [50.0, 150.0]},
+    n_folds=3, eval_k=10, seed=42,
+)
+
+# SASRec grid (interactions must carry `days_ago`).
+result = fease.grid_search_sasrec(
+    interactions_path="interactions.parquet",
+    param_grid={
+        "embedding_dim": [32, 64],
+        "num_heads": [2],
+        "num_layers": [2],
+        "dropout": [0.1, 0.2],
+        "learning_rate": [1e-3],
+        "num_epochs": [10],
+    },
+    n_folds=3, eval_k=10, seed=42,
+)
+
+# Two-Tower grid (optional feature paths).
+result = fease.grid_search_two_tower(
+    interactions_path="interactions.parquet",
+    user_features_path="user_features.parquet",   # optional
+    item_features_path="item_features.parquet",   # optional
+    param_grid={
+        "embedding_dim": [16, 32],
+        "temperature": [0.05, 0.1],
+        "learning_rate": [0.01],
+        "id_dropout": [0.1, 0.2],
+    },
+    n_folds=3, eval_k=10, seed=42,
+)
+```
+
+`random_search_ease` / `random_search_sasrec` / `random_search_two_tower`
+mirror the same parameter shape, taking an additional `n_trials` and
+sampling uniformly from each list of candidate values.
 
 ## Data Quality Validation
 
