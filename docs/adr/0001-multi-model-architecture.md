@@ -226,16 +226,9 @@ links the remaining phases to tracking issues. The ADR is now **Accepted**:
 the scaffolding it proposed (Phase 1) and the first model's forward pass
 (Phase 2) are merged on `main`, validating the design.
 
-| Phase | Status | Reference |
-|-------|--------|-----------|
-| 1 — `RecModel` trait + `models/ease.rs` adapter | ✅ Merged | `src/models/{mod,ease}.rs` (`RecModel`, `ModelKind`, `ModelInput`, `EaseAdapter`/`EaseAdapterRef`) |
-| 2 — `ml-models` feature gate + minimal SASRec forward | ✅ Merged | PR #33 (`src/models/sasrec.rs`) |
-| 3 — SASRec training loop + `data/sequences.rs` + Python smoke test | ⬜ Open | #36 |
-| 4 — generalize `evaluate_model` to `&dyn RecModel`; add `SASRecModel` PyO3 class | ◐ Partial | eval generalization merged in PR #32; `SASRecModel` PyO3 class tracked in #37 |
-| 5 — Two-Tower model + `data/triples.rs` + dense feature loader | ⬜ Open | #38 |
-| 6 — generalize `tuning` + `serving` registry; per-model PyO3 search | ⬜ Open | #39 |
-| 7 — docs pass (`CLAUDE.md`, `README.md`, model-comparison guide) | ⬜ Open | #40 |
+Live phase status is tracked in tracking issue #21;
+status changes go through that issue rather than this ADR.
 
 Note: PR #32 also added the borrowing `EaseAdapterRef` (zero-copy eval),
 and ADR-0002 Phase 1 (PR #34) parallelized tuning internally — orthogonal
-to the Phase 6 trait generalization tracked in #39.
+to the Phase 6 trait generalization (PR #52).
