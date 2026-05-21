@@ -1706,7 +1706,7 @@ mod sasrec_py {
             Ok(result)
         }
 
-        /// Persist the model to `path` (framed `FSAT` format).
+        /// Persist the model to `path` (framed `FSAS` format).
         fn save(&self, path: String) -> PyResult<()> {
             self.model
                 .save(Path::new(&path))
@@ -1825,6 +1825,229 @@ mod sasrec_py {
     }
 }
 
+/// Two-Tower Python wrapper. Compiled only with the `ml-models` feature
+/// because the underlying model depends on `burn`.
+///
+/// Training inputs are the same long-format Parquet/CSV files as EASE
+/// (`user_id`, `item_id`, `value` for interactions; long-format user /
+/// item feature tables). Predict-time inputs are limited to a string
+/// user id: warm users use their learned id embedding, unknown users
+/// fall back to the reserved cold-start row that id-dropout trains as a
+/// learned average-user prior (ADR-0001, PR #46). Predict-time arbitrary
+/// user features are not currently supported — the trained model does
+/// not persist a feature-name → category-index map.
+#[cfg(feature = "ml-models")]
+mod two_tower_py {
+    use super::*;
+    use crate::data::triples::{FeatureTable, load_features, load_triples};
+    use crate::models::two_tower::{TrainParams, TrainedTwoTower, train};
+    use crate::models::{ModelInput, RecModel};
+
+    /// A trained Two-Tower model, callable from Python.
+    #[pyclass]
+    pub struct TwoTowerModel {
+        model: TrainedTwoTower,
+        #[pyo3(get)]
+        num_items: usize,
+        #[pyo3(get)]
+        num_users: usize,
+    }
+
+    #[pymethods]
+    impl TwoTowerModel {
+        /// Score recommendations for `user_id`.
+        ///
+        /// Warm users (id seen in training) use their learned id-row
+        /// embedding. Unknown users transparently fall back to the
+        /// reserved cold-start row. Items the user already interacted
+        /// with in training are *not* excluded — Two-Tower has no
+        /// access to a user's full history at predict time.
+        ///
+        /// Args:
+        ///     user_id (str): String user id.
+        ///     top_k (int): Number of recommendations to return.
+        ///
+        /// Returns:
+        ///     list[tuple[str, float]]: (item_id, score), descending.
+        #[pyo3(signature = (user_id, top_k=100))]
+        fn predict<'py>(
+            &self,
+            py: Python<'py>,
+            user_id: &str,
+            top_k: usize,
+        ) -> PyResult<Bound<'py, PyList>> {
+            let user_idx = self.model.item_mapping().user_to_idx.get(user_id).copied();
+            let scores = self
+                .model
+                .predict_scores(ModelInput::TowerUser {
+                    user_idx,
+                    cat_features: &[],
+                    dense_features: &[],
+                })
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+
+            let mut ranked: Vec<(usize, f32)> = scores.into_iter().enumerate().collect();
+            ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+            let out = PyList::empty(py);
+            let map = self.model.item_mapping();
+            for (idx, score) in ranked.into_iter().take(top_k) {
+                if let Some(guid) = map.idx_to_item.get(idx) {
+                    out.append((PyString::new(py, guid), PyFloat::new(py, score as f64)))?;
+                }
+            }
+            Ok(out)
+        }
+
+        /// Top-K items most similar to `item_id` by item-embedding score.
+        #[pyo3(signature = (item_id, top_k=20))]
+        fn predict_similar_items<'py>(
+            &self,
+            py: Python<'py>,
+            item_id: &str,
+            top_k: usize,
+        ) -> PyResult<Bound<'py, PyList>> {
+            let out = PyList::empty(py);
+            let map = self.model.item_mapping();
+            let Some(&idx) = map.item_to_idx.get(item_id) else {
+                return Ok(out);
+            };
+            let sim = self
+                .model
+                .predict_similar_items(idx, top_k)
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            for (i, score) in sim {
+                if let Some(guid) = map.idx_to_item.get(i) {
+                    out.append((PyString::new(py, guid), PyFloat::new(py, score as f64)))?;
+                }
+            }
+            Ok(out)
+        }
+
+        /// Self-check the model state. Returns `(passed, messages)`.
+        fn validate<'py>(&self, py: Python<'py>) -> PyResult<(bool, Bound<'py, PyList>)> {
+            let report = self.model.validate();
+            Ok((report.passed, PyList::new(py, &report.messages)?))
+        }
+
+        /// Persist the model to `path` (framed `FTWO` format).
+        fn save(&self, path: String) -> PyResult<()> {
+            self.model
+                .save_to(Path::new(&path))
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))
+        }
+    }
+
+    /// Train a Two-Tower model from a long-format interactions file plus
+    /// optional user/item feature files.
+    ///
+    /// Args:
+    ///     interactions_path (str): Parquet/CSV with `user_id`, `item_id`,
+    ///         optional `value` (rows with `value <= 0` are skipped).
+    ///     user_features_path (str, optional): Long-format user features
+    ///         (`user_id`, `feature_name`, `value`). One-hot-only feature
+    ///         names route through the categorical embedding; others
+    ///         become a dense vector.
+    ///     item_features_path (str, optional): Same shape, with `item_id`.
+    ///     embedding_dim, temperature, learning_rate, epochs, batch_size,
+    ///         id_dropout, seed: training hyperparameters.
+    ///
+    /// Returns:
+    ///     TwoTowerModel
+    #[pyfunction]
+    #[pyo3(signature = (
+        interactions_path,
+        user_features_path = None,
+        item_features_path = None,
+        embedding_dim = 32,
+        temperature = 0.05,
+        learning_rate = 0.01,
+        epochs = 50,
+        batch_size = 256,
+        id_dropout = 0.1,
+        seed = 0,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_and_train_two_tower(
+        interactions_path: String,
+        user_features_path: Option<String>,
+        item_features_path: Option<String>,
+        embedding_dim: usize,
+        temperature: f64,
+        learning_rate: f64,
+        epochs: usize,
+        batch_size: usize,
+        id_dropout: f64,
+        seed: u64,
+    ) -> PyResult<TwoTowerModel> {
+        let data = load_triples(&interactions_path)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?;
+
+        let user_ft = match user_features_path {
+            Some(p) => load_features(&p, "user_id", &data.user_to_idx, data.num_users())
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?,
+            None => FeatureTable::empty(data.num_users()),
+        };
+        let item_ft = match item_features_path {
+            Some(p) => load_features(&p, "item_id", &data.item_to_idx, data.num_items())
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?,
+            None => FeatureTable::empty(data.num_items()),
+        };
+
+        let params = TrainParams {
+            embedding_dim,
+            temperature,
+            learning_rate,
+            epochs,
+            batch_size,
+            id_dropout,
+            seed,
+        };
+
+        let trained = train(&data, &user_ft, &item_ft, params)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+
+        let report = trained.validate();
+        if !report.passed {
+            let msg = format!(
+                "Two-Tower model validation failed:\n{}",
+                report.messages.join("\n")
+            );
+            return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(msg));
+        }
+
+        let num_items = RecModel::num_items(&trained);
+        let num_users = data.num_users();
+        Ok(TwoTowerModel {
+            model: trained,
+            num_items,
+            num_users,
+        })
+    }
+
+    /// Load a Two-Tower model previously written by `TwoTowerModel.save`.
+    #[pyfunction]
+    pub fn load_two_tower_model(path: String) -> PyResult<TwoTowerModel> {
+        let model = TrainedTwoTower::load_from(Path::new(&path))
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
+        let report = model.validate();
+        if !report.passed {
+            let msg = format!(
+                "Loaded Two-Tower model failed validation:\n{}",
+                report.messages.join("\n")
+            );
+            return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(msg));
+        }
+        let num_items = RecModel::num_items(&model);
+        let num_users = model.item_mapping().idx_to_user.len();
+        Ok(TwoTowerModel {
+            model,
+            num_items,
+            num_users,
+        })
+    }
+}
+
 /// Defines the Python module.
 /// This function is called when Python runs `import kzn_recsys._native`.
 #[pymodule]
@@ -1857,6 +2080,12 @@ fn _native(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_function(wrap_pyfunction!(sasrec_py::build_and_train_sasrec, m)?)?;
         m.add_function(wrap_pyfunction!(sasrec_py::load_sasrec_model, m)?)?;
         m.add_class::<sasrec_py::SASRecModel>()?;
+        m.add_function(wrap_pyfunction!(
+            two_tower_py::build_and_train_two_tower,
+            m
+        )?)?;
+        m.add_function(wrap_pyfunction!(two_tower_py::load_two_tower_model, m)?)?;
+        m.add_class::<two_tower_py::TwoTowerModel>()?;
     }
 
     Ok(())
