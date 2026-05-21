@@ -552,6 +552,8 @@ result = fease.grid_search_ease(
 # SASRec grid (interactions must carry `days_ago`).
 result = fease.grid_search_sasrec(
     interactions_path="interactions.parquet",
+    user_features_path="user_features.parquet",
+    item_features_path="item_features.parquet",
     param_grid={
         "embedding_dim": [32, 64],
         "num_heads": [2],
