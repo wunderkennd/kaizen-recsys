@@ -221,13 +221,8 @@ first.
 ## Amendment — 2026-05-16 (implementation status)
 
 The original decision and phased-rollout table above are retained unchanged
-as the historical record. This note tracks what has actually landed and
-links the remaining phases to tracking issues. The ADR is now **Accepted**:
-the scaffolding it proposed (Phase 1) and the first model's forward pass
-(Phase 2) are merged on `main`, validating the design.
-
-Live phase status is tracked in tracking issue #21;
-status changes go through that issue rather than this ADR.
+as the historical record. The ADR is **Accepted** and the rollout is
+complete; tracking issue #21 is closed.
 
 Note: PR #32 also added the borrowing `EaseAdapterRef` (zero-copy eval),
 and ADR-0002 Phase 1 (PR #34) parallelized tuning internally — orthogonal

@@ -1,6 +1,6 @@
 # ADR-0002: Training and tuning parallelism
 
-- **Status**: Proposed
+- **Status**: Accepted
 - **Date**: 2026-05-14
 - **Deciders**: project maintainers
 - **Supersedes**: —
