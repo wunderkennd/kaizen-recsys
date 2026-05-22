@@ -734,8 +734,17 @@ fn build_and_train(
 /// A Python-accessible registry for territory-based multi-model routing.
 ///
 /// This wraps the Rust `FeaseModelRegistry`, allowing Python callers to register
-/// multiple trained `FeaseModel` instances (one per territory/region) and route
-/// predictions to the correct model based on a territory key.
+/// trained EASE / SASRec / Two-Tower models (one per territory/region) and route
+/// predictions to the correct model based on a territory key (#56).
+///
+/// Note on `fallback_territory` + per-model predict (#56): the fallback
+/// is resolved purely by territory key, not by model kind. If the
+/// registered fallback's kind doesn't match the `predict_top_k_*`
+/// method being called, the call errors with the same kind-mismatch
+/// message you'd get on a directly-registered mismatch (e.g. calling
+/// `predict_top_k_sasrec("JP", ...)` when "JP" is unknown and the
+/// fallback "US" holds an EASE model). The error message points at the
+/// correct method for the actual model kind, so callers can recover.
 ///
 /// Example:
 ///     >>> registry = FeaseRegistry(fallback_territory="US")
@@ -917,6 +926,12 @@ impl FeaseRegistry {
     /// longer have to map `dict[str, float]` to integer indices by
     /// hand. The existing index-based `predict_top_k` is preserved for
     /// back-compat.
+    ///
+    /// Scores are routed through the `RecModel` trait, whose contract is
+    /// f32 — so output values differ from a direct `FeaseModel.predict`
+    /// call (which keeps EASE math in f64) by sub-ulp rounding (~1e-7).
+    /// Ranking is unaffected; never compare scores bit-exact across the
+    /// two surfaces.
     ///
     /// Errors:
     ///     ValueError: territory is unknown, or the registered model
