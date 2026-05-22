@@ -32,8 +32,8 @@ helps you pick.
 | Determinism guarantee | Byte-identical across runs (ADR-0002 §"Decision" #1) | Seedable; not byte-identical (BLAS / Adam moment-order) | Seedable; not byte-identical |
 | Persisted format magic bytes | `FEAS` (v1/v2) | `FSAS` | `FTWO` |
 | Hyperparameter search | `kzn_recsys.grid_search` / `grid_search_ease` / `random_search` / `random_search_ease` | `grid_search_sasrec` / `random_search_sasrec` | `grid_search_two_tower` / `random_search_two_tower` |
-| Python predict-time inputs | `interactions: dict[str, float]`, `features: dict[str, float]` | `history: list[str]` (chronological, oldest first) | `user_id: str` (warm by lookup, unknown → cold-start row) |
-| Predict-time side features | Yes (per-call user features) | n/a | **Not yet** — predict only takes a user id |
+| Python predict-time inputs | `interactions: dict[str, float]`, `features: dict[str, float]` | `history: list[str]` (chronological, oldest first) | `user_id: str` + optional `features: dict[str, float]` |
+| Predict-time side features | Yes (per-call user features) | n/a | Yes — categorical / dense features routed via maps persisted at train time (#55) |
 
 ## Data shape
 
@@ -74,11 +74,12 @@ discards chronology, so reported metrics are a lower bound — tracked in
 suitable for ANN retrieval, and where you have rich user/item features
 you want the model to encode separately. Wins when: you have many
 features that don't fit EASE's "long-format ID" shape cleanly (e.g.,
-dense continuous features), or you want decoupled user/item encoders.
-Loses when: you need predict-time arbitrary user features (not yet
-supported — see Python wrapper docs in [README](../../README.md#two-tower-usage)),
-or when warm users have very strong direct co-purchase signals that
-EASE captures more cheaply.
+dense continuous features), or you want decoupled user/item encoders,
+or you specifically need cold-start with predict-time side info — the
+trained model persists feature-name → index maps so
+`predict(user_id, features=...)` combines fresh feature values with the
+learned cold-start prior (#55). Loses when warm users have very strong
+direct co-purchase signals that EASE captures more cheaply.
 
 ## Mixing models
 

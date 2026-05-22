@@ -176,8 +176,12 @@ and learns an average-user prior (PR #46).
   arbitrary side features.
 - *SASRec*: empty history → no recommendation (model is sequence-only).
 - *Two-Tower*: unknown user ids fall back to the reserved cold-start row.
-  Predict-time arbitrary user features are not yet supported (the
-  trained model does not persist a feature-name → index map).
+  Predict-time arbitrary user features (`predict(user_id, features=...)`)
+  are routed through the user-feature-name → category-index / dense-
+  column maps persisted on the trained model (file format v5, #55), so
+  a cold-start user with informative side info combines its features
+  with the learned cold-start prior instead of falling back to the bare
+  prior. Unknown feature names are silently skipped.
 
 **Evaluation pipeline.** Three split strategies (random, temporal,
 leave-K-out) produce train/test Parquet files. The evaluation harness is

@@ -157,3 +157,70 @@ def test_train_without_features(tmp_path):
     recs = model.predict("u0", top_k=2)
     assert isinstance(recs, list)
     assert len(recs) == 2
+
+
+# ---------------------------------------------------------------------------
+# #55: predict-time arbitrary user features
+# ---------------------------------------------------------------------------
+
+
+def test_predict_features_arg_is_optional(trained_two_tower):
+    """Bare call with no `features` keeps the existing behavior."""
+    model, _ = trained_two_tower
+    recs_no_features = model.predict("u0", top_k=4)
+    recs_empty_features = model.predict("u0", features={}, top_k=4)
+    # Same ranking — empty dict is equivalent to no dict.
+    assert [r[0] for r in recs_no_features] == [r[0] for r in recs_empty_features]
+
+
+def test_predict_unknown_feature_names_are_skipped(trained_two_tower):
+    """Unknown feature names are silently dropped, not an error."""
+    model, _ = trained_two_tower
+    recs = model.predict(
+        "brand_new_user",
+        features={"never_seen": 1.0, "totally_made_up": 99.0},
+        top_k=3,
+    )
+    assert isinstance(recs, list)
+    assert len(recs) == 3
+
+
+def test_predict_cold_start_with_features_differs_from_bare(trained_two_tower):
+    """#55 acceptance: a cold-start user with informative features should
+    produce a different ranking than the bare cold-start row."""
+    model, _ = trained_two_tower
+    bare = model.predict("brand_new_user", top_k=4)
+    with_feature = model.predict(
+        "brand_new_user",
+        features={"plan_premium": 1.0},
+        top_k=4,
+    )
+    bare_scores = [s for _, s in bare]
+    with_feature_scores = [s for _, s in with_feature]
+    # Same items in both (the catalog is the same), but at least one
+    # score must differ — the categorical feature embedding has been
+    # combined into the user vector.
+    score_diff = max(
+        abs(a - b) for a, b in zip(bare_scores, with_feature_scores)
+    )
+    assert score_diff > 1e-6, (
+        f"cold-start with feature should differ from bare; max diff = {score_diff}"
+    )
+
+
+def test_save_load_roundtrip_preserves_feature_maps(trained_two_tower):
+    """Save/load must preserve the user-feature maps so features work
+    after a round-trip (#55 acceptance)."""
+    model, tmp = trained_two_tower
+    path = Path(tmp) / "two_tower_v5.ftwo"
+    model.save(str(path))
+    loaded = fease.load_two_tower_model(str(path))
+
+    features = {"plan_premium": 1.0}
+    before = model.predict("brand_new_user", features=features, top_k=4)
+    after = loaded.predict("brand_new_user", features=features, top_k=4)
+    # Item rankings must match byte-for-byte across save/load.
+    assert [r[0] for r in before] == [r[0] for r in after]
+    # Scores match to within model-output float tolerance.
+    for (_, sb), (_, sa) in zip(before, after):
+        assert abs(sb - sa) < 1e-5

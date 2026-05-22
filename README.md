@@ -360,8 +360,16 @@ model = fease.build_and_train_two_tower(
 recs = model.predict("u_warm", top_k=10)
 
 # Unknown user — silently falls back to the reserved cold-start row.
-# (Predict-time arbitrary user features are not yet supported.)
 recs_cold = model.predict("u_brand_new", top_k=10)
+
+# Cold-start user with predict-time features: categorical (`==1.0`) names
+# route to the matching category embedding; numeric names go to the
+# matching dense column. Unknown feature names are silently skipped.
+recs_with_features = model.predict(
+    "u_brand_new",
+    features={"plan_premium": 1.0, "tenure_days": 42.0},
+    top_k=10,
+)
 
 similar = model.predict_similar_items("GEXU12345", top_k=10)
 
