@@ -66,15 +66,25 @@ type Dev = burn::backend::ndarray::NdArrayDevice;
 const MAGIC: &[u8; 4] = b"FTWO";
 /// Framed format version for Two-Tower files.
 ///
+/// v5 persists the `feature_name → categorical-index` and
+/// `feature_name → dense-column` maps for the user side (#55), enabling
+/// `TwoTowerModel.predict(user_id, features=...)` to translate
+/// predict-time string feature names into the integer indices the model
+/// expects. v4 files have no such maps; loading a v4 file with v5 code
+/// is rejected with a "retrain required" error because (a) we couldn't
+/// know the original feature names and (b) silently mapping no features
+/// at predict time would be a silent regression for callers that expect
+/// the v5 surface to work.
+///
 /// v4 reserves user embedding row 0 as a learnable cold-start prior and
 /// shifts real users to `1..=N`, growing the user id table by one row and
 /// renumbering every user index. A v3 (or earlier) param blob is
 /// structurally incompatible — its user table is one row short and its
 /// indices are off by one, and the cold-start row it lacks can only be
 /// obtained by *training* (id-dropout), not by any in-place migration.
-/// `load_from` therefore rejects pre-v4 files loudly with a "retrain
+/// `load_from` therefore rejects pre-v5 files loudly with a "retrain
 /// required" error rather than silently mis-mapping users.
-const FORMAT_VERSION: u32 = 4;
+const FORMAT_VERSION: u32 = 5;
 
 /// Construction-time hyperparameters for [`TwoTower`].
 #[derive(Config, Debug)]
@@ -371,6 +381,19 @@ struct TwoTowerMeta {
     /// the catalog item matrix without re-reading the feature file.
     item_cat: Vec<Vec<usize>>,
     item_dense: Vec<Vec<f32>>,
+    /// User-side feature-name → categorical-slot map, in train-time
+    /// first-seen order (#55). Lets `predict(user_id, features=...)`
+    /// translate predict-time string feature names into the integer
+    /// indices the user tower expects. Empty when no user feature file
+    /// was provided at training. Uses `std::collections::HashMap` for
+    /// the persisted form (ahash lacks serde derives without an opt-in
+    /// feature); lookup happens once per `predict` call, so the slight
+    /// overhead vs `AHashMap` is irrelevant.
+    #[serde(default)]
+    user_cat_feature_to_idx: std::collections::HashMap<String, usize>,
+    /// User-side feature-name → dense-column map (#55).
+    #[serde(default)]
+    user_dense_feature_to_idx: std::collections::HashMap<String, usize>,
 }
 
 /// A trained, ready-to-serve Two-Tower model on the CPU `NdArray` backend.
@@ -671,6 +694,16 @@ fn finalize(
         idx_to_item: data.idx_to_item.clone(),
         item_cat: item_ft.cat.clone(),
         item_dense: item_ft.dense.clone(),
+        user_cat_feature_to_idx: user_ft
+            .cat_feature_to_idx
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect(),
+        user_dense_feature_to_idx: user_ft
+            .dense_feature_to_idx
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect(),
     };
 
     let item_matrix = catalog_matrix(&model, &meta, device);
@@ -717,6 +750,47 @@ fn catalog_matrix(model: &TwoTower<InfB>, meta: &TwoTowerMeta, device: &Dev) -> 
 }
 
 impl TrainedTwoTower {
+    /// Translate a `feature_name → value` map (e.g. from a Python
+    /// `dict[str, float]`) into the integer (`cat_features`,
+    /// `dense_features`) pair the user tower expects (#55).
+    ///
+    /// - **Categorical features:** if `feature_name` was registered as
+    ///   categorical at train time and `value` is non-zero, the slot's
+    ///   index is appended to `cat_features`. The categorical embedding
+    ///   is an "is present" signal in the user tower — the value's
+    ///   magnitude is otherwise unused, mirroring the one-hot semantics
+    ///   `data::triples::load_features` infers at train time.
+    /// - **Dense features:** if `feature_name` was registered as dense,
+    ///   `value` is written into the matching dense column. Columns for
+    ///   features not in the map stay at zero.
+    /// - **Unknown features:** silently skipped (no error), so callers
+    ///   can pass a single `dict` covering multiple model variants.
+    ///
+    /// Returns the empty `(vec![], vec![0.0; dense_dim])` pair when the
+    /// trained model has no user-feature maps (model trained without a
+    /// user feature file), which preserves the bare cold-start path.
+    pub fn resolve_user_features(
+        &self,
+        features: &AHashMap<String, f64>,
+    ) -> (Vec<usize>, Vec<f32>) {
+        let dense_dim = self.meta.user_dense_dim;
+        let mut cat_features: Vec<usize> = Vec::new();
+        let mut dense_features: Vec<f32> = vec![0.0; dense_dim];
+        for (name, value) in features {
+            if let Some(&cat_idx) = self.meta.user_cat_feature_to_idx.get(name) {
+                if *value != 0.0 {
+                    cat_features.push(cat_idx);
+                }
+            } else if let Some(&col) = self.meta.user_dense_feature_to_idx.get(name)
+                && col < dense_dim
+            {
+                dense_features[col] = *value as f32;
+            }
+            // Unknown feature names: skip silently.
+        }
+        (cat_features, dense_features)
+    }
+
     /// Serialize to the framed `FTWO || version || bincode(meta) ||
     /// params` format (research §4, mirrors `serialization.rs`).
     pub fn save_to(&self, path: &Path) -> Result<()> {
@@ -754,10 +828,13 @@ impl TrainedTwoTower {
         if version < FORMAT_VERSION {
             anyhow::bail!(
                 "Two-Tower model file {} is format v{version}, but this build \
-                 requires v{FORMAT_VERSION}. v{FORMAT_VERSION} reserves a \
-                 learnable cold-start user row and renumbers all user \
-                 indices; older files cannot be migrated in place. Retrain \
-                 the model to upgrade.",
+                 requires v{FORMAT_VERSION}. v5 persists the user-side \
+                 feature-name → index maps (#55) that v4 discarded — they \
+                 can't be reconstructed without retraining since the train-\
+                 time feature names aren't recorded anywhere else. v4 \
+                 itself reserves a learnable cold-start user row and \
+                 renumbers all user indices vs v3. Retrain the model to \
+                 upgrade.",
                 path.display()
             );
         }
@@ -1318,10 +1395,11 @@ mod tests {
         }
     }
 
-    /// Loading a pre-v4 (older format) file must fail loudly with a
-    /// retrain message rather than silently mis-mapping users.
+    /// Loading a pre-current (older format) file must fail loudly with a
+    /// retrain message rather than silently mis-mapping users / missing
+    /// the user-feature maps.
     #[test]
-    fn rejects_pre_v4_format_with_retrain_error() {
+    fn rejects_old_format_with_retrain_error() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("old.fease");
         // Minimal v3 frame: MAGIC + version=3 + empty meta + empty params.
@@ -1334,7 +1412,7 @@ mod tests {
 
         let res = TrainedTwoTower::load_from(&path);
         let err = match res {
-            Ok(_) => panic!("pre-v4 file must not load"),
+            Ok(_) => panic!("old-format file must not load"),
             Err(e) => e,
         };
         let msg = format!("{err}");
@@ -1342,6 +1420,70 @@ mod tests {
             msg.contains("Retrain") || msg.contains("retrain"),
             "expected a retrain-required error, got: {msg}"
         );
-        assert!(msg.contains("v3") && msg.contains("v4"), "got: {msg}");
+        assert!(
+            msg.contains("v3") && msg.contains(&format!("v{FORMAT_VERSION}")),
+            "got: {msg}"
+        );
+    }
+
+    /// #55: `resolve_user_features` translates a string `feature_name →
+    /// value` dict into the integer `(cat_features, dense_features)`
+    /// pair the user tower expects. This unit test exercises the helper
+    /// directly so we cover one-hot routing, dense routing, unknown
+    /// names, and zero-value categoricals without needing the full
+    /// Python predict path.
+    #[test]
+    fn resolve_user_features_routes_cat_dense_and_skips_unknown() {
+        // Build a tiny FeatureTable with one categorical slot ("plan_free")
+        // and one dense column ("tenure_days"). The data has 3 users +
+        // the reserved cold-start row, with feature row populated only
+        // for user index 1.
+        let mut uft = FeatureTable::empty(4);
+        uft.num_categories = 1;
+        uft.dense_dim = 1;
+        uft.cat_feature_to_idx.insert("plan_free".into(), 0);
+        uft.dense_feature_to_idx.insert("tenure_days".into(), 0);
+        uft.cat[1] = vec![0];
+        uft.dense[1] = vec![10.0];
+        let (data, _, ift) = tiny_data();
+        let trained = train(
+            &data,
+            &uft,
+            &ift,
+            TrainParams {
+                embedding_dim: 4,
+                epochs: 1,
+                batch_size: 6,
+                ..TrainParams::default()
+            },
+        )
+        .expect("train");
+
+        // Categorical with non-zero value → cat_features carries its idx.
+        let mut f = ahash::AHashMap::new();
+        f.insert("plan_free".to_string(), 1.0);
+        let (cat, dense) = trained.resolve_user_features(&f);
+        assert_eq!(cat, vec![0]);
+        assert_eq!(dense, vec![0.0]);
+
+        // Categorical with zero value → omitted.
+        let mut f = ahash::AHashMap::new();
+        f.insert("plan_free".to_string(), 0.0);
+        let (cat, _dense) = trained.resolve_user_features(&f);
+        assert!(cat.is_empty(), "zero-valued cat should be skipped");
+
+        // Dense feature → written into the matching column.
+        let mut f = ahash::AHashMap::new();
+        f.insert("tenure_days".to_string(), 42.0);
+        let (cat, dense) = trained.resolve_user_features(&f);
+        assert!(cat.is_empty());
+        assert_eq!(dense, vec![42.0]);
+
+        // Unknown name → silently skipped (no panic, no error).
+        let mut f = ahash::AHashMap::new();
+        f.insert("never_seen".to_string(), 99.0);
+        let (cat, dense) = trained.resolve_user_features(&f);
+        assert!(cat.is_empty());
+        assert_eq!(dense, vec![0.0]);
     }
 }

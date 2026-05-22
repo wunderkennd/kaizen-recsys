@@ -1863,26 +1863,56 @@ mod two_tower_py {
         /// with in training are *not* excluded — Two-Tower has no
         /// access to a user's full history at predict time.
         ///
+        /// When `features` is supplied, each entry is matched against the
+        /// user-feature maps captured at training time (#55):
+        /// - One-hot/categorical features (`{"plan_free": 1.0}`) add the
+        ///   slot's categorical-embedding to the user vector.
+        /// - Dense numeric features (`{"tenure_days": 42.0}`) write into
+        ///   the matching dense column.
+        /// - Feature names unknown to the model are silently skipped.
+        ///
+        /// For cold-start users (unknown `user_id`), this is how to
+        /// combine the learned cold-start prior with the new user's
+        /// side info instead of falling back to the bare cold-start row.
+        ///
         /// Args:
         ///     user_id (str): String user id.
+        ///     features (dict[str, float], optional): Predict-time
+        ///         user features. See above for routing rules.
         ///     top_k (int): Number of recommendations to return.
         ///
         /// Returns:
         ///     list[tuple[str, float]]: (item_id, score), descending.
-        #[pyo3(signature = (user_id, top_k=100))]
+        #[pyo3(signature = (user_id, features=None, top_k=100))]
         fn predict<'py>(
             &self,
             py: Python<'py>,
             user_id: &str,
+            features: Option<&Bound<'_, PyDict>>,
             top_k: usize,
         ) -> PyResult<Bound<'py, PyList>> {
             let user_idx = self.model.item_mapping().user_to_idx.get(user_id).copied();
+
+            // Translate predict-time string features through the
+            // user-feature maps persisted on the trained model.
+            let (cat_features, dense_features) = if let Some(d) = features {
+                let mut map: ahash::AHashMap<String, f64> = ahash::AHashMap::new();
+                for (k, v) in d.iter() {
+                    let name: String = k.extract()?;
+                    let value: f64 = v.extract()?;
+                    map.insert(name, value);
+                }
+                self.model.resolve_user_features(&map)
+            } else {
+                (Vec::new(), Vec::new())
+            };
+
             let scores = self
                 .model
                 .predict_scores(ModelInput::TowerUser {
                     user_idx,
-                    cat_features: &[],
-                    dense_features: &[],
+                    cat_features: &cat_features,
+                    dense_features: &dense_features,
                 })
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
 
