@@ -92,6 +92,21 @@ pub trait RecModel: Send + Sync {
     /// Persist the model to disk. Phase 1 routes to the existing EASE
     /// serializer; Phases 3 and 5 add per-model magic bytes.
     fn save(&self, path: &Path) -> Result<()>;
+
+    /// Translate a `feature_name → value` map into the integer
+    /// `(cat_features, dense_features)` pair the model expects in
+    /// `ModelInput::TowerUser` (#55 / #56).
+    ///
+    /// Default returns the empty pair — only Two-Tower currently uses
+    /// the feature embedding tables at predict time. Lets the
+    /// `FeaseModelRegistry` route `predict_top_k_two_tower` through
+    /// `&dyn RecModel` without downcasting to a concrete type.
+    fn resolve_user_features(
+        &self,
+        _features: &ahash::AHashMap<String, f64>,
+    ) -> (Vec<usize>, Vec<f32>) {
+        (Vec::new(), Vec::new())
+    }
 }
 
 #[cfg(test)]

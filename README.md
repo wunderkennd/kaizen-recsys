@@ -389,22 +389,46 @@ registry = fease.FeaseRegistry()
 # Or with a fallback for unknown territories:
 registry = fease.FeaseRegistry(fallback_territory="US")
 
-# Register models per territory
-registry.register("US", us_model)
-registry.register("BR", br_model)
+# Register models per territory — one method per model family so the
+# inputs each model expects are explicit in the call site.
+registry.register("US", ease_model)               # EASE
+registry.register_sasrec("UK", sasrec_model)      # SASRec    (needs ml-models)
+registry.register_two_tower("BR", two_tower_model)  # Two-Tower (needs ml-models)
 
-# Route predictions to the correct model
-recs = registry.predict_top_k("US", interactions, features, top_k=10)
-
-# List registered territories
-print(registry.territories())  # ["US", "BR"]
+print(registry.territories())  # ["US", "UK", "BR"]
 ```
 
-The Python `FeaseRegistry.register()` / `predict_top_k()` surface
-currently takes EASE-shaped inputs (a sparse interactions dict + a
-features dict); routing trained `SASRecModel` / `TwoTowerModel`
-instances through the same registry from Python is a follow-up. The
-Rust-side registry already accepts any `RecModel` via `register_model()`.
+Predict via the per-model methods. Each takes the same input shape as
+the standalone model's `.predict` method, so callers don't have to know
+the underlying integer indices:
+
+```python
+# EASE: sparse interactions + features (dict[str, float]).
+recs = registry.predict_top_k_ease(
+    "US",
+    interactions={"GEXU12345": 4.5, "GR9W56789": 3.2},
+    features={"device_Mobile": 1.0, "plan_Premium": 1.0},
+    top_k=10,
+)
+
+# SASRec: chronological history (list[str], oldest first).
+recs = registry.predict_top_k_sasrec("UK", history=["A", "B", "C"], top_k=10)
+
+# Two-Tower: user id + optional features. Warm users use their learned
+# id row; unknown users transparently fall back to the cold-start row.
+recs = registry.predict_top_k_two_tower(
+    "BR",
+    user_id="u_brand_new",
+    features={"plan_premium": 1.0},
+    top_k=10,
+)
+
+# Wrong method on a territory raises ValueError pointing at the right one.
+```
+
+The legacy index-based `register(...)` (EASE only) and
+`predict_top_k(territory, [(item_idx, value)], top_k, ...)` are
+preserved unchanged for back-compat.
 
 ## Evaluation Pipeline
 

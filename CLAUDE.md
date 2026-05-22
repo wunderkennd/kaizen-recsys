@@ -117,7 +117,7 @@ src/data_validation.rs — GaussianAnomalyDetector for pre-training data quality
 - **`tuning.rs`**: `SearchSpace` and `FoldEvaluator<P>` traits; `grid_search_with` / `random_search_with` runners generic over `P`. EASE keeps `grid_search()` / `random_search()` (`P = HyperParams`) for callers; per-model entrypoints layer on top. Parallelized via rayon (ADR-0002).
 - **`metrics.rs`**: Pure functions: `precision_at_k`, `recall_at_k`, `ndcg_at_k`, `mean_average_precision`, `coverage`, `hit_rate_at_k`.
 - **`serialization.rs`**: Binary save/load with `FEAS` magic bytes for EASE (format v2 persists `WeightingConfig`, v1 backward-compatible migration); top-level `load_model()` sniffs the magic bytes and dispatches to EASE / SASRec / Two-Tower loaders.
-- **`serving.rs`**: `FeaseModelRegistry` for multi-territory model routing — stores `Box<dyn RecModel>`. `register()` keeps the EASE adapter shortcut; `register_model()` accepts any `RecModel`. `predict_batch()` / `predict_batch_top_k()` parallelized via rayon.
+- **`serving.rs`**: `FeaseModelRegistry` for multi-territory model routing — stores `Box<dyn RecModel>`. `register()` keeps the EASE adapter shortcut; `register_model()` accepts any `RecModel`. String-id-native per-model predict methods (`predict_top_k_ease`, `predict_top_k_sasrec`, `predict_top_k_two_tower`) mirror the standalone model classes' input shapes; the legacy index-based `predict_top_k` is preserved (#56). `predict_batch()` / `predict_batch_top_k()` parallelized via rayon.
 - **`data_validation.rs`**: `GaussianAnomalyDetector` — confidence interval checks for data quality.
 
 ### Python Layer (`kzn_recsys/`)
