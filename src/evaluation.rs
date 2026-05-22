@@ -612,7 +612,12 @@ pub fn evaluate_with_adapter(
             .unwrap_or_default();
 
         let user_days_ago_vec = if train_days_col_opt.is_some() {
-            Some(train_user_days_ago.get(uid.as_str()).cloned().unwrap_or_default())
+            Some(
+                train_user_days_ago
+                    .get(uid.as_str())
+                    .cloned()
+                    .unwrap_or_default(),
+            )
         } else {
             None
         };
