@@ -99,7 +99,7 @@ pub trait RecModel: Send + Sync {
     ///
     /// Default returns the empty pair — only Two-Tower currently uses
     /// the feature embedding tables at predict time. Lets the
-    /// `FeaseModelRegistry` route `predict_top_k_two_tower` through
+    /// `ModelRegistry` route `predict_top_k_two_tower` through
     /// `&dyn RecModel` without downcasting to a concrete type.
     fn resolve_user_features(
         &self,

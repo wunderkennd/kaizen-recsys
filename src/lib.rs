@@ -733,7 +733,7 @@ fn build_and_train(
 
 /// A Python-accessible registry for territory-based multi-model routing.
 ///
-/// This wraps the Rust `FeaseModelRegistry`, allowing Python callers to register
+/// This wraps the Rust `ModelRegistry`, allowing Python callers to register
 /// trained EASE / SASRec / Two-Tower models (one per territory/region) and route
 /// predictions to the correct model based on a territory key (#56).
 ///
@@ -747,18 +747,18 @@ fn build_and_train(
 /// correct method for the actual model kind, so callers can recover.
 ///
 /// Example:
-///     >>> registry = FeaseRegistry(fallback_territory="US")
+///     >>> registry = ModelRegistry(fallback_territory="US")
 ///     >>> registry.register("US", us_model)
 ///     >>> registry.register("BR", br_model)
 ///     >>> scores = registry.predict("US", [(0, 1.0)], [(0, 1.0)])
 ///     >>> top_recs = registry.predict_top_k("JP", [(0, 1.0)], 10)  # falls back to US
 #[pyclass]
-struct FeaseRegistry {
-    inner: serving::FeaseModelRegistry,
+struct ModelRegistry {
+    inner: serving::ModelRegistry,
 }
 
 #[pymethods]
-impl FeaseRegistry {
+impl ModelRegistry {
     /// Creates a new, empty registry.
     ///
     /// Args:
@@ -768,10 +768,10 @@ impl FeaseRegistry {
     #[pyo3(signature = (fallback_territory=None))]
     fn new(fallback_territory: Option<String>) -> Self {
         let inner = match fallback_territory {
-            Some(fb) => serving::FeaseModelRegistry::with_fallback(fb),
-            None => serving::FeaseModelRegistry::new(),
+            Some(fb) => serving::ModelRegistry::with_fallback(fb),
+            None => serving::ModelRegistry::new(),
         };
-        FeaseRegistry { inner }
+        ModelRegistry { inner }
     }
 
     /// Registers a trained FeaseModel for a territory.
@@ -1703,7 +1703,7 @@ mod sasrec_py {
     /// A trained SASRec model, callable from Python.
     #[pyclass]
     pub struct SASRecModel {
-        // `pub(crate)` so `FeaseRegistry::register_sasrec` (sibling
+        // `pub(crate)` so `ModelRegistry::register_sasrec` (sibling
         // module in lib.rs) can clone the underlying TrainedSasRec
         // into the trait-object registry (#56).
         pub(crate) model: TrainedSasRec,
@@ -1975,7 +1975,7 @@ mod two_tower_py {
     /// A trained Two-Tower model, callable from Python.
     #[pyclass]
     pub struct TwoTowerModel {
-        // `pub(crate)` so `FeaseRegistry::register_two_tower` (sibling
+        // `pub(crate)` so `ModelRegistry::register_two_tower` (sibling
         // module in lib.rs) can clone the underlying TrainedTwoTower
         // into the trait-object registry (#56).
         pub(crate) model: TrainedTwoTower,
@@ -2277,7 +2277,7 @@ fn _native(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(grid_search_two_tower, m)?)?;
     m.add_function(wrap_pyfunction!(random_search_two_tower, m)?)?;
     m.add_class::<FeaseModel>()?;
-    m.add_class::<FeaseRegistry>()?;
+    m.add_class::<ModelRegistry>()?;
 
     #[cfg(feature = "ml-models")]
     {

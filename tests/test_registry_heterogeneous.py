@@ -1,4 +1,4 @@
-"""Heterogeneous `FeaseRegistry` smoke test (#56).
+"""Heterogeneous `ModelRegistry` smoke test (#56).
 
 Registers an EASE model, a SASRec model, and a Two-Tower model under
 three territories on the same registry, then drives each predict path.
@@ -135,7 +135,7 @@ def heterogeneous_registry():
             seed=42,
         )
 
-        registry = fease.FeaseRegistry()
+        registry = fease.ModelRegistry()
         registry.register("US", ease_model)
         registry.register_sasrec("UK", sasrec_model)
         registry.register_two_tower("BR", two_tower_model)

@@ -74,7 +74,7 @@ docker build . -t fease-builder
 ```
 Python caller
     ↓
-src/lib.rs           — PyO3 entrypoint: FeaseModel, FeaseRegistry, SASRecModel,
+src/lib.rs           — PyO3 entrypoint: FeaseModel, ModelRegistry, SASRecModel,
                        TwoTowerModel (last two gated on `ml-models`),
                        build_and_train{,_sasrec,_two_tower}, load_*_model,
                        per-model grid_search_* / random_search_*, split/eval helpers
@@ -96,14 +96,14 @@ src/metrics.rs       — Pure ranking metrics: precision, recall, NDCG, MAP, cov
 src/serialization.rs — EASE save/load (FEAS magic bytes, v1/v2 versioning).
                        SASRec uses FSAS framed format; Two-Tower FTWO. load_model
                        sniffs the magic bytes and dispatches.
-src/serving.rs       — FeaseModelRegistry generic over Box<dyn RecModel>, batch
+src/serving.rs       — ModelRegistry generic over Box<dyn RecModel>, batch
                        prediction (rayon-parallelized)
 src/data_validation.rs — GaussianAnomalyDetector for pre-training data quality checks
 ```
 
 ### Key Rust Modules
 
-- **`lib.rs`**: PyO3 bridge. Exposes `FeaseModel` (predict, predict_batch, predict_similar_items, evaluate, validate, save), `FeaseRegistry`, EASE `build_and_train()` / `load_model()`, `validate_data()`, split functions, EASE search functions (`grid_search` / `random_search`), per-model search functions (`grid_search_{ease,sasrec,two_tower}` and `random_search_*`), and standalone metrics. Under `ml-models`, also exposes `SASRecModel` / `build_and_train_sasrec` / `load_sasrec_model` and `TwoTowerModel` / `build_and_train_two_tower` / `load_two_tower_model`.
+- **`lib.rs`**: PyO3 bridge. Exposes `FeaseModel` (predict, predict_batch, predict_similar_items, evaluate, validate, save), `ModelRegistry`, EASE `build_and_train()` / `load_model()`, `validate_data()`, split functions, EASE search functions (`grid_search` / `random_search`), per-model search functions (`grid_search_{ease,sasrec,two_tower}` and `random_search_*`), and standalone metrics. Under `ml-models`, also exposes `SASRecModel` / `build_and_train_sasrec` / `load_sasrec_model` and `TwoTowerModel` / `build_and_train_two_tower` / `load_two_tower_model`.
 - **`models/mod.rs`**: `RecModel` trait (`kind`, `num_items`, `item_mapping`, `predict_scores(ModelInput<'_>)`, `predict_similar_items`, `validate`, `save`) + `ModelInput` enum (`Sparse`, `Sequence`, `TowerUser`).
 - **`models/ease.rs`**: `EaseAdapter` / `EaseAdapterRef` — implement `RecModel` over `RustFeaseModel` with no algorithmic change.
 - **`models/sasrec.rs`**: `SasRecConfig`, `SasRecTrainingConfig`, `train_sasrec()`, `TrainedSasRec` (transformer; `burn` backend). Magic-bytes-framed save/load.
@@ -117,12 +117,12 @@ src/data_validation.rs — GaussianAnomalyDetector for pre-training data quality
 - **`tuning.rs`**: `SearchSpace` and `FoldEvaluator<P>` traits; `grid_search_with` / `random_search_with` runners generic over `P`. EASE keeps `grid_search()` / `random_search()` (`P = HyperParams`) for callers; per-model entrypoints layer on top. Parallelized via rayon (ADR-0002).
 - **`metrics.rs`**: Pure functions: `precision_at_k`, `recall_at_k`, `ndcg_at_k`, `mean_average_precision`, `coverage`, `hit_rate_at_k`.
 - **`serialization.rs`**: Binary save/load with `FEAS` magic bytes for EASE (format v2 persists `WeightingConfig`, v1 backward-compatible migration); top-level `load_model()` sniffs the magic bytes and dispatches to EASE / SASRec / Two-Tower loaders.
-- **`serving.rs`**: `FeaseModelRegistry` for multi-territory model routing — stores `Box<dyn RecModel>`. `register()` keeps the EASE adapter shortcut; `register_model()` accepts any `RecModel`. String-id-native per-model predict methods (`predict_top_k_ease`, `predict_top_k_sasrec`, `predict_top_k_two_tower`) mirror the standalone model classes' input shapes; the legacy index-based `predict_top_k` is preserved (#56). `predict_batch()` / `predict_batch_top_k()` parallelized via rayon.
+- **`serving.rs`**: `ModelRegistry` for multi-territory model routing — stores `Box<dyn RecModel>`. `register()` keeps the EASE adapter shortcut; `register_model()` accepts any `RecModel`. String-id-native per-model predict methods (`predict_top_k_ease`, `predict_top_k_sasrec`, `predict_top_k_two_tower`) mirror the standalone model classes' input shapes; the legacy index-based `predict_top_k` is preserved (#56). `predict_batch()` / `predict_batch_top_k()` parallelized via rayon.
 - **`data_validation.rs`**: `GaussianAnomalyDetector` — confidence interval checks for data quality.
 
 ### Python Layer (`kzn_recsys/`)
 
-- `__init__.py` — Always exports: `FeaseModel`, `FeaseRegistry`, `build_and_train`, `load_model`, `validate_data`, split functions, `grid_search` / `grid_search_ease` / `random_search` / `random_search_ease`, metrics, `EngagementSchema`, `MetadataSchema`. Conditional on the extension being built with `--features ml-models` (gated by `_HAS_ML_MODELS`): `SASRecModel`, `build_and_train_sasrec`, `load_sasrec_model`, `grid_search_sasrec`, `random_search_sasrec`, `TwoTowerModel`, `build_and_train_two_tower`, `load_two_tower_model`, `grid_search_two_tower`, `random_search_two_tower`.
+- `__init__.py` — Always exports: `FeaseModel`, `ModelRegistry`, `build_and_train`, `load_model`, `validate_data`, split functions, `grid_search` / `grid_search_ease` / `random_search` / `random_search_ease`, metrics, `EngagementSchema`, `MetadataSchema`. Conditional on the extension being built with `--features ml-models` (gated by `_HAS_ML_MODELS`): `SASRecModel`, `build_and_train_sasrec`, `load_sasrec_model`, `grid_search_sasrec`, `random_search_sasrec`, `TwoTowerModel`, `build_and_train_two_tower`, `load_two_tower_model`, `grid_search_two_tower`, `random_search_two_tower`.
 - `schemas.py` — Pydantic models for column validation
 - `fease_wrapper.py` — Thin validation wrapper around `build_and_train()` with optional advanced weighting params
 - `train.py` — CLI training script (`--interactions`, `--user-features`, `--item-features`, `--output`)

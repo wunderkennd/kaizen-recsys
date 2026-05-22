@@ -53,7 +53,7 @@ src/data_pipeline.rs        # build_matrices — no changes
 src/evaluation.rs           # still &RustFeaseModel
 src/tuning.rs               # still concrete
 src/serialization.rs        # FEAS magic, no changes
-src/serving.rs              # FeaseModelRegistry — no changes
+src/serving.rs              # ModelRegistry — no changes
 src/{metrics,weighting,data_validation}.rs  # no changes
 ```
 

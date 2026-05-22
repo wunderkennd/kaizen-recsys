@@ -83,7 +83,7 @@ direct co-purchase signals that EASE captures more cheaply.
 
 ## Mixing models
 
-The `FeaseRegistry` is now generic over `&dyn RecModel`, so a single
+The `ModelRegistry` is now generic over `&dyn RecModel`, so a single
 registry can hold heterogeneous models keyed by territory / segment /
 user cohort. See the README's
 ["Territory-Aware Model Registry"](../../README.md#territory-aware-model-registry)

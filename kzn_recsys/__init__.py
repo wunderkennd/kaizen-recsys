@@ -2,7 +2,7 @@
 
 from kzn_recsys._native import (
     FeaseModel,
-    FeaseRegistry,
+    ModelRegistry,
     build_and_train,
     coverage,
     grid_search_ease,
@@ -51,7 +51,7 @@ except ImportError:
 
 __all__ = [
     "FeaseModel",
-    "FeaseRegistry",
+    "ModelRegistry",
     "build_and_train",
     "coverage",
     "grid_search",

@@ -384,10 +384,10 @@ is generic over `&dyn RecModel`, so EASE, SASRec, and Two-Tower models
 can coexist in the same registry behind the Rust trait.
 
 ```python
-registry = fease.FeaseRegistry()
+registry = fease.ModelRegistry()
 
 # Or with a fallback for unknown territories:
-registry = fease.FeaseRegistry(fallback_territory="US")
+registry = fease.ModelRegistry(fallback_territory="US")
 
 # Register models per territory — one method per model family so the
 # inputs each model expects are explicit in the call site.
