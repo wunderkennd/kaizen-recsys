@@ -570,7 +570,7 @@ struct TrainedSasRecMeta {
 
 /// A trained SASRec model on the CPU `NdArray` backend, carrying the
 /// catalog mappings so it satisfies [`RecModel`]. `Clone` lets the
-/// Python `FeaseRegistry.register_sasrec(...)` path hand a copy to the
+/// Python `ModelRegistry.register_sasrec(...)` path hand a copy to the
 /// registry without taking ownership of the source model (#56).
 #[derive(Clone)]
 pub struct TrainedSasRec {

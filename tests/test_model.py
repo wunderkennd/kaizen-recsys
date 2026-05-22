@@ -373,7 +373,7 @@ def test_backward_compat(weighting_data):
         assert abs(s1 - s2) < 1e-10
 
 
-# --- FeaseRegistry Tests ---
+# --- ModelRegistry Tests ---
 
 @pytest.fixture(scope="session")
 def two_territory_models(weighting_data):
@@ -395,7 +395,7 @@ def test_registry_basic(two_territory_models):
     """Create registry, register 2 models for different territories, verify predict works."""
     model_us, model_br = two_territory_models
 
-    registry = fease.FeaseRegistry()
+    registry = fease.ModelRegistry()
     assert len(registry) == 0
 
     registry.register("US", model_us)
@@ -421,7 +421,7 @@ def test_registry_fallback(two_territory_models):
     """Create with fallback, verify unknown territory falls back."""
     model_us, model_br = two_territory_models
 
-    registry = fease.FeaseRegistry(fallback_territory="US")
+    registry = fease.ModelRegistry(fallback_territory="US")
     registry.register("US", model_us)
     registry.register("BR", model_br)
 
@@ -442,7 +442,7 @@ def test_registry_predict_unknown_territory_error(two_territory_models):
     """No fallback, unknown territory raises error."""
     model_us, _ = two_territory_models
 
-    registry = fease.FeaseRegistry()  # No fallback
+    registry = fease.ModelRegistry()  # No fallback
     registry.register("US", model_us)
 
     with pytest.raises(ValueError, match="No model registered for territory 'JP'"):
@@ -453,7 +453,7 @@ def test_registry_predict_top_k(two_territory_models):
     """Tests predict_top_k on registry, verifying exclusion and ordering."""
     model_us, _ = two_territory_models
 
-    registry = fease.FeaseRegistry()
+    registry = fease.ModelRegistry()
     registry.register("US", model_us)
 
     # User interacted with item 0, ask for top 2
@@ -472,7 +472,7 @@ def test_registry_predict_similar_items(two_territory_models):
     """Tests predict_similar_items on registry."""
     model_us, _ = two_territory_models
 
-    registry = fease.FeaseRegistry()
+    registry = fease.ModelRegistry()
     registry.register("US", model_us)
 
     similar = registry.predict_similar_items("US", 0, top_k=2)
@@ -484,7 +484,7 @@ def test_registry_predict_similar_items(two_territory_models):
 
 def test_registry_bool():
     """Tests __bool__ — empty registry is falsy, non-empty is truthy."""
-    registry = fease.FeaseRegistry()
+    registry = fease.ModelRegistry()
     assert not registry  # empty -> falsy
 
 

@@ -399,7 +399,7 @@ struct TwoTowerMeta {
 /// A trained, ready-to-serve Two-Tower model on the CPU `NdArray` backend.
 /// Holds the catalog item embedding matrix precomputed once at construction
 /// so `predict_scores` is a single user-forward + matmul. `Clone` lets the
-/// Python `FeaseRegistry.register_two_tower(...)` path hand a copy to the
+/// Python `ModelRegistry.register_two_tower(...)` path hand a copy to the
 /// registry without taking ownership of the source model (#56).
 #[derive(Clone)]
 pub struct TrainedTwoTower {

@@ -8,8 +8,8 @@
 //! territory may be served by EASE, SASRec, or Two-Tower. Routing and
 //! prediction go through the [`RecModel`] trait, so the registry is
 //! model-agnostic. EASE callers register a `RustFeaseModel` via
-//! [`FeaseModelRegistry::register`] (it is wrapped in an `EaseAdapter`);
-//! other models register through [`FeaseModelRegistry::register_model`].
+//! [`ModelRegistry::register`] (it is wrapped in an `EaseAdapter`);
+//! other models register through [`ModelRegistry::register_model`].
 //!
 //! Also provides batch prediction for efficiently scoring multiple users at once.
 
@@ -25,14 +25,14 @@ use rayon::prelude::*;
 /// holds one trained model per territory group and routes predictions to
 /// the correct model. Models are stored as `Box<dyn RecModel>` so a
 /// territory can be served by any model family.
-pub struct FeaseModelRegistry {
+pub struct ModelRegistry {
     /// Map from territory name (e.g., "UNITED_STATES") to trained model.
     models: AHashMap<String, Box<dyn RecModel>>,
     /// Optional fallback territory name for unknown territories.
     fallback_territory: Option<String>,
 }
 
-impl FeaseModelRegistry {
+impl ModelRegistry {
     /// Creates an empty registry.
     pub fn new() -> Self {
         Self {
@@ -283,7 +283,7 @@ impl FeaseModelRegistry {
     }
 }
 
-impl Default for FeaseModelRegistry {
+impl Default for ModelRegistry {
     fn default() -> Self {
         Self::new()
     }
@@ -448,7 +448,7 @@ mod tests {
 
     #[test]
     fn test_registry_basic() {
-        let mut registry = FeaseModelRegistry::new();
+        let mut registry = ModelRegistry::new();
         assert!(registry.is_empty());
 
         registry.register("US".to_string(), make_test_model(1.0));
@@ -462,7 +462,7 @@ mod tests {
 
     #[test]
     fn test_registry_fallback() {
-        let mut registry = FeaseModelRegistry::with_fallback("US".to_string());
+        let mut registry = ModelRegistry::with_fallback("US".to_string());
         registry.register("US".to_string(), make_test_model(1.0));
         registry.register("BR".to_string(), make_test_model(2.0));
 
@@ -473,7 +473,7 @@ mod tests {
 
     #[test]
     fn test_registry_predict() {
-        let mut registry = FeaseModelRegistry::new();
+        let mut registry = ModelRegistry::new();
         registry.register("US".to_string(), make_test_model(1.0));
 
         let scores = registry
@@ -488,7 +488,7 @@ mod tests {
 
     #[test]
     fn test_registry_territory_isolation() {
-        let mut registry = FeaseModelRegistry::new();
+        let mut registry = ModelRegistry::new();
         registry.register("US".to_string(), make_test_model(1.0));
         registry.register("BR".to_string(), make_test_model(2.0));
 
@@ -596,7 +596,7 @@ mod tests {
 
     #[test]
     fn test_registry_unregister() {
-        let mut registry = FeaseModelRegistry::new();
+        let mut registry = ModelRegistry::new();
         registry.register("US".to_string(), make_test_model(1.0));
         assert_eq!(registry.len(), 1);
 
@@ -626,7 +626,7 @@ mod tests {
         }
         model.mappings = mappings;
 
-        let mut registry = FeaseModelRegistry::new();
+        let mut registry = ModelRegistry::new();
         registry.register("US".to_string(), model);
 
         let mut interactions = AHashMap::new();
@@ -650,7 +650,7 @@ mod tests {
     #[cfg(feature = "ml-models")]
     #[test]
     fn test_predict_top_k_sasrec_rejects_ease_territory() {
-        let mut registry = FeaseModelRegistry::new();
+        let mut registry = ModelRegistry::new();
         registry.register("US".to_string(), make_test_model(1.0));
         let err = registry
             .predict_top_k_sasrec("US", &["a".to_string()], 3)
@@ -665,7 +665,7 @@ mod tests {
     #[cfg(feature = "ml-models")]
     #[test]
     fn test_predict_top_k_two_tower_rejects_ease_territory() {
-        let mut registry = FeaseModelRegistry::new();
+        let mut registry = ModelRegistry::new();
         registry.register("US".to_string(), make_test_model(1.0));
         let features = AHashMap::new();
         let err = registry

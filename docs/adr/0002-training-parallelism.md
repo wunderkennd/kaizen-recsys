@@ -68,7 +68,7 @@ Explicit non-decisions (deferred or rejected):
 
 4. **Per-territory training parallelism** — out of scope for this ADR.
    When/if we add a batch-train-N-models entrypoint (sibling to
-   `FeaseModelRegistry` on the serving side), it's another `par_iter`
+   `ModelRegistry` on the serving side), it's another `par_iter`
    over independent calls to `build_and_train`. Mention it now, design
    it when there's a real consumer.
 
