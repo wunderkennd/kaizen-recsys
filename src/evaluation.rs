@@ -296,16 +296,179 @@ pub fn leave_k_out_split(
 // Evaluation harness
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// EvalAdapter — per-model input construction (issue #51)
+// ---------------------------------------------------------------------------
+
+/// Per-user data the eval harness collects from train/test/feature
+/// files. Handed to an [`EvalAdapter`] which picks the right
+/// [`ModelInput`] variant for its model.
+pub struct UserEvalContext<'a> {
+    /// `(item_idx, value)` pairs in train-DataFrame row order.
+    pub train_items: &'a [(usize, f64)],
+    /// `days_ago` values parallel to `train_items`, when the train
+    /// DataFrame has a `days_ago` column. `None` otherwise.
+    /// Sequence-aware models use this to order history chronologically.
+    pub train_days_ago: Option<&'a [f64]>,
+    /// `(feature_idx, value)` pairs for this user (EASE only).
+    pub user_features: &'a [(usize, f64)],
+    /// The model's user index for this user_id when present in
+    /// `mappings.user_to_idx` (Two-Tower routes `Some(idx)` to its warm
+    /// path; `None` falls back to the reserved cold-start row).
+    pub user_idx: Option<usize>,
+}
+
+/// Per-model strategy for turning [`UserEvalContext`] into model
+/// scores. Each model implements an adapter that picks the appropriate
+/// [`ModelInput`] variant. Both [`evaluate_model`] and the per-fold
+/// scorers in [`crate::tuning`] go through the adapter so the
+/// chronological-ordering (SASRec) and cold-start (Two-Tower) decisions
+/// are made in one place (issue #51).
+pub trait EvalAdapter: Send + Sync {
+    /// The wrapped model. Used by the harness for catalog size and
+    /// id mappings.
+    fn model(&self) -> &dyn RecModel;
+
+    /// Compute a length-`num_items` score vector for `ctx`. Returns
+    /// `Err` if the adapter requires data the context does not carry
+    /// (e.g. SASRec without `days_ago`).
+    fn predict_user_scores(&self, ctx: &UserEvalContext<'_>) -> Result<Vec<f32>>;
+}
+
+/// EASE eval adapter — ignores chronology and `user_idx`, builds
+/// [`ModelInput::Sparse`] from interactions and user features.
+pub struct EaseEvalAdapter<'m> {
+    model: &'m dyn RecModel,
+}
+
+impl<'m> EaseEvalAdapter<'m> {
+    pub fn new(model: &'m dyn RecModel) -> Self {
+        Self { model }
+    }
+}
+
+impl<'m> EvalAdapter for EaseEvalAdapter<'m> {
+    fn model(&self) -> &dyn RecModel {
+        self.model
+    }
+
+    fn predict_user_scores(&self, ctx: &UserEvalContext<'_>) -> Result<Vec<f32>> {
+        self.model.predict_scores(ModelInput::Sparse {
+            interactions: ctx.train_items,
+            user_features: ctx.user_features,
+        })
+    }
+}
+
+/// SASRec eval adapter — sorts each user's train items oldest-first
+/// by `days_ago` (matching `crate::data::sequences`) and scores via
+/// [`ModelInput::Sequence`]. Returns `Err` if the context has no
+/// `days_ago`: SASRec is order-sensitive, and silently falling back
+/// to row order produced misleading metrics in earlier versions (#51).
+pub struct SasRecEvalAdapter<'m> {
+    model: &'m dyn RecModel,
+}
+
+impl<'m> SasRecEvalAdapter<'m> {
+    pub fn new(model: &'m dyn RecModel) -> Self {
+        Self { model }
+    }
+}
+
+impl<'m> EvalAdapter for SasRecEvalAdapter<'m> {
+    fn model(&self) -> &dyn RecModel {
+        self.model
+    }
+
+    fn predict_user_scores(&self, ctx: &UserEvalContext<'_>) -> Result<Vec<f32>> {
+        let history = chronological_history_from_ctx(ctx)?;
+        self.model
+            .predict_scores(ModelInput::Sequence { history: &history })
+    }
+}
+
+/// Order `ctx.train_items` oldest-first by `train_days_ago`, matching
+/// the training-time convention in `data::sequences::build_sequences`
+/// (larger `days_ago` == older). Stable sort preserves file-row order
+/// for ties. Pub(crate) so the per-fold SASRec scorer in `tuning` can
+/// use the same ordering rule.
+pub(crate) fn chronological_history_from_ctx(ctx: &UserEvalContext<'_>) -> Result<Vec<usize>> {
+    let days_ago = ctx.train_days_ago.ok_or_else(|| {
+        anyhow!(
+            "SasRecEvalAdapter requires a `days_ago` column in the train interactions \
+             file to order each user's history chronologically; it is absent. \
+             (Matches the same requirement in `data::sequences::build_sequences`.)"
+        )
+    })?;
+    if days_ago.len() != ctx.train_items.len() {
+        return Err(anyhow!(
+            "internal error: days_ago.len() ({}) != train_items.len() ({})",
+            days_ago.len(),
+            ctx.train_items.len()
+        ));
+    }
+    let mut pairs: Vec<(f64, usize)> = days_ago
+        .iter()
+        .zip(ctx.train_items.iter())
+        .map(|(d, (idx, _))| (*d, *idx))
+        .collect();
+    // Oldest first: larger days_ago is older. Stable sort preserves
+    // file-row order for ties (matches `data::sequences::build_sequences`).
+    pairs.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    Ok(pairs.into_iter().map(|(_, idx)| idx).collect())
+}
+
+/// Two-Tower eval adapter — scores the catalog via
+/// [`ModelInput::TowerUser`] using the resolved `user_idx` (warm) or
+/// `None` (cold-start). Predict-time arbitrary user features are not
+/// supported yet (see #55).
+pub struct TwoTowerEvalAdapter<'m> {
+    model: &'m dyn RecModel,
+}
+
+impl<'m> TwoTowerEvalAdapter<'m> {
+    pub fn new(model: &'m dyn RecModel) -> Self {
+        Self { model }
+    }
+}
+
+impl<'m> EvalAdapter for TwoTowerEvalAdapter<'m> {
+    fn model(&self) -> &dyn RecModel {
+        self.model
+    }
+
+    fn predict_user_scores(&self, ctx: &UserEvalContext<'_>) -> Result<Vec<f32>> {
+        self.model.predict_scores(ModelInput::TowerUser {
+            user_idx: ctx.user_idx,
+            cat_features: &[],
+            dense_features: &[],
+        })
+    }
+}
+
+/// Build the right [`EvalAdapter`] for `model.kind()`.
+pub fn adapter_for(model: &dyn RecModel) -> Box<dyn EvalAdapter + '_> {
+    use crate::models::ModelKind;
+    match model.kind() {
+        ModelKind::Ease => Box::new(EaseEvalAdapter::new(model)),
+        ModelKind::SasRec => Box::new(SasRecEvalAdapter::new(model)),
+        ModelKind::TwoTower => Box::new(TwoTowerEvalAdapter::new(model)),
+    }
+}
+
 /// Evaluates a trained model against test interactions.
 ///
-/// The harness is generalized over `&dyn RecModel` (Phase 4a / issue #30):
-/// it works for any model implementing the trait, not just the concrete
-/// `RustFeaseModel`. EASE callers pass an `EaseAdapter`.
+/// The harness is generalized over `&dyn RecModel` (Phase 4a / issue #30)
+/// and dispatches per-user input construction through the [`EvalAdapter`]
+/// trait (#51 / Phase 7 follow-up): EASE → [`ModelInput::Sparse`],
+/// SASRec → chronologically-sorted [`ModelInput::Sequence`] (errors loudly
+/// if the train file has no `days_ago` column), Two-Tower →
+/// [`ModelInput::TowerUser`].
 ///
 /// For each user in the test set who also exists in the model's mappings:
 /// 1. Gets the user's TEST interactions (ground truth relevant items)
 /// 2. Gets the user's TRAIN interactions (to generate predictions from)
-/// 3. Calls `model.predict_scores(ModelInput::Sparse { .. })`
+/// 3. Calls the per-model `EvalAdapter` to produce scores
 /// 4. Ranks items, excludes train items
 /// 5. Computes all metrics against test items
 /// 6. Averages across users
@@ -316,11 +479,32 @@ pub fn evaluate_model(
     user_features_path: Option<&str>,
     config: &EvalConfig,
 ) -> Result<EvalReport> {
+    let adapter = adapter_for(model);
+    evaluate_with_adapter(
+        adapter.as_ref(),
+        test_interactions_path,
+        train_interactions_path,
+        user_features_path,
+        config,
+    )
+}
+
+/// Lower-level entrypoint: same as [`evaluate_model`] but with an
+/// explicit adapter, so callers (e.g. tuning's per-fold scorer) can
+/// avoid re-dispatching from `model.kind()`.
+pub fn evaluate_with_adapter(
+    adapter: &dyn EvalAdapter,
+    test_interactions_path: &str,
+    train_interactions_path: &str,
+    user_features_path: Option<&str>,
+    config: &EvalConfig,
+) -> Result<EvalReport> {
     log::info!("Starting model evaluation...");
 
     let test_df = read_interactions_df(test_interactions_path)?;
     let train_df = read_interactions_df(train_interactions_path)?;
 
+    let model = adapter.model();
     let mappings = model.item_mapping();
 
     // Load user features if provided
@@ -347,12 +531,20 @@ pub fn evaluate_model(
         }
     }
 
-    // Build per-user train interactions: user_id -> Vec<(item_idx, value)>
+    // Build per-user train interactions plus optional days_ago parallel
+    // vec when the train file carries that column. Sequence-aware
+    // adapters (SASRec) require days_ago; the column-presence check is
+    // done once per file, not per row.
     let train_user_col = train_df.column("user_id")?.str()?;
     let train_item_col = train_df.column("item_id")?.str()?;
     let train_val_col = train_df.column("value")?.f64()?;
+    let train_days_col_opt = train_df
+        .column("days_ago")
+        .ok()
+        .and_then(|s| s.f64().ok().cloned());
 
     let mut train_user_interactions: AHashMap<String, Vec<(usize, f64)>> = AHashMap::new();
+    let mut train_user_days_ago: AHashMap<String, Vec<f64>> = AHashMap::new();
     for i in 0..train_df.height() {
         if let (Some(uid), Some(iid), Some(val)) = (
             train_user_col.get(i),
@@ -364,6 +556,14 @@ pub fn evaluate_model(
                 .entry(uid.to_string())
                 .or_default()
                 .push((item_idx, val));
+            if let Some(days_col) = train_days_col_opt.as_ref()
+                && let Some(d) = days_col.get(i)
+            {
+                train_user_days_ago
+                    .entry(uid.to_string())
+                    .or_default()
+                    .push(d);
+            }
         }
     }
 
@@ -383,7 +583,8 @@ pub fn evaluate_model(
 
     for (uid, relevant_items) in &test_user_items {
         // The user must exist in the model's mappings
-        if !mappings.user_to_idx.contains_key(uid.as_str()) {
+        let user_idx_opt = mappings.user_to_idx.get(uid.as_str()).copied();
+        if user_idx_opt.is_none() {
             continue;
         }
 
@@ -392,18 +593,23 @@ pub fn evaluate_model(
             .cloned()
             .unwrap_or_default();
 
+        let user_days_ago_vec = train_user_days_ago.get(uid.as_str()).cloned();
+
         let user_features: Vec<(usize, f64)> = user_features_map
             .get(uid.as_str())
             .cloned()
             .unwrap_or_default();
 
-        // Predict scores. The `RecModel` trait standardizes on f32; the
-        // EASE math is identical and only pays a single `as f32` cast per
-        // element on output (the regression test guards this within 1e-9).
-        let scores = model.predict_scores(ModelInput::Sparse {
-            interactions: &user_interactions,
+        // Hand off per-user data to the model-specific adapter. EASE
+        // ignores days_ago/user_idx; SASRec uses days_ago to sort the
+        // history chronologically; Two-Tower uses user_idx.
+        let ctx = UserEvalContext {
+            train_items: &user_interactions,
+            train_days_ago: user_days_ago_vec.as_deref(),
             user_features: &user_features,
-        })?;
+            user_idx: user_idx_opt,
+        };
+        let scores = adapter.predict_user_scores(&ctx)?;
 
         // Build set of train items to exclude
         let train_item_set: HashSet<usize> =
@@ -976,6 +1182,140 @@ mod tests {
             assert!((t.hit_rate - b.hit_rate).abs() < 1e-9, "hit_rate@{}", t.k);
         }
 
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------
+    // #51: SASRec eval chronological-history tests
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn chronological_history_errors_when_days_ago_absent() {
+        let items = [(0_usize, 1.0_f64), (1, 1.0), (2, 1.0)];
+        let ctx = UserEvalContext {
+            train_items: &items,
+            train_days_ago: None,
+            user_features: &[],
+            user_idx: Some(1),
+        };
+        let r = chronological_history_from_ctx(&ctx);
+        assert!(
+            r.is_err(),
+            "expected Err when days_ago is absent, got {r:?}"
+        );
+    }
+
+    #[test]
+    fn chronological_history_sorts_oldest_first_by_days_ago() {
+        // items[i] has days_ago[i]. Larger days_ago is older; the sort
+        // should put items in (oldest, ..., newest) order — i.e. by
+        // descending days_ago. Stable sort: ties keep input order.
+        let items = [(10_usize, 1.0_f64), (20, 1.0), (30, 1.0), (40, 1.0)];
+        let days_ago = [1.0_f64, 7.0, 3.0, 7.0];
+        let ctx = UserEvalContext {
+            train_items: &items,
+            train_days_ago: Some(&days_ago),
+            user_features: &[],
+            user_idx: Some(1),
+        };
+        let hist = chronological_history_from_ctx(&ctx).expect("sort succeeds");
+        // Oldest first: days_ago 7 (item 20, then 40 by stable tie),
+        // then 3 (item 30), then 1 (item 10).
+        assert_eq!(hist, vec![20, 40, 30, 10]);
+    }
+
+    #[cfg(feature = "ml-models")]
+    #[test]
+    #[ignore = "trains a real burn SASRec; impractically slow in debug. Run with: cargo test --release --features ml-models -- --ignored"]
+    fn sasrec_eval_adapter_honors_days_ago_chronology() -> Result<()> {
+        // #51 acceptance: the adapter must produce different model scores
+        // when fed the same train items in different chronological
+        // orderings. We compare score vectors directly (more focused than
+        // an aggregate NDCG@k assertion, which could happen to coincide
+        // if the top-1 is stable across orderings).
+        use crate::data::sequences::build_sequences;
+        use crate::data_pipeline::build_interaction_mappings;
+        use crate::models::sasrec::{
+            SasRecConfig, SasRecTrainingConfig, TrainedSasRec, train_sasrec,
+        };
+        use burn::backend::ndarray::NdArrayDevice;
+        use burn::backend::{Autodiff, NdArray};
+
+        let dir = TempDir::new()?;
+        let train_path = dir.path().join("train.parquet");
+
+        // 6 users on a 4-item catalog with two distinct sequential
+        // patterns so the trained model has reason to learn order:
+        //   3 users: A → B → C  (so "last=B" → next=C)
+        //   3 users: C → B → A  (so "last=B" → next=A is also possible;
+        //                        the model has to attend to earlier
+        //                        positions to disambiguate)
+        let mut train_df = df!(
+            "user_id" => ["u0","u0","u0", "u1","u1","u1", "u2","u2","u2",
+                          "u3","u3","u3", "u4","u4","u4", "u5","u5","u5"],
+            "item_id" => ["A","B","C", "A","B","C", "A","B","C",
+                          "C","B","A", "C","B","A", "C","B","A"],
+            "value"   => vec![1.0_f64; 18],
+            "days_ago"=> vec![3.0_f64,2.0,1.0, 3.0,2.0,1.0, 3.0,2.0,1.0,
+                              3.0,2.0,1.0, 3.0,2.0,1.0, 3.0,2.0,1.0],
+        )?;
+        create_test_parquet(&mut train_df, train_path.to_str().unwrap())?;
+
+        let mappings = build_interaction_mappings(train_path.to_str().unwrap())?;
+        let dataset = build_sequences(train_path.to_str().unwrap(), &mappings, 8)?;
+        let vocab_size = mappings.idx_to_item.len() + 1;
+        let model_config = SasRecConfig::new(vocab_size, 16, 8, 2, 1).with_dropout(0.0);
+        let train_config = SasRecTrainingConfig::new()
+            .with_num_epochs(30)
+            .with_batch_size(4)
+            .with_learning_rate(1e-2)
+            .with_patience(30)
+            .with_seed(42);
+        let device = NdArrayDevice::default();
+        let fitted = train_sasrec::<Autodiff<NdArray<f32>>>(
+            &model_config,
+            &train_config,
+            &dataset,
+            &device,
+        )?;
+        let trained = TrainedSasRec::new(fitted, model_config, mappings);
+
+        // Same `train_items` slice (file-row order [A, B, C]) but
+        // different `days_ago` per call. The adapter must sort so that
+        // chronological ordering [A, B, C] differs from reversed [C, B, A].
+        let mapping = trained.item_mapping();
+        let a = *mapping.item_to_idx.get("A").expect("A in catalog");
+        let b = *mapping.item_to_idx.get("B").expect("B in catalog");
+        let c = *mapping.item_to_idx.get("C").expect("C in catalog");
+        let items = [(a, 1.0_f64), (b, 1.0), (c, 1.0)];
+
+        let adapter = SasRecEvalAdapter::new(&trained);
+        // days_ago [3, 2, 1]: A oldest → C newest → sorted history [A, B, C]
+        let scores_chrono = adapter.predict_user_scores(&UserEvalContext {
+            train_items: &items,
+            train_days_ago: Some(&[3.0, 2.0, 1.0]),
+            user_features: &[],
+            user_idx: Some(1),
+        })?;
+        // days_ago [1, 2, 3]: A newest → C oldest → sorted history [C, B, A]
+        let scores_reversed = adapter.predict_user_scores(&UserEvalContext {
+            train_items: &items,
+            train_days_ago: Some(&[1.0, 2.0, 3.0]),
+            user_features: &[],
+            user_idx: Some(1),
+        })?;
+
+        assert_eq!(scores_chrono.len(), scores_reversed.len());
+        let max_abs_diff = scores_chrono
+            .iter()
+            .zip(scores_reversed.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(
+            max_abs_diff > 1e-6,
+            "score vectors should differ between chronological and reversed days_ago; \
+             max abs diff was {max_abs_diff}"
+        );
         Ok(())
     }
 }

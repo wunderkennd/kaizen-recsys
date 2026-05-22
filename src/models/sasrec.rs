@@ -753,19 +753,19 @@ impl RecModel for TrainedSasRec {
     fn predict_scores(&self, input: ModelInput<'_>) -> anyhow::Result<Vec<f32>> {
         match input {
             ModelInput::Sequence { history } => Ok(self.score_items(history)),
-            // The generalized eval harness only passes `Sparse`. SASRec is
-            // order-sensitive, but the harness's per-user train slice has
-            // no chronology attached, so the interaction item indices are
-            // taken as the user's history in iteration order. This is the
-            // documented behavior that lets SASRec run end-to-end through
-            // `evaluate_model` (the model still scores from real attention
-            // over those items).
-            ModelInput::Sparse { interactions, .. } => {
-                let history: Vec<usize> = interactions.iter().map(|(idx, _)| *idx).collect();
-                Ok(self.score_items(&history))
-            }
+            // SASRec is order-sensitive. The eval harness and the tuning
+            // per-fold scorer route through `SasRecEvalAdapter` (#51),
+            // which sorts each user's history oldest-first by `days_ago`
+            // and hands `Sequence` here — Sparse is no longer accepted
+            // because silently taking row order produced misleading
+            // metrics. Callers that genuinely have a pre-ordered history
+            // pass it via `ModelInput::Sequence` directly.
+            ModelInput::Sparse { .. } => Err(anyhow::anyhow!(
+                "SASRec does not support ModelInput::Sparse; expected ModelInput::Sequence \
+                 (use crate::evaluation::SasRecEvalAdapter for time-aware eval, #51)"
+            )),
             ModelInput::TowerUser { .. } => Err(anyhow::anyhow!(
-                "SASRec does not support ModelInput::TowerUser; expected Sequence or Sparse"
+                "SASRec does not support ModelInput::TowerUser; expected ModelInput::Sequence"
             )),
         }
     }
@@ -1125,18 +1125,18 @@ mod tests {
     }
 
     #[test]
-    fn recmodel_sparse_input_supported_for_eval_harness() {
+    fn recmodel_rejects_sparse_input() {
+        // Issue #51: silently taking Sparse and ignoring chronology
+        // produced misleading metrics. The eval harness now sorts by
+        // `days_ago` and feeds `Sequence`; Sparse is an error so any
+        // remaining caller has to make the input shape explicit.
         let t = trained_tiny();
-        // The eval harness only passes `Sparse`; SASRec treats the
-        // interaction item indices as the history.
         let inter = [(0usize, 1.0f64), (1, 1.0), (2, 1.0)];
-        let scores = t
-            .predict_scores(ModelInput::Sparse {
-                interactions: &inter,
-                user_features: &[],
-            })
-            .expect("Sparse input must be supported");
-        assert_eq!(scores.len(), 4);
+        let r = t.predict_scores(ModelInput::Sparse {
+            interactions: &inter,
+            user_features: &[],
+        });
+        assert!(r.is_err(), "Sparse should be rejected, got {r:?}");
     }
 
     #[test]

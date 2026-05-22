@@ -698,15 +698,14 @@ fn evaluate_trial(
 /// SASRec [`FoldEvaluator`]: builds left-padded causal sequences from the
 /// fold's training interactions, trains a burn `SasRec` for the trial's
 /// architecture/optimizer config, wraps it in [`TrainedSasRec`], and scores
-/// held-out users through the shared `&dyn RecModel` path.
+/// held-out users through `SasRecEvalAdapter` so the per-user history is
+/// ordered chronologically by `days_ago` before scoring (issue #51).
 ///
 /// SASRec is order-sensitive; the sequence builder requires a numeric
-/// `days_ago` column and orders each user's history chronologically. The
-/// eval harness passes per-user train items as `ModelInput::Sparse`, which
-/// [`TrainedSasRec`] accepts (treating the interaction indices as the
-/// user's history) so SASRec runs end-to-end through the same scorer EASE
-/// uses. `max_seq_len` is fixed per evaluator (not a tuned axis) so every
-/// trial sees the same sequence horizon.
+/// `days_ago` column. The per-fold scorer used to pass per-user train items
+/// as `ModelInput::Sparse`, which discarded chronology — fixed in #51 by
+/// routing through the adapter. `max_seq_len` is fixed per evaluator
+/// (not a tuned axis) so every trial sees the same sequence horizon.
 #[cfg(feature = "ml-models")]
 pub struct SasRecFoldEvaluator {
     /// History length / positional-embedding cap shared by every trial.
@@ -775,24 +774,23 @@ impl FoldEvaluator<SasRecParams> for SasRecFoldEvaluator {
         )?;
         let trained = TrainedSasRec::new(fitted, model_config, mappings);
 
-        let train_df = read_interactions_df(train_interactions_path)?;
-        let train_user_items = group_user_items(&train_df, trained.item_mapping())?;
-        let test_df = read_interactions_df(test_interactions_path)?;
-        let test_user_items = group_user_items(&test_df, trained.item_mapping())?;
-        // No user-feature file in tuning; SASRec ignores user features.
-        let empty_user_feats: AHashMap<String, Vec<(usize, f64)>> = AHashMap::new();
-
-        score_recmodel_over_test_users(
-            &trained,
-            &train_user_items,
-            &test_user_items,
-            &empty_user_feats,
-            eval_k,
-            |interactions, _user_features| ModelInput::Sparse {
-                interactions,
-                user_features: &[],
-            },
-        )
+        // Route per-fold scoring through `SasRecEvalAdapter` so each test
+        // user's train history is ordered chronologically by `days_ago`
+        // before being passed to the model (#51). The adapter errors
+        // loudly if the train fold has no `days_ago` column, matching
+        // the training-time requirement.
+        let adapter = crate::evaluation::SasRecEvalAdapter::new(&trained);
+        let config = crate::evaluation::EvalConfig {
+            k_values: vec![eval_k],
+        };
+        let report = crate::evaluation::evaluate_with_adapter(
+            &adapter,
+            test_interactions_path,
+            train_interactions_path,
+            None,
+            &config,
+        )?;
+        Ok(report.metrics_at_k[0].ndcg)
     }
 }
 
