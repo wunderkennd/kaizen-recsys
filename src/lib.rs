@@ -1930,6 +1930,48 @@ mod two_tower_py {
             Ok((report.passed, PyList::new(py, &report.messages)?))
         }
 
+        /// Evaluate against test interactions via the `&dyn RecModel`
+        /// harness routed through `TwoTowerEvalAdapter` (same metrics
+        /// dict shape as `FeaseModel.evaluate`).
+        #[pyo3(signature = (test_interactions_path, train_interactions_path, k_values=None))]
+        fn evaluate<'py>(
+            &self,
+            py: Python<'py>,
+            test_interactions_path: &str,
+            train_interactions_path: &str,
+            k_values: Option<Vec<usize>>,
+        ) -> PyResult<Bound<'py, PyDict>> {
+            let config = evaluation::EvalConfig {
+                k_values: k_values.unwrap_or_else(|| vec![5, 10, 20, 50]),
+            };
+            let report = evaluation::evaluate_model(
+                &self.model,
+                test_interactions_path,
+                train_interactions_path,
+                None,
+                &config,
+            )
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+
+            let result = PyDict::new(py);
+            result.set_item("num_users", report.num_users)?;
+            result.set_item("num_interactions", report.num_interactions)?;
+            result.set_item("coverage", report.coverage)?;
+            let metrics_list = PyList::empty(py);
+            for m in &report.metrics_at_k {
+                let d = PyDict::new(py);
+                d.set_item("k", m.k)?;
+                d.set_item("precision", m.precision)?;
+                d.set_item("recall", m.recall)?;
+                d.set_item("ndcg", m.ndcg)?;
+                d.set_item("map", m.map)?;
+                d.set_item("hit_rate", m.hit_rate)?;
+                metrics_list.append(d)?;
+            }
+            result.set_item("metrics", metrics_list)?;
+            Ok(result)
+        }
+
         /// Persist the model to `path` (framed `FTWO` format).
         fn save(&self, path: String) -> PyResult<()> {
             self.model
