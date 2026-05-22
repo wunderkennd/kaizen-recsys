@@ -546,24 +546,42 @@ pub fn evaluate_with_adapter(
     let mut train_user_interactions: AHashMap<String, Vec<(usize, f64)>> = AHashMap::new();
     let mut train_user_days_ago: AHashMap<String, Vec<f64>> = AHashMap::new();
     for i in 0..train_df.height() {
-        if let (Some(uid), Some(iid), Some(val)) = (
+        let (Some(uid), Some(iid), Some(val)) = (
             train_user_col.get(i),
             train_item_col.get(i),
             train_val_col.get(i),
-        ) && let Some(&item_idx) = mappings.item_to_idx.get(iid)
-        {
+        ) else {
+            continue;
+        };
+        let Some(&item_idx) = mappings.item_to_idx.get(iid) else {
+            continue;
+        };
+        // When the train file carries a `days_ago` column, we keep
+        // train_user_interactions[uid] and train_user_days_ago[uid] in
+        // lockstep so SasRecEvalAdapter can pair them by index. A row
+        // with a null `days_ago` is skipped entirely (not pushed to
+        // either map) — otherwise we'd get parallel vecs of different
+        // lengths and the adapter would report a misleading "internal
+        // error: days_ago.len() != train_items.len()". Null `days_ago`
+        // means we can't place this interaction in time, so excluding
+        // it is the conservative choice.
+        if let Some(days_col) = train_days_col_opt.as_ref() {
+            let Some(d) = days_col.get(i) else {
+                continue;
+            };
             train_user_interactions
                 .entry(uid.to_string())
                 .or_default()
                 .push((item_idx, val));
-            if let Some(days_col) = train_days_col_opt.as_ref()
-                && let Some(d) = days_col.get(i)
-            {
-                train_user_days_ago
-                    .entry(uid.to_string())
-                    .or_default()
-                    .push(d);
-            }
+            train_user_days_ago
+                .entry(uid.to_string())
+                .or_default()
+                .push(d);
+        } else {
+            train_user_interactions
+                .entry(uid.to_string())
+                .or_default()
+                .push((item_idx, val));
         }
     }
 

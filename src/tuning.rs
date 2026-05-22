@@ -774,23 +774,56 @@ impl FoldEvaluator<SasRecParams> for SasRecFoldEvaluator {
         )?;
         let trained = TrainedSasRec::new(fitted, model_config, mappings);
 
-        // Route per-fold scoring through `SasRecEvalAdapter` so each test
-        // user's train history is ordered chronologically by `days_ago`
-        // before being passed to the model (#51). The adapter errors
-        // loudly if the train fold has no `days_ago` column, matching
-        // the training-time requirement.
+        // SASRec per-fold scoring uses `SasRecEvalAdapter` for the
+        // chronological-sort + `Sequence` construction, but does *not*
+        // go through `evaluate_with_adapter`. That harness skips test
+        // users absent from `user_to_idx`, which is fine for the public
+        // eval API but wrong here: `generate_kfold_splits` partitions
+        // users disjointly, so by construction no test user is in the
+        // train fold's `user_to_idx` and the harness would skip them
+        // all (NDCG=0 every trial). Mirrors `score_two_tower_over_
+        // test_users`, which is its own loop for the same reason.
         let adapter = crate::evaluation::SasRecEvalAdapter::new(&trained);
-        let config = crate::evaluation::EvalConfig {
-            k_values: vec![eval_k],
-        };
-        let report = crate::evaluation::evaluate_with_adapter(
-            &adapter,
-            test_interactions_path,
-            train_interactions_path,
-            None,
-            &config,
-        )?;
-        Ok(report.metrics_at_k[0].ndcg)
+
+        let train_df = read_interactions_df(train_interactions_path)?;
+        let (train_user_items, train_user_days_ago) =
+            group_user_items_with_days_ago(&train_df, trained.item_mapping())?;
+        let test_df = read_interactions_df(test_interactions_path)?;
+        let test_user_items = group_user_items(&test_df, trained.item_mapping())?;
+
+        let mut ndcg_sum = 0.0;
+        let mut n_users = 0;
+        for (user_id, test_items) in &test_user_items {
+            if test_items.is_empty() {
+                continue;
+            }
+            let train_items: Vec<(usize, f64)> =
+                train_user_items.get(user_id).cloned().unwrap_or_default();
+            let days_ago_vec: Vec<f64> = train_user_days_ago
+                .get(user_id)
+                .cloned()
+                .unwrap_or_default();
+
+            let ctx = crate::evaluation::UserEvalContext {
+                train_items: &train_items,
+                // Always Some — group_user_items_with_days_ago already
+                // bailed if the train fold had no `days_ago` column.
+                // For test users with no train interactions (the common
+                // case under user-disjoint k-fold), the slice is empty.
+                train_days_ago: Some(&days_ago_vec),
+                user_features: &[],
+                user_idx: None,
+            };
+            let scores =
+                <_ as crate::evaluation::EvalAdapter>::predict_user_scores(&adapter, &ctx)?;
+            ndcg_sum += rank_and_ndcg(&scores, &train_items, test_items, eval_k);
+            n_users += 1;
+        }
+
+        if n_users == 0 {
+            return Ok(0.0);
+        }
+        Ok(ndcg_sum / n_users as f64)
     }
 }
 
@@ -1144,6 +1177,58 @@ fn group_user_items(
     }
 
     Ok(map)
+}
+
+/// Per-user (items, days_ago) maps in lockstep — see
+/// [`group_user_items_with_days_ago`].
+#[cfg(feature = "ml-models")]
+type UserItemsWithDaysAgo = (
+    AHashMap<String, Vec<(usize, f64)>>,
+    AHashMap<String, Vec<f64>>,
+);
+
+/// Same as [`group_user_items`] but also collects each row's `days_ago`
+/// in parallel. The two per-user vecs are kept in lockstep: a row with a
+/// null `days_ago` is skipped entirely so SasRec scorers can pair items
+/// and days_ago by index. Used by `SasRecFoldEvaluator`, which requires
+/// chronological ordering at scoring time (#51).
+#[cfg(feature = "ml-models")]
+fn group_user_items_with_days_ago(
+    df: &DataFrame,
+    mappings: &Mappings,
+) -> Result<UserItemsWithDaysAgo> {
+    let user_col = df.column("user_id")?.str()?;
+    let item_col = df.column("item_id")?.str()?;
+    let val_col = df.column("value")?.f64()?;
+    let days_col = df.column("days_ago").map_err(|_| {
+        anyhow::anyhow!(
+            "SasRecFoldEvaluator requires a `days_ago` column in the train fold (matches \
+             the same requirement in `data::sequences::build_sequences`)."
+        )
+    })?;
+    let days_col = days_col.f64()?;
+
+    let mut items: AHashMap<String, Vec<(usize, f64)>> = AHashMap::new();
+    let mut days: AHashMap<String, Vec<f64>> = AHashMap::new();
+
+    for i in 0..df.height() {
+        let (Some(u), Some(it), Some(v)) = (user_col.get(i), item_col.get(i), val_col.get(i))
+        else {
+            continue;
+        };
+        let Some(&item_idx) = mappings.item_to_idx.get(it) else {
+            continue;
+        };
+        let Some(d) = days_col.get(i) else {
+            // Lockstep skip: a row with null days_ago is excluded from
+            // BOTH maps so the parallel vecs stay aligned.
+            continue;
+        };
+        items.entry(u.to_string()).or_default().push((item_idx, v));
+        days.entry(u.to_string()).or_default().push(d);
+    }
+
+    Ok((items, days))
 }
 
 // ---------------------------------------------------------------------------
