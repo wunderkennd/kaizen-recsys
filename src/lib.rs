@@ -734,8 +734,17 @@ fn build_and_train(
 /// A Python-accessible registry for territory-based multi-model routing.
 ///
 /// This wraps the Rust `FeaseModelRegistry`, allowing Python callers to register
-/// multiple trained `FeaseModel` instances (one per territory/region) and route
-/// predictions to the correct model based on a territory key.
+/// trained EASE / SASRec / Two-Tower models (one per territory/region) and route
+/// predictions to the correct model based on a territory key (#56).
+///
+/// Note on `fallback_territory` + per-model predict (#56): the fallback
+/// is resolved purely by territory key, not by model kind. If the
+/// registered fallback's kind doesn't match the `predict_top_k_*`
+/// method being called, the call errors with the same kind-mismatch
+/// message you'd get on a directly-registered mismatch (e.g. calling
+/// `predict_top_k_sasrec("JP", ...)` when "JP" is unknown and the
+/// fallback "US" holds an EASE model). The error message points at the
+/// correct method for the actual model kind, so callers can recover.
 ///
 /// Example:
 ///     >>> registry = FeaseRegistry(fallback_territory="US")
@@ -891,6 +900,123 @@ impl FeaseRegistry {
             .map(|ranked| ranked.into_iter().map(|(i, s)| (i, s as f64)).collect())
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))
     }
+
+    /// Registers a trained SASRec model for a territory (#56). Mirrors
+    /// `register` (EASE) but for `SASRecModel`. The underlying trained
+    /// model is cloned into the registry; the source `SASRecModel`
+    /// instance remains usable. Available only when the extension is
+    /// built with `--features ml-models`.
+    #[cfg(feature = "ml-models")]
+    fn register_sasrec(&mut self, territory: String, model: &sasrec_py::SASRecModel) {
+        self.inner
+            .register_model(territory, Box::new(model.model.clone()));
+    }
+
+    /// Registers a trained Two-Tower model for a territory (#56).
+    /// Mirrors `register` (EASE) but for `TwoTowerModel`. Available
+    /// only when the extension is built with `--features ml-models`.
+    #[cfg(feature = "ml-models")]
+    fn register_two_tower(&mut self, territory: String, model: &two_tower_py::TwoTowerModel) {
+        self.inner
+            .register_model(territory, Box::new(model.model.clone()));
+    }
+
+    /// Predicts top-K items for an EASE territory using string ids
+    /// (#56). Mirrors `FeaseModel.predict`'s API surface so callers no
+    /// longer have to map `dict[str, float]` to integer indices by
+    /// hand. The existing index-based `predict_top_k` is preserved for
+    /// back-compat.
+    ///
+    /// Scores are routed through the `RecModel` trait, whose contract is
+    /// f32 — so output values differ from a direct `FeaseModel.predict`
+    /// call (which keeps EASE math in f64) by sub-ulp rounding (~1e-7).
+    /// Ranking is unaffected; never compare scores bit-exact across the
+    /// two surfaces.
+    ///
+    /// Errors:
+    ///     ValueError: territory is unknown, or the registered model
+    ///         is not EASE.
+    #[pyo3(signature = (territory, interactions, features=None, top_k=100))]
+    fn predict_top_k_ease(
+        &self,
+        territory: &str,
+        interactions: &Bound<'_, PyDict>,
+        features: Option<&Bound<'_, PyDict>>,
+        top_k: usize,
+    ) -> PyResult<Vec<(String, f64)>> {
+        let interactions_map = pydict_to_str_f64(interactions)?;
+        let features_map = match features {
+            Some(d) => pydict_to_str_f64(d)?,
+            None => ahash::AHashMap::new(),
+        };
+        self.inner
+            .predict_top_k_ease(territory, &interactions_map, &features_map, top_k)
+            .map(|ranked| ranked.into_iter().map(|(i, s)| (i, s as f64)).collect())
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))
+    }
+
+    /// Predicts top-K items for a SASRec territory using string ids
+    /// (#56). `history` is the user's chronological item-id list,
+    /// oldest first — same convention as `SASRecModel.predict`.
+    /// Unknown item ids are silently skipped.
+    ///
+    /// Errors:
+    ///     ValueError: territory is unknown, or the registered model
+    ///         is not SASRec.
+    #[cfg(feature = "ml-models")]
+    #[pyo3(signature = (territory, history, top_k=100))]
+    fn predict_top_k_sasrec(
+        &self,
+        territory: &str,
+        history: Vec<String>,
+        top_k: usize,
+    ) -> PyResult<Vec<(String, f64)>> {
+        self.inner
+            .predict_top_k_sasrec(territory, &history, top_k)
+            .map(|ranked| ranked.into_iter().map(|(i, s)| (i, s as f64)).collect())
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))
+    }
+
+    /// Predicts top-K items for a Two-Tower territory using string ids
+    /// (#56). Warm users use their learned id row; unknown users fall
+    /// back to the reserved cold-start row. Optional `features`
+    /// follows the same routing rules as `TwoTowerModel.predict`
+    /// (one-hot → cat embedding, numeric → dense column, unknown
+    /// silently skipped — see #55).
+    ///
+    /// Errors:
+    ///     ValueError: territory is unknown, or the registered model
+    ///         is not Two-Tower.
+    #[cfg(feature = "ml-models")]
+    #[pyo3(signature = (territory, user_id, features=None, top_k=100))]
+    fn predict_top_k_two_tower(
+        &self,
+        territory: &str,
+        user_id: &str,
+        features: Option<&Bound<'_, PyDict>>,
+        top_k: usize,
+    ) -> PyResult<Vec<(String, f64)>> {
+        let features_map = match features {
+            Some(d) => pydict_to_str_f64(d)?,
+            None => ahash::AHashMap::new(),
+        };
+        self.inner
+            .predict_top_k_two_tower(territory, user_id, &features_map, top_k)
+            .map(|ranked| ranked.into_iter().map(|(i, s)| (i, s as f64)).collect())
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))
+    }
+}
+
+/// Convert a `dict[str, float]` PyDict into the
+/// `ahash::AHashMap<String, f64>` the Rust registry methods consume.
+fn pydict_to_str_f64(d: &Bound<'_, PyDict>) -> PyResult<ahash::AHashMap<String, f64>> {
+    let mut map = ahash::AHashMap::with_capacity(d.len());
+    for (k, v) in d.iter() {
+        let key: String = k.extract()?;
+        let val: f64 = v.extract()?;
+        map.insert(key, val);
+    }
+    Ok(map)
 }
 
 // --- Ranking Evaluation Metrics (PyO3 wrappers) ---
@@ -1577,7 +1703,10 @@ mod sasrec_py {
     /// A trained SASRec model, callable from Python.
     #[pyclass]
     pub struct SASRecModel {
-        model: TrainedSasRec,
+        // `pub(crate)` so `FeaseRegistry::register_sasrec` (sibling
+        // module in lib.rs) can clone the underlying TrainedSasRec
+        // into the trait-object registry (#56).
+        pub(crate) model: TrainedSasRec,
         #[pyo3(get)]
         num_items: usize,
         #[pyo3(get)]
@@ -1846,7 +1975,10 @@ mod two_tower_py {
     /// A trained Two-Tower model, callable from Python.
     #[pyclass]
     pub struct TwoTowerModel {
-        model: TrainedTwoTower,
+        // `pub(crate)` so `FeaseRegistry::register_two_tower` (sibling
+        // module in lib.rs) can clone the underlying TrainedTwoTower
+        // into the trait-object registry (#56).
+        pub(crate) model: TrainedTwoTower,
         #[pyo3(get)]
         num_items: usize,
         #[pyo3(get)]

@@ -398,7 +398,10 @@ struct TwoTowerMeta {
 
 /// A trained, ready-to-serve Two-Tower model on the CPU `NdArray` backend.
 /// Holds the catalog item embedding matrix precomputed once at construction
-/// so `predict_scores` is a single user-forward + matmul.
+/// so `predict_scores` is a single user-forward + matmul. `Clone` lets the
+/// Python `FeaseRegistry.register_two_tower(...)` path hand a copy to the
+/// registry without taking ownership of the source model (#56).
+#[derive(Clone)]
 pub struct TrainedTwoTower {
     model: TwoTower<InfB>,
     meta: TwoTowerMeta,
@@ -750,47 +753,6 @@ fn catalog_matrix(model: &TwoTower<InfB>, meta: &TwoTowerMeta, device: &Dev) -> 
 }
 
 impl TrainedTwoTower {
-    /// Translate a `feature_name → value` map (e.g. from a Python
-    /// `dict[str, float]`) into the integer (`cat_features`,
-    /// `dense_features`) pair the user tower expects (#55).
-    ///
-    /// - **Categorical features:** if `feature_name` was registered as
-    ///   categorical at train time and `value` is non-zero, the slot's
-    ///   index is appended to `cat_features`. The categorical embedding
-    ///   is an "is present" signal in the user tower — the value's
-    ///   magnitude is otherwise unused, mirroring the one-hot semantics
-    ///   `data::triples::load_features` infers at train time.
-    /// - **Dense features:** if `feature_name` was registered as dense,
-    ///   `value` is written into the matching dense column. Columns for
-    ///   features not in the map stay at zero.
-    /// - **Unknown features:** silently skipped (no error), so callers
-    ///   can pass a single `dict` covering multiple model variants.
-    ///
-    /// Returns the empty `(vec![], vec![0.0; dense_dim])` pair when the
-    /// trained model has no user-feature maps (model trained without a
-    /// user feature file), which preserves the bare cold-start path.
-    pub fn resolve_user_features(
-        &self,
-        features: &AHashMap<String, f64>,
-    ) -> (Vec<usize>, Vec<f32>) {
-        let dense_dim = self.meta.user_dense_dim;
-        let mut cat_features: Vec<usize> = Vec::new();
-        let mut dense_features: Vec<f32> = vec![0.0; dense_dim];
-        for (name, value) in features {
-            if let Some(&cat_idx) = self.meta.user_cat_feature_to_idx.get(name) {
-                if *value != 0.0 {
-                    cat_features.push(cat_idx);
-                }
-            } else if let Some(&col) = self.meta.user_dense_feature_to_idx.get(name)
-                && col < dense_dim
-            {
-                dense_features[col] = *value as f32;
-            }
-            // Unknown feature names: skip silently.
-        }
-        (cat_features, dense_features)
-    }
-
     /// Serialize to the framed `FTWO || version || bincode(meta) ||
     /// params` format (research §4, mirrors `serialization.rs`).
     pub fn save_to(&self, path: &Path) -> Result<()> {
@@ -1035,6 +997,31 @@ impl RecModel for TrainedTwoTower {
 
     fn save(&self, path: &Path) -> Result<()> {
         self.save_to(path)
+    }
+
+    /// Translate a `feature_name → value` map into the integer
+    /// `(cat_features, dense_features)` pair the user tower expects
+    /// (#55). Routing rules:
+    /// - Categorical (one-hot) features with non-zero value contribute
+    ///   their slot index to `cat_features`. Magnitude unused.
+    /// - Dense numeric features fill the matching dense column.
+    /// - Unknown feature names are silently skipped.
+    fn resolve_user_features(&self, features: &AHashMap<String, f64>) -> (Vec<usize>, Vec<f32>) {
+        let dense_dim = self.meta.user_dense_dim;
+        let mut cat_features: Vec<usize> = Vec::new();
+        let mut dense_features: Vec<f32> = vec![0.0; dense_dim];
+        for (name, value) in features {
+            if let Some(&cat_idx) = self.meta.user_cat_feature_to_idx.get(name) {
+                if *value != 0.0 {
+                    cat_features.push(cat_idx);
+                }
+            } else if let Some(&col) = self.meta.user_dense_feature_to_idx.get(name)
+                && col < dense_dim
+            {
+                dense_features[col] = *value as f32;
+            }
+        }
+        (cat_features, dense_features)
     }
 }
 

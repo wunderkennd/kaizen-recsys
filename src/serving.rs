@@ -14,9 +14,9 @@
 //! Also provides batch prediction for efficiently scoring multiple users at once.
 
 use crate::model::RustFeaseModel;
-use crate::models::{EaseAdapter, ModelInput, RecModel};
+use crate::models::{EaseAdapter, ModelInput, ModelKind, RecModel};
 use ahash::AHashMap;
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use rayon::prelude::*;
 
 /// A registry of recommender models keyed by territory/region name.
@@ -162,6 +162,115 @@ impl FeaseModelRegistry {
         model.predict_similar_items(item_idx, top_k)
     }
 
+    /// String-id-native EASE top-K (#56). Mirrors `FeaseModel.predict`'s
+    /// surface: callers pass `dict[str, float]` interactions and features
+    /// and get back `(item_id, score)` rows. Errors if the registered
+    /// model for `territory` isn't EASE.
+    pub fn predict_top_k_ease(
+        &self,
+        territory: &str,
+        interactions: &AHashMap<String, f64>,
+        features: &AHashMap<String, f64>,
+        top_k: usize,
+    ) -> Result<Vec<(String, f32)>> {
+        let model = self.route(territory)?;
+        if model.kind() != ModelKind::Ease {
+            bail!(
+                "predict_top_k_ease called on territory '{territory}', but the registered \
+                 model is {:?}. Use predict_top_k_{} instead.",
+                model.kind(),
+                kind_method_suffix(model.kind())
+            );
+        }
+        let mappings = model.item_mapping();
+        let interactions_idx: Vec<(usize, f64)> = interactions
+            .iter()
+            .filter_map(|(name, &v)| mappings.item_to_idx.get(name).map(|&i| (i, v)))
+            .collect();
+        let features_idx: Vec<(usize, f64)> = features
+            .iter()
+            .filter_map(|(name, &v)| mappings.user_feature_to_idx.get(name).map(|&i| (i, v)))
+            .collect();
+        let scores = model.predict_scores(ModelInput::Sparse {
+            interactions: &interactions_idx,
+            user_features: &features_idx,
+        })?;
+        let interacted: Vec<usize> = interactions_idx.iter().map(|(idx, _)| *idx).collect();
+        let ranked = filter_sort_top_k(scores, &interacted, top_k);
+        Ok(idx_scores_to_str(&ranked, mappings))
+    }
+
+    /// String-id-native SASRec top-K (#56). `history` is a chronological
+    /// item-id list (oldest first), mirroring `SASRecModel.predict`.
+    /// Unknown item ids are skipped silently. Errors if the registered
+    /// model for `territory` isn't SASRec.
+    #[cfg(feature = "ml-models")]
+    pub fn predict_top_k_sasrec(
+        &self,
+        territory: &str,
+        history: &[String],
+        top_k: usize,
+    ) -> Result<Vec<(String, f32)>> {
+        let model = self.route(territory)?;
+        if model.kind() != ModelKind::SasRec {
+            bail!(
+                "predict_top_k_sasrec called on territory '{territory}', but the registered \
+                 model is {:?}. Use predict_top_k_{} instead.",
+                model.kind(),
+                kind_method_suffix(model.kind())
+            );
+        }
+        let mappings = model.item_mapping();
+        let history_idx: Vec<usize> = history
+            .iter()
+            .filter_map(|id| mappings.item_to_idx.get(id).copied())
+            .collect();
+        let scores = model.predict_scores(ModelInput::Sequence {
+            history: &history_idx,
+        })?;
+        // SASRec ranking excludes items already in the user's history,
+        // matching SASRecModel.predict's behaviour.
+        let ranked = filter_sort_top_k(scores, &history_idx, top_k);
+        Ok(idx_scores_to_str(&ranked, mappings))
+    }
+
+    /// String-id-native Two-Tower top-K (#56). Warm users use their
+    /// learned id-row embedding; unknown users fall back to the
+    /// reserved cold-start row. When `features` is non-empty, the
+    /// trained model's `resolve_user_features` map translates names
+    /// into category indices and dense columns (#55). Errors if the
+    /// registered model for `territory` isn't Two-Tower.
+    #[cfg(feature = "ml-models")]
+    pub fn predict_top_k_two_tower(
+        &self,
+        territory: &str,
+        user_id: &str,
+        features: &AHashMap<String, f64>,
+        top_k: usize,
+    ) -> Result<Vec<(String, f32)>> {
+        let model = self.route(territory)?;
+        if model.kind() != ModelKind::TwoTower {
+            bail!(
+                "predict_top_k_two_tower called on territory '{territory}', but the registered \
+                 model is {:?}. Use predict_top_k_{} instead.",
+                model.kind(),
+                kind_method_suffix(model.kind())
+            );
+        }
+        let mappings = model.item_mapping();
+        let user_idx = mappings.user_to_idx.get(user_id).copied();
+        let (cat_features, dense_features) = model.resolve_user_features(features);
+        let scores = model.predict_scores(ModelInput::TowerUser {
+            user_idx,
+            cat_features: &cat_features,
+            dense_features: &dense_features,
+        })?;
+        // Two-Tower has no per-request history to exclude — matches
+        // `TwoTowerModel.predict`'s behaviour.
+        let ranked = filter_sort_top_k(scores, &[], top_k);
+        Ok(idx_scores_to_str(&ranked, mappings))
+    }
+
     /// Routes a territory to its model (or the fallback), erroring with a
     /// consistent message when neither exists.
     fn route(&self, territory: &str) -> Result<&dyn RecModel> {
@@ -178,6 +287,31 @@ impl Default for FeaseModelRegistry {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Method-name suffix matching a model kind — used in error messages
+/// to point callers at the correct `predict_top_k_*` variant when they
+/// invoke the wrong one.
+fn kind_method_suffix(kind: ModelKind) -> &'static str {
+    match kind {
+        ModelKind::Ease => "ease",
+        ModelKind::SasRec => "sasrec",
+        ModelKind::TwoTower => "two_tower",
+    }
+}
+
+/// Translate index-keyed `(item_idx, score)` rows back to string ids
+/// via the model's catalog mapping. Skips indices that aren't present
+/// in `idx_to_item` (shouldn't happen in practice — scores are indexed
+/// over the catalog — but keep it total).
+fn idx_scores_to_str(
+    ranked: &[(usize, f32)],
+    mappings: &crate::data_pipeline::Mappings,
+) -> Vec<(String, f32)> {
+    ranked
+        .iter()
+        .filter_map(|(idx, score)| mappings.idx_to_item.get(*idx).map(|s| (s.clone(), *score)))
+        .collect()
 }
 
 /// A single user's input data for batch prediction.
@@ -469,6 +603,77 @@ mod tests {
         let removed = registry.unregister("US");
         assert!(removed.is_some());
         assert!(registry.is_empty());
+    }
+
+    /// #56: predict_top_k_ease translates string ids via the registered
+    /// model's mappings and produces (item_id, score) rows.
+    #[test]
+    fn test_predict_top_k_ease_string_ids_route_through_mappings() {
+        use crate::data_pipeline::Mappings;
+        let mut model = make_test_model(1.0);
+        let mut mappings = Mappings {
+            user_to_idx: Default::default(),
+            idx_to_user: Default::default(),
+            item_to_idx: Default::default(),
+            idx_to_item: vec!["a".into(), "b".into(), "c".into(), "d".into()],
+            user_feature_to_idx: Default::default(),
+            idx_to_user_feature: Default::default(),
+            item_feature_to_idx: Default::default(),
+            idx_to_item_feature: Default::default(),
+        };
+        for (i, id) in mappings.idx_to_item.iter().enumerate() {
+            mappings.item_to_idx.insert(id.clone(), i);
+        }
+        model.mappings = mappings;
+
+        let mut registry = FeaseModelRegistry::new();
+        registry.register("US".to_string(), model);
+
+        let mut interactions = AHashMap::new();
+        interactions.insert("a".to_string(), 1.0);
+        let features = AHashMap::new();
+        let ranked = registry
+            .predict_top_k_ease("US", &interactions, &features, 3)
+            .expect("predict_top_k_ease should succeed");
+        // Ranked items are string ids, not indices.
+        assert!(!ranked.is_empty());
+        for (item_id, _) in &ranked {
+            assert!(["a", "b", "c", "d"].contains(&item_id.as_str()));
+            // The user already interacted with "a" — must be excluded.
+            assert_ne!(item_id, "a");
+        }
+    }
+
+    /// #56: predict_top_k_sasrec on a territory holding an EASE model
+    /// errors loudly with a useful message instead of silently
+    /// invoking the wrong predict path.
+    #[cfg(feature = "ml-models")]
+    #[test]
+    fn test_predict_top_k_sasrec_rejects_ease_territory() {
+        let mut registry = FeaseModelRegistry::new();
+        registry.register("US".to_string(), make_test_model(1.0));
+        let err = registry
+            .predict_top_k_sasrec("US", &["a".to_string()], 3)
+            .expect_err("should reject mismatched model kind");
+        let msg = format!("{err}");
+        assert!(msg.contains("predict_top_k_sasrec"));
+        assert!(msg.contains("predict_top_k_ease"));
+    }
+
+    /// #56: predict_top_k_two_tower on a territory holding an EASE model
+    /// errors loudly with a useful message.
+    #[cfg(feature = "ml-models")]
+    #[test]
+    fn test_predict_top_k_two_tower_rejects_ease_territory() {
+        let mut registry = FeaseModelRegistry::new();
+        registry.register("US".to_string(), make_test_model(1.0));
+        let features = AHashMap::new();
+        let err = registry
+            .predict_top_k_two_tower("US", "user0", &features, 3)
+            .expect_err("should reject mismatched model kind");
+        let msg = format!("{err}");
+        assert!(msg.contains("predict_top_k_two_tower"));
+        assert!(msg.contains("predict_top_k_ease"));
     }
 
     #[test]
