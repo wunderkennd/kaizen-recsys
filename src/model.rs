@@ -44,6 +44,7 @@ pub struct RustFeaseModel {
     /// Mappings to convert between string IDs and numeric indices
     pub mappings: Mappings,
     pub weighting_config: Option<WeightingConfig>,
+    pub transformation_schema: Option<crate::transform::FeatureTransformationSchema>,
 }
 
 impl RustFeaseModel {
@@ -72,6 +73,7 @@ impl RustFeaseModel {
             meta_weight,
             mappings,
             weighting_config: None,
+            transformation_schema: None,
         }
     }
 
@@ -378,6 +380,52 @@ impl RustFeaseModel {
         p_items.iter().cloned().collect()
     }
 
+    /// Predicts scores for a user starting from a raw key-value mapping of user features.
+    /// Uses the transformation schema embedded in the model if present.
+    pub fn predict_raw(
+        &self,
+        interactions: &std::collections::HashMap<String, f64>,
+        raw_user_features: &std::collections::HashMap<String, serde_json::Value>,
+        beta: f64,
+    ) -> Vec<f64> {
+        // 1. Transform raw user features using the embedded schema if available
+        let transformed_features = if let Some(ref schema) = self.transformation_schema {
+            crate::transform::transform_features(raw_user_features, schema)
+        } else {
+            // No schema, use features as-is if they are already mapped (represented as floats)
+            let mut fm = std::collections::HashMap::new();
+            for (k, v) in raw_user_features {
+                if let Some(f) = v.as_f64() {
+                    fm.insert(k.clone(), f);
+                } else if let Some(s) = v.as_str() {
+                    if let Ok(f) = s.parse::<f64>() {
+                        fm.insert(k.clone(), f);
+                    }
+                }
+            }
+            fm
+        };
+
+        // 2. Convert string interaction keys to internal indices
+        let mut user_interactions = Vec::with_capacity(interactions.len());
+        for (item_guid, &value) in interactions {
+            if let Some(&item_idx) = self.mappings.item_to_idx.get(item_guid) {
+                user_interactions.push((item_idx, value));
+            }
+        }
+
+        // 3. Convert transformed feature keys to internal indices
+        let mut user_features = Vec::with_capacity(transformed_features.len());
+        for (feature_name, &value) in &transformed_features {
+            if let Some(&feature_idx) = self.mappings.user_feature_to_idx.get(feature_name) {
+                user_features.push((feature_idx, value));
+            }
+        }
+
+        // 4. Delegate to the index-based prediction engine
+        self.predict(&user_interactions, &user_features, beta)
+    }
+
     /// Predicts similar items for a given item (More-Like-This / MLT).
     ///
     /// Uses the item-item block of the S matrix to find the most similar items
@@ -638,6 +686,7 @@ mod tests {
             meta_weight: 0.0,
             mappings: dummy_mappings(),
             weighting_config: None,
+            transformation_schema: None,
         };
 
         // --- 1. Warm User: interacts with Item 0, has Feature 1 ---
@@ -693,6 +742,7 @@ mod tests {
             meta_weight: 0.0,
             mappings: dummy_mappings(),
             weighting_config: None,
+            transformation_schema: None,
         };
 
         // Similar to Item 0
@@ -776,6 +826,7 @@ mod tests {
             meta_weight: 0.0,
             mappings: dummy_mappings(),
             weighting_config: None,
+            transformation_schema: None,
         };
 
         let report = model.validate();
@@ -796,6 +847,7 @@ mod tests {
             meta_weight: 0.0,
             mappings: dummy_mappings(),
             weighting_config: None,
+            transformation_schema: None,
         };
 
         let report = model.validate();
