@@ -17,6 +17,12 @@ from kzn_recsys._native import (
     random_split,
     temporal_split,
     leave_k_out_split,
+    Format,
+    optimize_layout,
+    GaussianAnomalyDetector,
+    NumericalBucketConfig,
+    FeatureTransformationSchema,
+    LayoutConstraint,
 )
 from kzn_recsys.fease_wrapper import (
     SplitResult,
@@ -49,4 +55,10 @@ __all__ = [
     "leave_k_out_split_safe",
     "EngagementSchema",
     "MetadataSchema",
+    "Format",
+    "optimize_layout",
+    "GaussianAnomalyDetector",
+    "NumericalBucketConfig",
+    "FeatureTransformationSchema",
+    "LayoutConstraint",
 ]

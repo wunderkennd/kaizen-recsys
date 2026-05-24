@@ -26,6 +26,8 @@ mod serialization;
 mod serving;
 pub mod tuning;
 mod weighting;
+mod layout;
+pub mod transform;
 
 /// A Python-accessible class that holds the trained FEASE model.
 ///
@@ -50,6 +52,10 @@ struct FeaseModel {
     /// Number of item features the model was trained on.
     #[pyo3(get)]
     num_item_features: usize,
+
+    /// Feature transformation schema used during training.
+    #[pyo3(get)]
+    transformation_schema: Option<transform::FeatureTransformationSchema>,
 }
 
 #[pymethods]
@@ -124,6 +130,79 @@ impl FeaseModel {
         let py_results = PyList::empty(py);
         for (idx, score) in results_with_idx.into_iter().take(top_k) {
             // Map item_idx back to item_guid
+            if let Some(guid) = self.model.mappings.idx_to_item.get(idx) {
+                let py_guid = PyString::new(py, guid);
+                let py_score = PyFloat::new(py, score);
+                py_results.append((py_guid, py_score))?;
+            }
+        }
+
+        Ok(py_results)
+    }
+
+    /// Predicts recommendation scores starting from raw categorical/numerical features.
+    /// Uses the embedded FeatureTransformationSchema to bin and prepend features.
+    #[pyo3(signature = (interactions, raw_features, top_k=100))]
+    fn predict_raw<'py>(
+        &self,
+        py: Python<'py>,
+        interactions: &Bound<'_, PyDict>,
+        raw_features: &Bound<'_, PyDict>,
+        top_k: usize,
+    ) -> PyResult<Bound<'py, PyList>> {
+        // 1. Convert Python interactions (item_guid -> f64) to Rust map
+        let mut rust_interactions = std::collections::HashMap::new();
+        for (key, val) in interactions.iter() {
+            let item_guid: String = key.extract()?;
+            let value: f64 = val.extract()?;
+            rust_interactions.insert(item_guid, value);
+        }
+
+        // 2. Convert Python raw_features (feature_name -> PyAny) to Rust map of serde_json::Value
+        let mut rust_raw_features = std::collections::HashMap::new();
+        for (key, val) in raw_features.iter() {
+            let k: String = key.extract()?;
+            let value: serde_json::Value = if let Ok(s) = val.extract::<String>() {
+                serde_json::Value::String(s)
+            } else if let Ok(b) = val.extract::<bool>() {
+                serde_json::Value::Bool(b)
+            } else if let Ok(i) = val.extract::<i64>() {
+                serde_json::Value::Number(serde_json::Number::from(i))
+            } else if let Ok(f) = val.extract::<f64>() {
+                if let Some(num) = serde_json::Number::from_f64(f) {
+                    serde_json::Value::Number(num)
+                } else {
+                    serde_json::Value::Null
+                }
+            } else {
+                serde_json::Value::Null
+            };
+            rust_raw_features.insert(k, value);
+        }
+
+        // 3. Call the internal Rust predict_raw function
+        let scores = self.model.predict_raw(&rust_interactions, &rust_raw_features, self.model.beta);
+
+        // 4. Exclude interacted items
+        let mut interacted_indices = std::collections::HashSet::new();
+        for item_guid in rust_interactions.keys() {
+            if let Some(&idx) = self.model.mappings.item_to_idx.get(item_guid) {
+                interacted_indices.insert(idx);
+            }
+        }
+
+        let mut results_with_idx: Vec<(usize, f64)> = scores
+            .into_iter()
+            .enumerate()
+            .filter(|(idx, _score)| !interacted_indices.contains(idx))
+            .collect();
+
+        // Sort by score, descending
+        results_with_idx.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        // 5. Convert top-K results back to Python types
+        let py_results = PyList::empty(py);
+        for (idx, score) in results_with_idx.into_iter().take(top_k) {
             if let Some(guid) = self.model.mappings.idx_to_item.get(idx) {
                 let py_guid = PyString::new(py, guid);
                 let py_score = PyFloat::new(py, score);
@@ -376,6 +455,7 @@ fn load_model(path: String) -> PyResult<FeaseModel> {
         num_items: model.num_items,
         num_user_features: model.num_user_features,
         num_item_features: model.num_item_features,
+        transformation_schema: model.transformation_schema.clone(),
         model,
     })
 }
@@ -582,7 +662,8 @@ fn leave_k_out_split(
     decay_rate = 0.0,
     ips_alpha = 0.0,
     sparsity_threshold = 0.0,
-    event_weights = None
+    event_weights = None,
+    transformation_schema = None
 ))]
 #[allow(clippy::too_many_arguments)]
 fn build_and_train(
@@ -597,6 +678,7 @@ fn build_and_train(
     ips_alpha: f64,
     sparsity_threshold: f64,
     event_weights: Option<&Bound<'_, PyDict>>,
+    transformation_schema: Option<transform::FeatureTransformationSchema>,
 ) -> PyResult<FeaseModel> {
     log::info!("--- [Rust] Starting Model Training ---");
     let start_time = Instant::now();
@@ -694,6 +776,7 @@ fn build_and_train(
     );
 
     rust_model.weighting_config = weighting_config;
+    rust_model.transformation_schema = transformation_schema;
 
     // --- 2b. Apply sparsity pruning ---
     if sparsity_threshold > 0.0 {
@@ -712,6 +795,7 @@ fn build_and_train(
 
     // --- 4. Wrap in Python Class ---
     let model = FeaseModel {
+        transformation_schema: rust_model.transformation_schema.clone(),
         model: rust_model,
         num_items,
         num_user_features,
@@ -1147,5 +1231,129 @@ fn _native(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(random_search_py, m)?)?;
     m.add_class::<FeaseModel>()?;
     m.add_class::<FeaseRegistry>()?;
+    m.add_class::<layout::Format>()?;
+    m.add_class::<data_validation::GaussianAnomalyDetector>()?;
+    m.add_class::<transform::NumericalBucketConfig>()?;
+    m.add_class::<transform::FeatureTransformationSchema>()?;
+    m.add_class::<PyLayoutConstraint>()?;
+    m.add_function(wrap_pyfunction!(optimize_layout, m)?)?;
     Ok(())
+}
+
+/// Dynamic, polymorphic layout constraints exposed to Python.
+#[pyclass(name = "LayoutConstraint")]
+#[derive(Clone, Debug)]
+pub struct PyLayoutConstraint {
+    pub rule: layout::ConstraintRule,
+}
+
+#[pymethods]
+impl PyLayoutConstraint {
+    #[staticmethod]
+    pub fn no_consecutive(format: layout::Format) -> Self {
+        PyLayoutConstraint {
+            rule: layout::ConstraintRule::NoConsecutive(format),
+        }
+    }
+
+    #[staticmethod]
+    pub fn disallowed_at_slot(format: layout::Format, slot_idx: usize) -> Self {
+        PyLayoutConstraint {
+            rule: layout::ConstraintRule::DisallowedAtSlot { format, slot_idx },
+        }
+    }
+
+    #[staticmethod]
+    pub fn max_occurrences(format: layout::Format, limit: usize) -> Self {
+        PyLayoutConstraint {
+            rule: layout::ConstraintRule::MaxOccurrences { format, limit },
+        }
+    }
+
+    #[staticmethod]
+    pub fn no_consecutive_banners() -> Self {
+        PyLayoutConstraint {
+            rule: layout::ConstraintRule::NoConsecutive(layout::Format::Banner),
+        }
+    }
+}
+
+/// Exposes the Dynamic Programming whole-page layout optimizer to Python.
+///
+/// Ingests a list of dictionaries representing trays, along with a total rendering
+/// height budget and an optional list of custom layout constraints.
+#[pyfunction]
+#[pyo3(signature = (trays, max_height, constraints = None))]
+fn optimize_layout(
+    trays: Vec<Bound<'_, PyDict>>,
+    max_height: usize,
+    constraints: Option<Vec<PyLayoutConstraint>>,
+) -> PyResult<(f64, Vec<layout::Format>)> {
+    let mut rust_trays = Vec::with_capacity(trays.len());
+    for py_tray in trays {
+        let id: usize = py_tray.get_item("id")?.ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyKeyError, _>("Tray dict must contain 'id'")
+        })?.extract()?;
+
+        let options_obj = py_tray.get_item("options")?.ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyKeyError, _>("Tray dict must contain 'options'")
+        })?;
+        let options_list: &Bound<'_, PyList> = options_obj
+            .cast()
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyTypeError, _>(e.to_string()))?;
+
+        let mut rust_options = Vec::with_capacity(options_list.len());
+        for item in options_list.iter() {
+            let py_opt: &Bound<'_, PyDict> = item
+                .cast()
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyTypeError, _>(e.to_string()))?;
+
+            let format_obj = py_opt.get_item("format")?.ok_or_else(|| {
+                PyErr::new::<pyo3::exceptions::PyKeyError, _>("Option dict must contain 'format'")
+            })?;
+            let format_str: String = format_obj.extract()?;
+
+            let format = match format_str.as_str() {
+                "Carousel" => layout::Format::Carousel,
+                "Grid2x3" => layout::Format::Grid2x3,
+                "Banner" => layout::Format::Banner,
+                _ => layout::Format::None,
+            };
+
+            let height_obj = py_opt.get_item("height")?.ok_or_else(|| {
+                PyErr::new::<pyo3::exceptions::PyKeyError, _>("Option dict must contain 'height'")
+            })?;
+            let height: usize = height_obj.extract()?;
+
+            let utility_obj = py_opt.get_item("utility")?.ok_or_else(|| {
+                PyErr::new::<pyo3::exceptions::PyKeyError, _>("Option dict must contain 'utility'")
+            })?;
+            let utility: f64 = utility_obj.extract()?;
+
+            let item_count_obj = py_opt.get_item("item_count")?.ok_or_else(|| {
+                PyErr::new::<pyo3::exceptions::PyKeyError, _>("Option dict must contain 'item_count'")
+            })?;
+            let item_count: usize = item_count_obj.extract()?;
+
+            rust_options.push(layout::TrayOption {
+                format,
+                height,
+                utility,
+                item_count,
+            });
+        }
+
+        rust_trays.push(layout::Tray {
+            id,
+            options: rust_options,
+        });
+    }
+
+    let native_constraints = match constraints {
+        Some(list) => list.into_iter().map(|c| c.rule).collect(),
+        None => vec![layout::ConstraintRule::NoConsecutive(layout::Format::Banner)],
+    };
+
+    let (val, formats) = layout::solve_tray_layout_with_constraints(&rust_trays, max_height, &native_constraints);
+    Ok((val, formats))
 }

@@ -8,12 +8,14 @@
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use pyo3::prelude::*;
 
 /// A single confidence-interval check based on Gaussian statistics.
 ///
 /// Given historical `mean` and `std`, the acceptable range is
 /// `[mean - std_multiplier * std, mean + std_multiplier * std]`.
 /// The `low` / `high` fields store these pre-computed bounds.
+#[pyclass(get_all)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GaussianAnomalyDetector {
     /// Lower bound of the confidence interval.
@@ -103,6 +105,32 @@ impl GaussianAnomalyDetector {
                 high: self.high,
             }
         }
+    }
+}
+
+#[pymethods]
+impl GaussianAnomalyDetector {
+    #[new]
+    #[pyo3(signature = (low, high, mean, std, std_multiplier))]
+    pub fn py_new(low: f64, high: f64, mean: f64, std: f64, std_multiplier: f64) -> Self {
+        Self {
+            low,
+            high,
+            mean,
+            std,
+            std_multiplier,
+        }
+    }
+
+    #[staticmethod]
+    #[pyo3(signature = (values, std_multiplier))]
+    pub fn fit(values: Vec<f64>, std_multiplier: f64) -> Option<Self> {
+        Self::from_observations(&values, std_multiplier)
+    }
+
+    #[pyo3(name = "check", signature = (value, label = "unlabeled"))]
+    pub fn check_py(&self, value: f64, label: &str) -> bool {
+        self.check(value, label).passed()
     }
 }
 
