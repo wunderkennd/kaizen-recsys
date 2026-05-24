@@ -7,6 +7,7 @@
 use crate::data_pipeline::Mappings;
 use crate::model::RustFeaseModel;
 use crate::weighting::WeightingConfig;
+use crate::transform::FeatureTransformationSchema;
 use anyhow::{Context, Result};
 use nalgebra::DMatrix;
 use serde::{Deserialize, Serialize};
@@ -15,7 +16,7 @@ use std::path::Path;
 
 /// Current version of the serialization format.
 /// Increment when making breaking changes to `SerializedModel`.
-const FORMAT_VERSION: u32 = 2;
+const FORMAT_VERSION: u32 = 3;
 
 /// Magic bytes to identify FEASE model files.
 const MAGIC: &[u8; 4] = b"FEAS";
@@ -46,7 +47,7 @@ struct SerializedModelV1 {
 }
 
 impl SerializedModelV1 {
-    fn into_v2(self) -> SerializedModel {
+    fn into_v3(self) -> SerializedModel {
         SerializedModel {
             version: self.version,
             s_nrows: self.s_nrows,
@@ -68,6 +69,61 @@ impl SerializedModelV1 {
             item_feature_to_idx: self.item_feature_to_idx,
             idx_to_item_feature: self.idx_to_item_feature,
             weighting_config: None,
+            transformation_schema: None,
+        }
+    }
+}
+
+/// V2 serialization format (without transformation_schema).
+/// Used for backward-compatible loading of models saved before v3.
+#[derive(Serialize, Deserialize)]
+struct SerializedModelV2 {
+    version: u32,
+    s_nrows: usize,
+    s_ncols: usize,
+    s_data: Vec<f64>,
+    num_items: usize,
+    num_user_features: usize,
+    num_item_features: usize,
+    alpha: f64,
+    beta: f64,
+    lambda_: f64,
+    meta_weight: f64,
+    user_to_idx: Vec<(String, usize)>,
+    idx_to_user: Vec<String>,
+    item_to_idx: Vec<(String, usize)>,
+    idx_to_item: Vec<String>,
+    user_feature_to_idx: Vec<(String, usize)>,
+    idx_to_user_feature: Vec<String>,
+    item_feature_to_idx: Vec<(String, usize)>,
+    idx_to_item_feature: Vec<String>,
+    weighting_config: Option<WeightingConfig>,
+}
+
+impl SerializedModelV2 {
+    fn into_v3(self) -> SerializedModel {
+        SerializedModel {
+            version: self.version,
+            s_nrows: self.s_nrows,
+            s_ncols: self.s_ncols,
+            s_data: self.s_data,
+            num_items: self.num_items,
+            num_user_features: self.num_user_features,
+            num_item_features: self.num_item_features,
+            alpha: self.alpha,
+            beta: self.beta,
+            lambda_: self.lambda_,
+            meta_weight: self.meta_weight,
+            user_to_idx: self.user_to_idx,
+            idx_to_user: self.idx_to_user,
+            item_to_idx: self.item_to_idx,
+            idx_to_item: self.idx_to_item,
+            user_feature_to_idx: self.user_feature_to_idx,
+            idx_to_user_feature: self.idx_to_user_feature,
+            item_feature_to_idx: self.item_feature_to_idx,
+            idx_to_item_feature: self.idx_to_item_feature,
+            weighting_config: self.weighting_config,
+            transformation_schema: None,
         }
     }
 }
@@ -105,6 +161,8 @@ struct SerializedModel {
     idx_to_item_feature: Vec<String>,
     /// Weighting configuration used during training (added in v2).
     weighting_config: Option<WeightingConfig>,
+    /// Feature transformation schema used during training (added in v3).
+    transformation_schema: Option<FeatureTransformationSchema>,
 }
 
 impl SerializedModel {
@@ -150,13 +208,14 @@ impl SerializedModel {
                 .collect(),
             idx_to_item_feature: model.mappings.idx_to_item_feature.clone(),
             weighting_config: model.weighting_config.clone(),
+            transformation_schema: model.transformation_schema.clone(),
         }
     }
 
     fn into_model(self) -> Result<RustFeaseModel> {
-        if self.version != FORMAT_VERSION && self.version != 1 {
+        if self.version != FORMAT_VERSION && self.version != 2 && self.version != 1 {
             anyhow::bail!(
-                "Unsupported model format version: {} (expected {} or 1)",
+                "Unsupported model format version: {} (expected {} or 2 or 1)",
                 self.version,
                 FORMAT_VERSION
             );
@@ -205,6 +264,12 @@ impl SerializedModel {
             None
         };
 
+        let transformation_schema = if self.version >= 3 {
+            self.transformation_schema
+        } else {
+            None
+        };
+
         Ok(RustFeaseModel {
             s_matrix,
             num_items: self.num_items,
@@ -216,6 +281,7 @@ impl SerializedModel {
             meta_weight: self.meta_weight,
             mappings,
             weighting_config,
+            transformation_schema,
         })
     }
 }
@@ -267,10 +333,18 @@ pub fn load_model(path: &Path) -> Result<RustFeaseModel> {
     let serialized: SerializedModel = match bincode::deserialize::<SerializedModel>(payload) {
         Ok(s) => s,
         Err(_) => {
-            let v1: SerializedModelV1 = bincode::deserialize(payload)
-                .context("Failed to deserialize model data (tried v2 and v1 formats)")?;
-            log::info!("Loaded v1 model file, migrating to v2 format");
-            v1.into_v2()
+            match bincode::deserialize::<SerializedModelV2>(payload) {
+                Ok(v2) => {
+                    log::info!("Loaded v2 model file, migrating to v3 format");
+                    v2.into_v3()
+                }
+                Err(_) => {
+                    let v1: SerializedModelV1 = bincode::deserialize(payload)
+                        .context("Failed to deserialize model data (tried v3, v2, and v1 formats)")?;
+                    log::info!("Loaded v1 model file, migrating to v3 format");
+                    v1.into_v3()
+                }
+            }
         }
     };
 
@@ -339,6 +413,7 @@ mod tests {
                 idx_to_item_feature: vec![],
             },
             weighting_config: None,
+            transformation_schema: None,
         }
     }
 
