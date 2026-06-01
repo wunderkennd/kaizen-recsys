@@ -24,6 +24,7 @@ pub mod metrics;
 mod model;
 mod models;
 pub(crate) mod onnx_export;
+mod py;
 mod serialization;
 mod serving;
 pub mod tuning;
