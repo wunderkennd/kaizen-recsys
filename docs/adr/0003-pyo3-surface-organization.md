@@ -262,3 +262,95 @@ subsystem move turns out to need further care) is trivial.
 - PyO3 module documentation: https://pyo3.rs/latest/module
 - PyO3 class organization patterns:
   https://pyo3.rs/latest/class.html#class-customizations
+
+## Amendment — 2026-06-01 (pre-merge drift reconciliation)
+
+The original decision text above is retained unchanged as the historical
+record of what was drafted. This note reconciles it with the state of
+`main` at the time of implementation kick-off (PR #67), which has moved
+since this ADR was written.
+
+When ADR-0003 was drafted, the working copy used to characterise the
+problem was the `feature/wpo-constraints-and-preprocessing` branch
+(PR #62), where `src/lib.rs` measured ~1360 lines and the territory-
+routing class was still named `FeaseRegistry`. Between the draft and
+the implementation start, `main` advanced through PRs #55, #58, #59,
+#60, and #61. Three concrete deltas affect this ADR:
+
+1. **`FeaseRegistry` was renamed to `ModelRegistry`** (PR #61). All
+   references in the **Context** and **Decision** sections to
+   `FeaseRegistry` should be read as `ModelRegistry`. The intent is
+   unchanged — the file shape and content of the wrapper moved.
+
+2. **The tuning surface grew from two entrypoints to eight.** The
+   ADR's Context table listed only `grid_search_py` and
+   `random_search_py`. `main` now also exposes `grid_search_ease`,
+   `random_search_ease`, `grid_search_sasrec`, `random_search_sasrec`,
+   `grid_search_two_tower`, and `random_search_two_tower`, along with
+   helpers `extract_f64_vec`, `extract_usize_vec`,
+   `parse_sasrec_grid`, `parse_two_tower_grid`,
+   `sasrec_search_result_to_py`, and `two_tower_search_result_to_py`.
+   All of these belong in `src/py/tuning.rs` under the **Decision**'s
+   tuning row. The row's intent is unchanged; the contents are
+   larger.
+
+3. **Two cfg-gated inline submodules now live in `lib.rs`:**
+   `#[cfg(feature = "ml-models")] mod sasrec_py { … }` exposing
+   `SASRecModel` + trainer/loader functions, and the parallel
+   `mod two_tower_py` for the Two-Tower model. The original ADR did
+   not name these because they did not yet exist as inline modules
+   when the audit ran. They are themselves a confirmation of the
+   ADR's premise (the author already reached for organizational
+   sub-mods inside `lib.rs` to avoid one flat heap) but the wrong
+   layer of organisation: they should be sibling files under
+   `src/py/`, not nested modules under `src/lib.rs`.
+
+`src/lib.rs` on current `main` measures **2296 lines, not 1360.** The
+cohesion finding that motivated this ADR therefore stands more
+strongly than originally documented.
+
+### Updated subsystem file list
+
+Replace the table in **§ Decision** with this expanded version:
+
+| File | Contents |
+|---|---|
+| `src/lib.rs` | `mod` declarations, `#![recursion_limit]`, the `_native` `#[pymodule]` registration block only. |
+| `src/py/mod.rs` | `pub mod` declarations for the submodules below. |
+| `src/py/model.rs` | `FeaseModel` pyclass, `build_and_train`, `load_model`. |
+| `src/py/registry.rs` | `ModelRegistry` pyclass (renamed from `FeaseRegistry` per PR #61). Includes the `pydict_to_str_f64` private helper. Blocked on `model.rs` move because `register` takes `&FeaseModel`. |
+| `src/py/eval.rs` | `random_split`, `temporal_split`, `leave_k_out_split`, `validate_data`. |
+| `src/py/metrics.rs` | The six metric wrappers. |
+| `src/py/tuning.rs` | All eight tuning entrypoints (`grid_search_py`, `random_search_py`, `grid_search_ease`, `random_search_ease`, `grid_search_sasrec`, `random_search_sasrec`, `grid_search_two_tower`, `random_search_two_tower`) plus the helpers (`parse_param_grid`, `search_result_to_py`, `extract_f64_vec`, `extract_usize_vec`, `parse_sasrec_grid`, `parse_two_tower_grid`, `sasrec_search_result_to_py`, `two_tower_search_result_to_py`). The largest single file. |
+| `src/py/sasrec.rs` | `SASRecModel` pyclass + `build_and_train_sasrec` + `load_sasrec_model`. Entire contents `#[cfg(feature = "ml-models")]`. Lifts the existing inline `mod sasrec_py` into its own file. |
+| `src/py/two_tower.rs` | `TwoTowerModel` pyclass + trainer/loader. Entire contents `#[cfg(feature = "ml-models")]`. Lifts the existing inline `mod two_tower_py` into its own file. |
+
+Eight subsystem files instead of the original six. The naming
+convention, the **target `src/lib.rs` size** ("< 50 lines", or modestly
+larger to accommodate the cfg-gated registration block), and the
+**explicit non-decisions** (§ Decision items 4–6) are unchanged.
+
+### Updated phased rollout
+
+The rollout table now reads:
+
+| Phase | Scope | Gate |
+|-------|-------|------|
+| **0** | This ADR + this amendment. Doc-only. | Merged on `main`. |
+| **1** | Create `src/py/` directory and `src/py/mod.rs` with empty `pub mod` declarations. | `cargo build` succeeds with no functional change. |
+| **2** | Move one subsystem per commit. Order: **metrics → eval → sasrec → two_tower → model → tuning → registry.** The trailing `registry` move depends on `model` (because of `register(&FeaseModel)`) and on `sasrec`/`two_tower` (because of the cfg-gated `register_sasrec` / `register_two_tower` methods); all other moves are independent. | Each commit compiles in isolation under `cargo check` and `cargo check --features ml-models`. Test suite passes after the final commit. |
+| **3** | Verify Python surface byte-identity via `dir()` snapshot diff. | `python -c "import kzn_recsys._native as n; print(sorted(x for x in dir(n) if not x.startswith('_')))"` is unchanged from `main`. |
+| **4** | Re-run `/graphify --update`. | Community C1 cohesion materially improves or C1 splits. |
+
+PR #67 implements Phase 1 plus the first two Phase 2 moves (metrics,
+eval). Subsequent PRs will land the remaining moves in the
+dependency order above.
+
+### Implementation note
+
+The amendment exists because the ADR was drafted from a working copy
+(PR #62's branch) that did not match what `main` looked like when
+implementation actually began two days later. A future amendment is
+permitted — and expected — for any post-merge reconciliation between
+this design and what PR #67 (and its successors) actually ship,
+following the same pattern ADR-0002 used for its Phase 2 amendment.
