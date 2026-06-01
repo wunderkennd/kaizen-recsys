@@ -7,11 +7,13 @@
   future Rust-native serving path.
 - **Related**: ADR-0001 (multi-model architecture); research paper
   `research/silver_torch_research.pdf` (SilverTorch, SIGIR '26).
-- **Revision note**: revised after a code-grounded review — parity baseline
-  pinned to the f32 path, `export_payload` return type and matrix layout
-  defined, `include_mask` dropped, provenance completed, K=0 handled, and a
-  configurable repeat-watch penalty added that generalizes the existing
-  hardcoded interacted-item exclusion.
+- **Revision note**: revised over two code-grounded review rounds. R1: parity
+  baseline pinned to the f32 path, `export_payload` return type and matrix
+  layout defined, `include_mask` dropped, provenance completed, configurable
+  repeat-watch penalty added. R2: `seen` decoupled from interaction values via
+  an optional `seen` input (fidelity with Rust's sparse-key semantics); K=0
+  resolved to a uniform signature; a secondary `raw_scores` output added; a
+  sentinel glossary and a first-class `io_signature` field added.
 
 ## 1. Motivation
 
@@ -60,8 +62,9 @@ EASE model (they are relevant later to the SASRec / Two-Tower seam).
 
 ### Goals
 - Export a trained EASE `FeaseModel` to a portable `.onnx` graph.
-- Graph is self-contained: `(interactions, features, mask, repeat_penalty, k)`
-  → `(top_indices, top_scores)`.
+- Graph is self-contained:
+  `(interactions, features, mask, seen, repeat_penalty, k)`
+  → `(top_indices, top_scores, raw_scores)`.
 - **Configurable repeat-watch preference**: a per-request (and per-individual)
   penalty on already-seen items, spanning hard-exclude → demote → neutral →
   boost. Default reproduces the native Rust behavior (exclude).
@@ -142,12 +145,27 @@ Python side) with:
 | `sparsity_threshold` | `float \| None` | from `weighting_config`, if set |
 | `weighting_config` | `dict \| None` | provenance |
 
+**The exported weight is not raw `S`.** It is a β-folded, row-subset extract:
+`s_items = β-fold(S[0:M, :])`, where the user-feature columns are pre-multiplied
+by β (`s_items[:, M:] = β · S[0:M, M:M+K]`; see §4). Callers pass raw feature
+values; β lives in the weight. `export_payload` may return either the raw
+`S[0:M, :]` plus `beta` (Python folds it) or the already-folded matrix — the
+spec assumes the **Rust accessor returns raw `S[0:M, :]` and `beta`
+separately**, and the Python `build_graph()` does the fold, so the fold is
+testable in one place.
+
 **Matrix layout.** `RustFeaseModel.s_matrix` is a `nalgebra::DMatrix<f64>`
 stored **column-major**, of shape `(M+K) × (M+K)`. The accessor extracts the
 `S_items` sub-block `S[0:M, :]` and emits it **row-major** by iterating
 `for r in 0..M { for c in 0..(M+K) { push s_matrix[(r, c)] } }`, so the Python
 side can `np.asarray(flat).reshape(M, M+K)` (NumPy C-order default) without a
 transpose. The Rust accessor — not Python — owns the layout conversion.
+
+**`weighting_config = None`.** When weighting was not used during training,
+`model.weighting_config` is `None`. `export_payload` returns
+`sparsity_threshold = None` (serialized as JSON `null`), not `0.0`, to keep the
+"not applied" case distinguishable from "threshold was 0.0":
+`self.model.weighting_config.as_ref().map(|wc| wc.sparsity_threshold)`.
 
 The exporter calls the model's existing `validate()` first and refuses to
 export a model that fails (NaN/Inf in `S`, all-zeros, dimension mismatch),
@@ -170,36 +188,38 @@ simplifications:
 
 ```
 Inputs:
-  interactions   : float32[batch, M]   dense interaction values (0 = no interaction)
-  features       : float32[batch, K]   dense user-feature values  (omitted entirely if K == 0)
-  mask           : float32[batch, M]   eligibility; 1 = keep, 0 = exclude  (default all-ones)
-  repeat_penalty : float32[batch, 1]   ρ, penalty on already-seen items     (default = exclude sentinel)
-  k              : int64 scalar        number of items to return
+  interactions   : float32[batch, M]   dense interaction values (0 = no interaction value)
+  features       : float32[batch, K]   dense user-feature values (K may be 0 → width-0 tensor; see K=0 note)
+  mask           : float32[batch, M]   eligibility; 1 = keep, 0 = exclude          (default all-ones)
+  seen           : float32[batch, M]   prior-interaction indicator; 1 = seen        (default all-zeros)
+  repeat_penalty : float32[batch, 1]   ρ, penalty on already-seen items             (default EXCLUDE_SENTINEL)
+  k              : int64 scalar        number of items to return                    (default top_k_default)
 
 Graph (vanilla ai.onnx, opset 17):
-  z          = Concat(interactions, features)        # [batch, M+K]   (z = interactions if K == 0)
-  raw        = Gemm(z, W, transB=1)                  # W stored [M, M+K]; transB=1 → z·Wᵀ → [batch, M]
-  scores     = Cast(raw, to=float32)                 # masking + ranking always in fp32 (see notes)
-  seen       = Cast(Not(Equal(interactions, 0)), float32)   # [batch, M] indicator of prior interaction
-  adjusted   = scores - repeat_penalty * seen        # ρ broadcast [batch,1] over [batch,M]
-  masked     = adjusted + (mask - 1) * MASK_PENALTY  # excluded items sink below TopK; MASK_PENALTY = 1e9 (fp32)
-  kc         = Min(k, M)                             # clamp k ≤ catalog size
+  z          = Concat(interactions, features, axis=-1)     # [batch, M+K]  (width-0 features → [batch, M])
+  raw_scores = Cast(Gemm(z, W, transB=1), to=float32)      # W stored [M, M+K]; z·Wᵀ → [batch, M]; OUTPUT
+  seen_eff   = Max(seen, Cast(Not(Equal(interactions, 0)), float32))   # union: explicit seen ∪ nonzero-value
+  adjusted   = raw_scores - repeat_penalty * seen_eff      # ρ broadcast [batch,1] over [batch,M]
+  masked     = adjusted + (mask - 1) * MASK_PENALTY        # excluded items sink below TopK
+  kc         = Min(k, M)                                   # clamp k ≤ catalog size
   topv, topi = TopK(masked, kc, axis=-1, largest=1, sorted=1)
 
 Outputs:
-  top_indices : int64[batch, kc]
-  top_scores  : float32[batch, kc]   the ranked (adjusted+masked) score
+  top_indices : int64[batch, kc]     ranked item indices
+  top_scores  : float32[batch, kc]   the ranked (adjusted + masked) score TopK ordered on
+  raw_scores  : float32[batch, M]    pre-penalty, pre-mask model affinity for ALL items
 ```
 
 Design notes:
-- **Optional inputs with baked defaults.** `interactions` (and `features` when
-  K > 0) are required. `mask`, `repeat_penalty`, and `k` are graph inputs that
-  *also* have initializers (ONNX default-valued optional inputs), so a caller
-  may omit them and get the baked defaults: `mask` = all-ones (no eligibility
-  filtering), `repeat_penalty` = the exclude sentinel, `k` = `top_k_default`.
-  This means even a bare `onnxruntime` caller — not just the MLflow wrapper —
-  reproduces the native Rust default (exclude already-watched) when passing only
-  `interactions`/`features`.
+- **Optional inputs with baked defaults.** `interactions` and `features` are
+  required (`features` is width-0 when K=0; see below). `mask`, `seen`,
+  `repeat_penalty`, and `k` are graph inputs that *also* have initializers (ONNX
+  default-valued optional inputs), so a caller may omit them and get the baked
+  defaults: `mask` = all-ones (no eligibility filtering), `seen` = all-zeros,
+  `repeat_penalty` = `EXCLUDE_SENTINEL`, `k` = `top_k_default`. Even a bare
+  `onnxruntime` caller — not just the MLflow wrapper — reproduces the native Rust
+  default (exclude already-watched) when passing only `interactions`/`features`,
+  because `seen_eff` falls back to the in-graph `interactions ≠ 0` derivation.
 - **Stored vs computed weight shape.** The ONNX initializer `W` holds `S_items`
   in its non-transposed shape `[M, M+K]`. ONNX `Gemm` with `transB=1` computes
   `z[batch, M+K] · Wᵀ[(M+K), M] → [batch, M]`.
@@ -208,16 +228,30 @@ Design notes:
 
   | ρ | behavior | use case |
   |---|---|---|
-  | `+MASK_PENALTY` (sentinel) | always exclude seen | **default — matches native EASE/SASRec** |
+  | `EXCLUDE_SENTINEL` (+1e9) | always exclude seen | **default — matches native EASE/SASRec** |
   | `> 0` finite | demote repeats | mostly-fresh, occasional repeat |
   | `0` | neutral; repeats compete on merit | exploratory |
   | `< 0` | boost repeats | consumables, replay, habitual content |
 
-  `seen` is derived in-graph from `interactions ≠ 0` (no extra input). The
-  eligibility `mask` (compliance/business hard-filter) and `repeat_penalty`
+- **`seen` semantics — explicit input ∪ derived (fixes R2 §2.1).** The Rust path
+  treats an item as "seen" if it is a **key** in the interaction dict, regardless
+  of value (`src/lib.rs`: `HashSet` of interacted indices). Deriving `seen` only
+  from `interactions ≠ 0` would miss a key whose value is exactly `0.0` (e.g.,
+  an impression with no engagement). So the graph takes an optional `seen` input
+  and computes `seen_eff = Max(seen, interactions ≠ 0)`:
+  - **bare caller** (no `seen`, default all-zeros) → `seen_eff = interactions ≠ 0`
+    — the convenient default, unchanged for the common case;
+  - **MLflow wrapper** populates `seen` from the interaction dict **keys** →
+    `seen_eff` = key-based, **exact parity with Rust** (every nonzero value is
+    also a key, so the union equals the key set);
+  - **exposure case** (key present, value `0.0`) → wrapper sets `seen=1` → item
+    is penalized, matching Rust.
+  One `Max` node, vanilla opset, no branching.
+- The eligibility `mask` (compliance/business hard-filter) and `repeat_penalty`
   (preference) are kept as **separate additive terms** because they answer
   different questions ("is this item *allowed*?" vs "how much do we like
-  *re*-showing it?").
+  *re*-showing it?"). `mask` always overrides a repeat boost: a masked-out item
+  gets `… + (0−1)·MASK_PENALTY`, which dominates any finite negative ρ.
 - **Score dtype is always fp32** inside the masking/TopK subgraph and on output,
   independent of weight `dtype`. Only the stored weight `W` (and the
   `Gemm`/`MatMulInteger` it feeds) is quantized for `fp16`/`int8`; its result is
@@ -228,9 +262,15 @@ Design notes:
   re-exporting. `top_k_default` is stored in `vocab.json` and used by the MLflow
   wrapper as the default.
 - `batch` is a dynamic dimension; the same artifact serves one user or a batch.
-- **K = 0 (no user features).** When `num_user_features == 0`, the `features`
-  input and the `Concat` are omitted; `z = interactions`. This avoids feeding a
-  zero-width `float32[batch, 0]` tensor, which not all runtimes handle.
+- **K = 0 (no user features) — uniform signature (fixes R2 §3.1).** The graph
+  **always** has the same input names, including `features`. When
+  `num_user_features == 0`, `features` is a width-0 tensor `float32[batch, 0]`
+  and the `Concat` is a no-op (`z = interactions`). We deliberately keep a single
+  signature rather than a K-dependent variant, so downstream consumers never
+  branch on K to build their input dict. ONNX Runtime (our verified target,
+  Python `onnxruntime` and Rust `ort`) handles width-0 tensors and zero-input
+  `Concat`; a K=0 parity test (§8) locks this in. The authoritative input
+  names/shapes are published in `vocab.json.io_signature` (§6).
 - Default weight dtype is `float32` (cast from native `f64`); parity tolerance
   per §8. `float64` exact-parity export is not in the first cut (could be added
   later as `dtype="fp64"`).
@@ -249,13 +289,15 @@ kzn_recsys.export_onnx(
 ) -> ExportResult
 ```
 
-- `repeat_penalty_default="exclude"` bakes the exclude sentinel (`+MASK_PENALTY`)
-  as the default `repeat_penalty` initializer; a `float` bakes that value.
-  Callers can still override per-request via the `repeat_penalty` graph input.
+- `repeat_penalty_default="exclude"` bakes `EXCLUDE_SENTINEL` (§13) as the
+  default `repeat_penalty` initializer; a `float` bakes that value. Callers can
+  still override per-request via the `repeat_penalty` graph input.
 - `ExportResult` carries the written paths: `onnx_path`, `vocab_path`, and
   `mlflow_path` (when `mlflow=True`).
 - `include_mask` is **not** a parameter: the mask is always present (all-ones =
-  no filtering), so there is only one graph signature to deploy against.
+  no filtering), so there is only one graph signature to deploy against. For the
+  same reason there is no `include_raw_scores` flag and no K-dependent variant —
+  `raw_scores` is always emitted and the input signature is uniform across K.
 - Dispatch is on the payload's `kind`: `"ease"` builds the graph in §4; any
   other kind raises
   `NotImplementedError("ONNX export not yet supported for {kind}")`.
@@ -279,11 +321,28 @@ Language-neutral JSON (loadable later by a Rust serving path via serde):
   "weight_dtype": "fp32",
   "opset": 17,
   "top_k_default": 100,
-  "mask_penalty": 1e9,
+  "constants": {
+    "MASK_PENALTY": 1e9,
+    "EXCLUDE_SENTINEL": 1e9
+  },
   "repeat_policy": {
     "default_penalty": 1e9,
-    "exclude_sentinel": 1e9,
     "per_user_table_present": false
+  },
+  "io_signature": {
+    "inputs": [
+      {"name": "interactions",   "dtype": "float32", "shape": ["batch", 12000], "required": true},
+      {"name": "features",       "dtype": "float32", "shape": ["batch", 340],   "required": true},
+      {"name": "mask",           "dtype": "float32", "shape": ["batch", 12000], "required": false, "default": "all-ones"},
+      {"name": "seen",           "dtype": "float32", "shape": ["batch", 12000], "required": false, "default": "all-zeros"},
+      {"name": "repeat_penalty", "dtype": "float32", "shape": ["batch", 1],     "required": false, "default": "EXCLUDE_SENTINEL"},
+      {"name": "k",              "dtype": "int64",   "shape": [],               "required": false, "default": "top_k_default"}
+    ],
+    "outputs": [
+      {"name": "top_indices", "dtype": "int64",   "shape": ["batch", "kc"]},
+      {"name": "top_scores",  "dtype": "float32", "shape": ["batch", "kc"]},
+      {"name": "raw_scores",  "dtype": "float32", "shape": ["batch", 12000]}
+    ]
   },
   "item_index_to_guid": ["itm_a", "itm_b", "..."],
   "feature_name_to_index": {"age_bucket=2": 0, "country=US": 1},
@@ -298,14 +357,25 @@ Language-neutral JSON (loadable later by a Rust serving path via serde):
 }
 ```
 
-- `format_version` is independent of the `FEAS` binary format's v1/v2 (different
-  namespace); starts at `1`.
-- `item_index_to_guid` maps the graph's `top_indices` → GUIDs.
+- `format_version` is independent of the `FEAS`/`FSAS`/`FTWO` binary formats
+  (different namespace; those are at v2/v3/v5); starts at `1`.
+- **Two distinct `1e9` constants (R2 §2.3).** `MASK_PENALTY` is the graph
+  constant applied via `(mask − 1) · MASK_PENALTY`; `EXCLUDE_SENTINEL` is the
+  baked default *value* of the `repeat_penalty` input. They share the magnitude
+  `1e9` but live on different code paths and are named separately here to avoid
+  runtime-integration confusion.
+- `io_signature` is the **authoritative** list of graph input/output names,
+  dtypes, shapes, and defaults. Consumers (and the MLflow wrapper) build their
+  input dict from this field, never from assumptions. `num_user_features == 0`
+  is detectable here (the `features` shape is `["batch", 0]`); the signature
+  itself is uniform across K (§4).
+- `item_index_to_guid` maps the graph's `top_indices` (and the column index of
+  `raw_scores`) → GUIDs.
 - `feature_name_to_index` tells a caller where to place each feature value in the
   dense `features` input.
-- `repeat_policy.default_penalty` is the baked default `ρ`;
-  `per_user_table_present` is `false` in this iteration (reserved for the
-  deferred learned Tier C table).
+- `repeat_policy.default_penalty` is the baked default `ρ` (= `EXCLUDE_SENTINEL`
+  when `repeat_penalty_default="exclude"`); `per_user_table_present` is `false`
+  in this iteration (reserved for the deferred learned Tier C table).
 - `provenance` is informational only — `alpha`, `lambda_`, `meta_weight`,
   `sparsity_threshold`, and any `weighting_config` are already baked into `S`
   (sparsity pruning via `RustFeaseModel::prune_sparse` zeroes small entries in
@@ -337,13 +407,25 @@ Behaviour:
   `vocab.json`.
 - `predict` vectorizes each row (GUIDs/feature-names → dense tensors via the
   vocab), runs the session, and maps `top_indices` → GUIDs.
-- **Already-watched handling matches the Rust path by default.** `seen` is
-  derived in-graph from `interactions`, and the default `repeat_penalty` is the
-  exclude sentinel — so a caller who passes `interactions` and nothing else gets
-  already-watched items excluded, exactly like `FeaseModel.predict`
-  (`src/lib.rs`). Callers override `repeat_penalty` to demote/keep/boost repeats.
+- **Already-watched handling matches the Rust path exactly.** The wrapper
+  populates the `seen` input from the interaction dict **keys** (not from
+  nonzero values), and the default `repeat_penalty` is `EXCLUDE_SENTINEL` — so a
+  caller passing `interactions` and nothing else gets already-watched items
+  excluded with the same key-based semantics as `FeaseModel.predict`
+  (`src/lib.rs`), including the value-`0.0` exposure case (R2 §2.1). Callers
+  override `repeat_penalty` to demote/keep/boost repeats.
 - The `exclude` field is the *eligibility* mask (licensing/region), distinct
   from repeat handling.
+- **Filter vs penalize (R2 §3.5).** The Rust serving path *removes* interacted
+  items from its returned vector (`filter_sort_top_k`), so it returns
+  `M − |interacted|` scores; the ONNX graph *penalizes* them to ≈ `−1e9` and the
+  full `raw_scores` output still has `M` columns. For the GUID-keyed top-k
+  `DataFrame` the wrapper returns, the results are identical; a consumer reading
+  `raw_scores` directly sees all `M` entries (penalized items are not removed,
+  only pushed out of the top-k).
+- `raw_scores` (pre-penalty affinity) is available on the session output for
+  consumers that threshold, blend, or explain; the wrapper exposes it on request
+  but does not include it in the default top-k `DataFrame`.
 - Unknown item GUIDs / feature names in input are **skipped with a warning**,
   not fatal (catalogs drift; serving should degrade, not crash).
 - Ships with a pinned pip environment (`onnxruntime`, `numpy`).
@@ -369,14 +451,24 @@ must match modulo float tie-ordering.
 - Warm user and cold-start user (no interactions, features only).
 - Repeat spectrum: `ρ > 0` demotes seen items; `ρ = 0` lets them rank on merit;
   `ρ < 0` boosts seen items above comparable unseen items.
-- Eligibility `mask`: excluded items never appear in `top_indices`.
+- **`seen` semantics**: (a) bare call (no `seen`) excludes items with nonzero
+  interaction values; (b) explicit `seen` from keys excludes a key whose value
+  is exactly `0.0` (the value-`0.0` fidelity case) while the derived-only path
+  does not — proving `seen_eff = Max(seen, interactions ≠ 0)` works.
+- `raw_scores` output: equals `predict_scores` (f32) for all M items regardless
+  of `mask`/`seen`/`repeat_penalty`, and is unaffected by the penalty/mask
+  (tol `1e-5`).
+- Eligibility `mask`: excluded items never appear in `top_indices`; mask
+  overrides a repeat boost (`ρ < 0` + `mask = 0` → still excluded).
 - `top_k` clamping: `k > num_items` returns `num_items` results.
-- K = 0 model: graph omits `features`/`Concat` and still scores correctly.
+- **K = 0 model (uniform signature)**: pass a width-0 `features` tensor; the
+  graph scores correctly and the input names are identical to the K>0 case.
 - int8 export: assert **top-k rank agreement** (set overlap / order), not score
   equality — quantization perturbs scores but preserves ranking (SilverTorch
   §4.2, §6.2). Testing score equality here would falsely flag int8 as broken.
-- MLflow pyfunc roundtrip: GUID-in → GUID-out; default excludes already-watched;
-  `repeat_penalty`/`exclude` overrides behave as specified.
+- MLflow pyfunc roundtrip: GUID-in → GUID-out; default excludes already-watched
+  (key-based, incl. value-`0.0`); `repeat_penalty`/`exclude` overrides behave as
+  specified.
 - Unsupported model kind raises `NotImplementedError`.
 
 ### Rust — `ort`-based parity test
@@ -427,19 +519,41 @@ must match modulo float tie-ordering.
 - `top_k <= 0` → validation error in the API layer.
 - `top_k > num_items` → clamped in-graph by `Min(k, M)`.
 - NaN/Inf/all-zeros `S` → refused via `validate()` pre-export.
-- `dtype="fp16"` with the `1e9` sentinel → safe, because masking/penalties run
-  in fp32 (§4); the sentinel never enters fp16 arithmetic.
-- K = 0 → features input and Concat omitted (§4).
+- `dtype="fp16"` with the `1e9` sentinels → safe, because masking/penalties run
+  in fp32 (§4); the sentinels never enter fp16 arithmetic.
+- K = 0 → width-0 `features` tensor, uniform signature (§4); no graph variant.
+- Item with interaction value exactly `0.0` → "seen" only if the caller marks it
+  via the `seen` input (the wrapper does, from dict keys); bare callers relying
+  on the derived path treat it as unseen (§4 `seen` note).
 - Unknown GUID/feature in MLflow wrapper input → skipped with warning.
 - `meta_weight` / `weighting_config` / `sparsity_threshold`: training-time only,
   already baked into `S`; not represented in the graph, recorded in `vocab.json`
-  provenance.
+  provenance (`None` → `null`, not `0.0`).
 
-## 12. Open question — repeat penalty and `top_scores` semantics
+## 12. Resolved — `top_scores` vs `raw_scores` semantics
 
-The returned `top_scores` are the **ranked (adjusted + masked) scores**, not the
-raw affinity. For demoted-but-surfaced repeats this means the reported score
-reflects the penalty. If a consumer needs the raw affinity alongside the ranking
-score, a second output could be added later; deferred unless a concrete need
-appears.
+Resolved in favour of exposing **both**. `top_scores` are the ranked
+(adjusted + masked) scores `TopK` ordered on — correct for argmax/display
+consumers. `raw_scores` (full `[batch, M]`) is the pre-penalty, pre-mask model
+affinity, for consumers that threshold, blend (SilverTorch Value-Model style),
+A/B-test, or explain. Cost is one extra graph output node (the `Gemm` result is
+already materialized — no `Gather` needed since we return all M). `top_scores`
+is **never** replaced by raw affinity, which would break the descending-sorted
+assumption (a boosted repeat could outrank an item with higher raw affinity). A
+consumer wanting raw affinity for only the returned items gathers `raw_scores`
+by `top_indices` client-side.
+
+## 13. Glossary
+
+- **`MASK_PENALTY`** — graph constant (`1e9`, fp32) applied as
+  `(mask − 1) · MASK_PENALTY`; drives masked-out items below `TopK`.
+- **`EXCLUDE_SENTINEL`** — baked default value of the `repeat_penalty` input
+  (`1e9`); reproduces native "exclude already-watched". Same magnitude as
+  `MASK_PENALTY`, distinct role (a runtime input value vs a graph constant).
+- **`seen` / `seen_eff`** — caller-supplied prior-interaction indicator and its
+  union with the in-graph `interactions ≠ 0` derivation.
+- **`S_items` / `W`** — `β`-folded first-`M`-rows extract of `S`, shape
+  `[M, M+K]`, the `Gemm` weight (used with `transB=1`).
+- **ρ (`repeat_penalty`)** — signed per-row repeat penalty: `+sentinel` exclude,
+  `>0` demote, `0` neutral, `<0` boost.
 ```
