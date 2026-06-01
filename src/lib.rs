@@ -1096,50 +1096,6 @@ fn pydict_to_str_f64(d: &Bound<'_, PyDict>) -> PyResult<ahash::AHashMap<String, 
     Ok(map)
 }
 
-// --- Ranking Evaluation Metrics (PyO3 wrappers) ---
-
-/// Precision@K: fraction of top-K recommendations that are relevant.
-#[pyfunction]
-#[pyo3(signature = (recommended, relevant, k))]
-fn precision_at_k(recommended: Vec<usize>, relevant: HashSet<usize>, k: usize) -> f64 {
-    metrics::precision_at_k(&recommended, &relevant, k)
-}
-
-/// Recall@K: fraction of relevant items captured in the top-K recommendations.
-#[pyfunction]
-#[pyo3(signature = (recommended, relevant, k))]
-fn recall_at_k(recommended: Vec<usize>, relevant: HashSet<usize>, k: usize) -> f64 {
-    metrics::recall_at_k(&recommended, &relevant, k)
-}
-
-/// NDCG@K: Normalized Discounted Cumulative Gain at K (binary relevance).
-#[pyfunction]
-#[pyo3(signature = (recommended, relevant, k))]
-fn ndcg_at_k(recommended: Vec<usize>, relevant: HashSet<usize>, k: usize) -> f64 {
-    metrics::ndcg_at_k(&recommended, &relevant, k)
-}
-
-/// Mean Average Precision over the full recommendation list.
-#[pyfunction]
-#[pyo3(signature = (recommended, relevant))]
-fn mean_average_precision(recommended: Vec<usize>, relevant: HashSet<usize>) -> f64 {
-    metrics::mean_average_precision(&recommended, &relevant)
-}
-
-/// Coverage: fraction of the item catalog recommended across all users.
-#[pyfunction]
-#[pyo3(signature = (all_recommendations, num_total_items))]
-fn coverage(all_recommendations: Vec<Vec<usize>>, num_total_items: usize) -> f64 {
-    metrics::coverage(&all_recommendations, num_total_items)
-}
-
-/// Hit Rate@K: 1.0 if any item in top-K is relevant, else 0.0.
-#[pyfunction]
-#[pyo3(signature = (recommended, relevant, k))]
-fn hit_rate_at_k(recommended: Vec<usize>, relevant: HashSet<usize>, k: usize) -> f64 {
-    metrics::hit_rate_at_k(&recommended, &relevant, k)
-}
-
 /// Grid search over hyperparameters with k-fold cross-validation.
 ///
 /// Args:
@@ -2336,12 +2292,12 @@ fn _native(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(build_and_train, m)?)?;
     m.add_function(wrap_pyfunction!(load_model, m)?)?;
     m.add_function(wrap_pyfunction!(validate_data, m)?)?;
-    m.add_function(wrap_pyfunction!(precision_at_k, m)?)?;
-    m.add_function(wrap_pyfunction!(recall_at_k, m)?)?;
-    m.add_function(wrap_pyfunction!(ndcg_at_k, m)?)?;
-    m.add_function(wrap_pyfunction!(mean_average_precision, m)?)?;
-    m.add_function(wrap_pyfunction!(coverage, m)?)?;
-    m.add_function(wrap_pyfunction!(hit_rate_at_k, m)?)?;
+    m.add_function(wrap_pyfunction!(py::metrics::precision_at_k, m)?)?;
+    m.add_function(wrap_pyfunction!(py::metrics::recall_at_k, m)?)?;
+    m.add_function(wrap_pyfunction!(py::metrics::ndcg_at_k, m)?)?;
+    m.add_function(wrap_pyfunction!(py::metrics::mean_average_precision, m)?)?;
+    m.add_function(wrap_pyfunction!(py::metrics::coverage, m)?)?;
+    m.add_function(wrap_pyfunction!(py::metrics::hit_rate_at_k, m)?)?;
     m.add_function(wrap_pyfunction!(random_split, m)?)?;
     m.add_function(wrap_pyfunction!(temporal_split, m)?)?;
     m.add_function(wrap_pyfunction!(leave_k_out_split, m)?)?;
