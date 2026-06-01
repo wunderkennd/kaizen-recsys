@@ -123,11 +123,9 @@ GitHub API and is conflict-free.
 
 ## PR Review Policy
 
-All PRs require a review from Devin (`devin-ai-integration[bot]`) before merging. When creating PRs, always request review:
+All PRs require a review from Devin (`devin-ai-integration[bot]`) before merging. **No manual action is required to request the review** — the `.github/workflows/request_devin_review.yml` workflow runs on every `opened` and `ready_for_review` event and the Devin GitHub App also picks up new PRs automatically.
 
-```bash
-gh pr edit <number> --add-reviewer devin-ai-integration[bot]
-```
+Do not attempt to add Devin as a reviewer via `gh pr edit --add-reviewer 'devin-ai-integration[bot]'` from a local checkout: the GitHub REST API does not let user PATs request reviews from GitHub Apps, and the call fails with `Could not resolve user`. The CI workflow itself appends `|| true` to acknowledge that the same call can fail under GitHub's own token; the actual review request reaches Devin through its app webhook, not through the reviewer-request endpoint.
 
 Do not merge PRs without an approved review from Devin. This is enforced via branch protection on `main`.
 
