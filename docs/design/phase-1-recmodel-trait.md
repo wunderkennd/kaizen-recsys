@@ -53,7 +53,7 @@ src/data_pipeline.rs        # build_matrices — no changes
 src/evaluation.rs           # still &RustFeaseModel
 src/tuning.rs               # still concrete
 src/serialization.rs        # FEAS magic, no changes
-src/serving.rs              # FeaseModelRegistry — no changes
+src/serving.rs              # ModelRegistry — no changes
 src/{metrics,weighting,data_validation}.rs  # no changes
 ```
 
@@ -163,8 +163,7 @@ associated types break dyn dispatch.
 
 `load` needs to *construct* the right concrete type from a file. That
 inverts the polymorphism — it's a free function `load_model(path)` that
-peeks the magic bytes and dispatches. Lives in `serialization.rs` (already
-does this for EASE). Phase 6 generalizes it to all model kinds.
+peeks the magic bytes and dispatches. Lives in `serialization.rs`.
 
 ## EASE adapter
 

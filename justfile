@@ -55,7 +55,7 @@ test-fresh: build
     "$TMPVENV/bin/pip" install --quiet dist/kzn_recsys-*.whl
     cd /tmp && "$TMPVENV/bin/python" -c "
     from kzn_recsys import (
-        build_and_train, FeaseModel, FeaseRegistry, SplitResult,
+        build_and_train, FeaseModel, ModelRegistry, SplitResult,
         EngagementSchema, random_split_safe,
     )
     print('OK: fresh-venv import works ->', FeaseModel)

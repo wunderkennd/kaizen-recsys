@@ -1,6 +1,6 @@
 # ADR-0001: Multi-model architecture for FEASE
 
-- **Status**: Proposed
+- **Status**: Accepted (see "Amendment — implementation status" below)
 - **Date**: 2026-05-10
 - **Deciders**: project maintainers
 - **Supersedes**: —
@@ -217,3 +217,13 @@ first.
 - Yi et al., "Sampling-Bias-Corrected Neural Modeling for Large Corpus Item
   Recommendations", RecSys 2019 (two-tower with sampled softmax).
 - `burn` framework: https://burn.dev/
+
+## Amendment — 2026-05-16 (implementation status)
+
+The original decision and phased-rollout table above are retained unchanged
+as the historical record. The ADR is **Accepted** and the rollout is
+complete; tracking issue #21 is closed.
+
+Note: PR #32 also added the borrowing `EaseAdapterRef` (zero-copy eval),
+and ADR-0002 Phase 1 (PR #34) parallelized tuning internally — orthogonal
+to the Phase 6 trait generalization (PR #52).
