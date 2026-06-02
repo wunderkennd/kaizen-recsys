@@ -27,6 +27,7 @@ def _convert_weight_to_fp16(onnx_path: Path) -> None:
     m = onnx.load(str(onnx_path))
 
     # 1. Find the W initialiser and replace with W_fp16 (fp16 tensor).
+    # "W" is the initializer name defined in _graph.py.
     w_init = next((init for init in m.graph.initializer if init.name == "W"), None)
     if w_init is None:
         raise ValueError("ONNX graph has no initialiser named 'W'")
@@ -35,25 +36,33 @@ def _convert_weight_to_fp16(onnx_path: Path) -> None:
     m.graph.initializer.remove(w_init)
     m.graph.initializer.append(numpy_helper.from_array(w_fp16, name="W_fp16"))
 
-    # 2. Insert Cast(W_fp16 → fp32) before the Gemm that consumes W.
+    # 2. Locate the Gemm node that consumes "W" (name coupled to _graph.py) and
+    #    rewire it to consume the Cast output.  Fail loud if out of sync with
+    #    _graph.py rather than producing a cryptic check_model error.
+    gemm = next(
+        (
+            n
+            for n in m.graph.node
+            if n.op_type == "Gemm" and len(n.input) > 1 and n.input[1] == "W"
+        ),
+        None,
+    )
+    if gemm is None:
+        raise ValueError(
+            "No Gemm node consuming 'W' found — _quantize.py is out of sync with _graph.py"
+        )
+    gemm.input[1] = "W_fp32_cast"
+
+    # 3. Insert Cast(W_fp16 → fp32) immediately before the located Gemm in node order.
     cast_node = helper.make_node(
         "Cast",
         inputs=["W_fp16"],
         outputs=["W_fp32_cast"],
         to=TensorProto.FLOAT,
     )
-    for node in m.graph.node:
-        if node.op_type == "Gemm" and node.input[1] == "W":
-            node.input[1] = "W_fp32_cast"
-            break
-
-    # 3. Splice cast_node immediately before the Gemm in node order.
     nodes = list(m.graph.node)
-    new_nodes: list = []
-    for n in nodes:
-        if n.op_type == "Gemm":
-            new_nodes.append(cast_node)
-        new_nodes.append(n)
+    gemm_idx = nodes.index(gemm)
+    new_nodes: list[onnx.NodeProto] = nodes[:gemm_idx] + [cast_node] + nodes[gemm_idx:]
     del m.graph.node[:]
     m.graph.node.extend(new_nodes)
 
@@ -67,14 +76,24 @@ def quantize(onnx_path: Path, dtype: str) -> None:
     IO (and the masking/TopK arithmetic) stay fp32 — only the weight and the
     matmul are reduced — so the output signature and the 1e9 sentinels remain
     safe (spec §4).
+
+    Not idempotent / not re-entrant: calling fp16 twice on the same file will
+    fail because the ``W`` initializer has been renamed to ``W_fp16`` after the
+    first call. Intended for single-pass export-once usage.
     """
     if dtype == "fp16":
         _convert_weight_to_fp16(onnx_path)
     elif dtype == "int8":
         from onnxruntime.quantization import QuantType, quantize_dynamic
 
+        # "int8.onnx" suffix is a temp file; cleaned up on failure so a stale
+        # partial file is never left next to the model.
         tmp = onnx_path.with_suffix(".int8.onnx")
-        quantize_dynamic(str(onnx_path), str(tmp), weight_type=QuantType.QInt8)
-        tmp.replace(onnx_path)
+        try:
+            quantize_dynamic(str(onnx_path), str(tmp), weight_type=QuantType.QInt8)
+            tmp.replace(onnx_path)
+        except Exception:
+            tmp.unlink(missing_ok=True)
+            raise
     else:
         raise ValueError(f"unsupported quantization dtype: {dtype!r}")
