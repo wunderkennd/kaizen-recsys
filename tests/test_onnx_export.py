@@ -349,3 +349,32 @@ def test_optional_inputs_omittable_use_baked_defaults(trained_model, tmp_path):
     assert top[0][-1] == 0
     # raw_scores still present for all M items.
     assert out[names.index("raw_scores")].shape == (1, M)
+
+
+# ---------------------------------------------------------------------------
+# Task 7: Quantization (fp16 / int8)
+# ---------------------------------------------------------------------------
+
+
+def _topk_set(sess, payload, kk=3):
+    inter, feat = _build_inputs(payload, [], [(0, 1.0)])
+    out = _run(sess, payload, inter, feat, rp=0.0, k=kk)
+    return out["top_indices"][0].tolist()
+
+
+@pytest.mark.parametrize("dtype", ["fp16", "int8"])
+def test_quantized_rank_agreement(trained_model, tmp_path, dtype):
+    from kzn_recsys.onnx_export import _payload_from_model, export_onnx
+
+    payload = _payload_from_model(trained_model)
+    fp32 = ort.InferenceSession(str(export_onnx(trained_model, tmp_path / "fp32").onnx_path))
+    quant = ort.InferenceSession(str(export_onnx(trained_model, tmp_path / dtype, dtype=dtype).onnx_path))
+    # Ranking is preserved even though scores shift under quantization.
+    assert _topk_set(quant, payload, kk=3) == _topk_set(fp32, payload, kk=3)
+
+
+def test_quantized_io_is_fp32(trained_model, tmp_path):
+    from kzn_recsys.onnx_export import export_onnx
+
+    sess = ort.InferenceSession(str(export_onnx(trained_model, tmp_path, dtype="fp16").onnx_path))
+    assert sess.get_outputs()[[o.name for o in sess.get_outputs()].index("raw_scores")].type == "tensor(float)"
