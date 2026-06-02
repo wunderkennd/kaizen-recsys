@@ -345,11 +345,36 @@ impl FeaseModel {
     /// The returned `s_items_bytes` is the RAW `S[0:M, :]` (NOT yet β-folded);
     /// the Python layer folds β into the user-feature columns when it builds the
     /// graph, keeping that transform testable in one place.
+    ///
+    /// Returns:
+    ///     dict: A dictionary with the following keys:
+    ///         - "kind" (str): Model architecture tag, e.g. ``"ease"``.
+    ///         - "s_items_bytes" (bytes): Row-major little-endian f64 bytes of
+    ///           the raw ``S[0:M, :]`` submatrix (shape ``M × (M + K_u)``).
+    ///         - "s_items_shape" (tuple[int, int]): ``(rows, cols)`` of the
+    ///           submatrix above.
+    ///         - "beta" (float): User-feature weight hyper-parameter.
+    ///         - "num_items" (int): Number of items ``M`` in the trained model.
+    ///         - "num_user_features" (int): Number of user-feature columns ``K_u``.
+    ///         - "num_item_features" (int): Number of item-feature rows ``K_t``.
+    ///         - "alpha" (float): Item-feature weight hyper-parameter.
+    ///         - "lambda_" (float): L2 regularisation strength.
+    ///         - "meta_weight" (float): Metadata-row weight in the Gram matrix.
+    ///         - "sparsity_threshold" (float | None): Pruning threshold used
+    ///           during training, or ``None`` when no weighting config was set.
+    ///         - "item_index_to_guid" (list[str]): Mapping from item index to
+    ///           item GUID string; index ``i`` → ``item_index_to_guid[i]``.
+    ///         - "feature_name_to_index" (dict[str, int]): Inverse mapping from
+    ///           user-feature name to its column index in ``S``.
+    #[pyo3(signature = ())]
     fn export_payload<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         use crate::models::{ModelKind, RecModel};
 
         let (s_bytes, rows, cols) = crate::onnx_export::s_items_row_major_le_bytes(&self.model);
 
+        // FeaseModel only ever wraps an Ease model today; sourcing the kind string
+        // from RecModel::kind() keeps this honest to the trait rather than
+        // hardcoding "ease". The non-Ease arms are defensive.
         let kind = match crate::models::EaseAdapterRef::new(&self.model).kind() {
             ModelKind::Ease => "ease",
             ModelKind::SasRec => "sasrec",
@@ -374,7 +399,7 @@ impl FeaseModel {
             .as_ref()
             .map(|w| w.sparsity_threshold);
         d.set_item("sparsity_threshold", sparsity)?;
-        d.set_item("item_index_to_guid", self.model.mappings.idx_to_item.clone())?;
+        d.set_item("item_index_to_guid", self.model.mappings.idx_to_item.as_slice())?;
 
         let feat = PyDict::new(py);
         for (name, idx) in self.model.mappings.user_feature_to_idx.iter() {
