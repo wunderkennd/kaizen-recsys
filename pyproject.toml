@@ -23,6 +23,7 @@ onnx = [
     "onnxruntime>=1.18",
     "onnxconverter-common>=1.14",
     "mlflow>=2.12",
+    "sympy>=1.12",  # required by onnxruntime.quantization (int8 path)
 ]
 
 [tool.maturin]
