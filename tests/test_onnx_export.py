@@ -305,8 +305,16 @@ def test_k0_uniform_signature(model_no_user_features, tmp_path):
     assert payload.num_user_features == 0
     res = export_onnx(model_no_user_features, tmp_path)
     sess = ort.InferenceSession(str(res.onnx_path))
-    in_names = [i.name for i in sess.get_inputs()]
-    assert in_names == ["interactions", "features", "mask", "seen", "repeat_penalty", "k"]
+
+    # ORT only reports the REQUIRED inputs (the 4 initializer-backed optional
+    # inputs are excluded). The authoritative full signature is io_signature.
+    required = [i.name for i in sess.get_inputs()]
+    assert required == ["interactions", "features"]
+    vocab = json.loads(res.vocab_path.read_text())
+    sig_inputs = [i["name"] for i in vocab["io_signature"]["inputs"]]
+    assert sig_inputs == ["interactions", "features", "mask", "seen", "repeat_penalty", "k"]
+
+    # K=0 runs with a width-0 features tensor and all inputs supplied.
     M = payload.num_items
     out = sess.run(
         None,
@@ -320,4 +328,24 @@ def test_k0_uniform_signature(model_no_user_features, tmp_path):
         },
     )
     names = [o.name for o in sess.get_outputs()]
+    assert out[names.index("raw_scores")].shape == (1, M)
+
+
+def test_optional_inputs_omittable_use_baked_defaults(trained_model, tmp_path):
+    from kzn_recsys.onnx_export import _payload_from_model, export_onnx
+
+    payload = _payload_from_model(trained_model)
+    M, K = payload.num_items, payload.num_user_features
+    sess = ort.InferenceSession(str(export_onnx(trained_model, tmp_path).onnx_path))
+    # Feed ONLY the required inputs; mask/seen/repeat_penalty/k use baked defaults
+    # (all-ones / all-zeros / EXCLUDE_SENTINEL / top_k_default).
+    inter = np.zeros((1, M), np.float32)
+    inter[0, 0] = 5.0  # interacted with item 0
+    feat = np.zeros((1, K), np.float32)
+    out = sess.run(None, {"interactions": inter, "features": feat})
+    names = [o.name for o in sess.get_outputs()]
+    top = out[names.index("top_indices")]
+    # Default repeat policy is exclude → interacted item 0 sinks to the bottom.
+    assert top[0][-1] == 0
+    # raw_scores still present for all M items.
     assert out[names.index("raw_scores")].shape == (1, M)
