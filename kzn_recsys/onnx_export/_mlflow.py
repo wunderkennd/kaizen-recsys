@@ -24,12 +24,18 @@ class FeaseOnnxPyfunc(mlflow.pyfunc.PythonModel):
         self._feat_to_idx = self._vocab["feature_name_to_index"]
         self._default_rp = self._vocab["repeat_policy"]["default_penalty"]
         self._default_k = self._vocab["top_k_default"]
+        # Cache output-name positions once to avoid per-row list rebuild.
+        self._output_names = [o.name for o in self._sess.get_outputs()]
+        self._top_idx_pos = self._output_names.index("top_indices")
+        self._top_scr_pos = self._output_names.index("top_scores")
 
-    def predict(self, context, model_input, params=None):
+    def predict(self, context, model_input: pd.DataFrame, params=None) -> pd.DataFrame:
         rows = model_input.to_dict(orient="records") if isinstance(model_input, pd.DataFrame) else list(model_input)
         frames = []
         for r, row in enumerate(rows):
             frames.append(self._predict_one(r, row))
+        if not frames:
+            return pd.DataFrame(columns=["user_row", "rank", "item_guid", "score"])
         return pd.concat(frames, ignore_index=True)
 
     def _predict_one(self, row_id, row):
@@ -66,9 +72,8 @@ class FeaseOnnxPyfunc(mlflow.pyfunc.PythonModel):
                 "k": np.array([k], np.int64),
             },
         )
-        names = [o.name for o in self._sess.get_outputs()]
-        top_idx = out[names.index("top_indices")][0]
-        top_scr = out[names.index("top_scores")][0]
+        top_idx = out[self._top_idx_pos][0]
+        top_scr = out[self._top_scr_pos][0]
         return pd.DataFrame(
             {
                 "user_row": row_id,

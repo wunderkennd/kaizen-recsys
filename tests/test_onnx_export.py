@@ -404,3 +404,15 @@ def test_mlflow_roundtrip_guid_in_guid_out(trained_model, tmp_path):
     assert "G0" not in guids  # excluded by default repeat policy
     assert len(guids) == 3
     assert {"user_row", "rank", "item_guid", "score"} <= set(out.columns)
+
+
+def test_mlflow_empty_input_returns_empty_frame(trained_model, tmp_path):
+    import mlflow.pyfunc
+
+    from kzn_recsys.onnx_export import export_onnx
+
+    res = export_onnx(trained_model, tmp_path, mlflow=True)
+    loaded = mlflow.pyfunc.load_model(str(res.mlflow_path))
+    out = loaded.predict(pd.DataFrame(columns=["interactions", "features", "exclude", "top_k"]))
+    assert list(out.columns) == ["user_row", "rank", "item_guid", "score"]
+    assert len(out) == 0
