@@ -77,6 +77,13 @@ src/data_validation.rs — GaussianAnomalyDetector for pre-training data quality
 - `train.py` — CLI training script (`--interactions`, `--user-features`, `--item-features`, `--output`)
 - `inference.py` — `FeasePredictor` class for loading saved models and serving predictions
 - `fease_train.py` — Databricks end-to-end workflow (PySpark → Parquet → Rust training → predictions)
+- `onnx_export/` — optional ONNX export (requires the `[onnx]` extra:
+  `pip install kzn_recsys[onnx]`): `export_onnx(model, out_dir, *, top_k_default,
+  dtype, repeat_penalty_default, mlflow)` writes `model.onnx` (Gemm scoring +
+  configurable repeat penalty + eligibility mask + TopK + `raw_scores`), a
+  `vocab.json` sidecar, and an optional MLflow pyfunc model. See
+  `docs/superpowers/specs/2026-06-01-onnx-export-design.md`. Regenerate the Rust
+  ort parity fixtures with `kzn_recsys.onnx_export._write_rust_fixture(model, "tests/fixtures")`.
 
 ## Key Concepts
 

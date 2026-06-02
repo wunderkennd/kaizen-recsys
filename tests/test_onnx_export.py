@@ -416,3 +416,41 @@ def test_mlflow_empty_input_returns_empty_frame(trained_model, tmp_path):
     out = loaded.predict(pd.DataFrame(columns=["interactions", "features", "exclude", "top_k"]))
     assert list(out.columns) == ["user_row", "rank", "item_guid", "score"]
     assert len(out) == 0
+
+
+# ---------------------------------------------------------------------------
+# Task 10: end-to-end artifacts, unsupported-kind, bad-dtype
+# ---------------------------------------------------------------------------
+
+
+def test_export_writes_all_artifacts(trained_model, tmp_path):
+    from kzn_recsys.onnx_export import export_onnx
+
+    res = export_onnx(trained_model, tmp_path, dtype="int8", mlflow=True)
+    assert res.onnx_path.exists()
+    assert res.vocab_path.exists()
+    assert res.mlflow_path.exists()
+
+
+def test_unsupported_kind_raises():
+    """Verify _payload_from_model raises NotImplementedError for a non-ease kind.
+
+    monkeypatch.setattr cannot patch a PyO3 instance (attribute is read-only on
+    builtins.FeaseModel). Instead we feed a minimal stand-in whose export_payload
+    returns kind="sasrec" directly into the dispatch logic.
+    """
+    from kzn_recsys import onnx_export as ox
+
+    class _FakeModel:
+        def export_payload(self):
+            return {"kind": "sasrec"}
+
+    with pytest.raises(NotImplementedError, match="sasrec"):
+        ox._payload_from_model(_FakeModel())
+
+
+def test_bad_dtype_raises(trained_model, tmp_path):
+    from kzn_recsys.onnx_export import export_onnx
+
+    with pytest.raises(ValueError, match="dtype"):
+        export_onnx(trained_model, tmp_path, dtype="bf16")

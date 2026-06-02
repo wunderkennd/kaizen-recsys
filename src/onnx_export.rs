@@ -29,7 +29,6 @@ mod tests {
     use crate::data_pipeline::Mappings;
     use ahash::AHashMap;
     use nalgebra::DMatrix;
-    #[cfg(test)]
     use ndarray;
 
     fn dummy_mappings() -> Mappings {
@@ -90,16 +89,19 @@ mod tests {
         use ort::session::Session;
 
         let onnx = std::path::Path::new("tests/fixtures/fixture.onnx");
+        // CI must ensure tests/fixtures/ is committed; this graceful-skip is for partial local checkouts.
         if !onnx.exists() {
             eprintln!("skipping: tests/fixtures/fixture.onnx missing");
             return;
         }
 
         let inputs: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string("tests/fixtures/inputs.json").unwrap())
+            serde_json::from_str(&fs::read_to_string("tests/fixtures/inputs.json")
+                .expect("tests/fixtures/inputs.json missing — regenerate via kzn_recsys.onnx_export._write_rust_fixture"))
                 .unwrap();
         let expected: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string("tests/fixtures/expected.json").unwrap())
+            serde_json::from_str(&fs::read_to_string("tests/fixtures/expected.json")
+                .expect("tests/fixtures/expected.json missing — regenerate via kzn_recsys.onnx_export._write_rust_fixture"))
                 .unwrap();
 
         let inter: Vec<f32> = inputs["interactions"]
