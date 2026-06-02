@@ -6,6 +6,14 @@ import polars as pl
 import pytest
 
 import kzn_recsys as fease
+from kzn_recsys.onnx_export import (
+    ExportPayload,
+    EXCLUDE_SENTINEL,
+    MASK_PENALTY,
+    OPSET,
+    _payload_from_model,
+    _validate_exportable,
+)
 
 
 @pytest.fixture(scope="module")
@@ -56,16 +64,6 @@ def test_export_payload_shapes_and_fields(trained_model):
     assert isinstance(d["item_index_to_guid"], list) and len(d["item_index_to_guid"]) == m
     assert d["sparsity_threshold"] is None  # no weighting config used
     assert set(d["feature_name_to_index"].values()) == set(range(d["num_user_features"]))
-
-
-from kzn_recsys.onnx_export import (
-    ExportPayload,
-    EXCLUDE_SENTINEL,
-    MASK_PENALTY,
-    OPSET,
-    _payload_from_model,
-    _validate_exportable,
-)
 
 
 def test_payload_from_model_builds_dataclass(trained_model):

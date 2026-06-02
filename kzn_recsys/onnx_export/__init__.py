@@ -6,7 +6,10 @@ from pathlib import Path
 
 import numpy as np
 
-# Graph/runtime constants (see spec §13 glossary).
+# Two distinct concepts that currently share the magnitude 1e9 (spec §13 glossary),
+# kept as separate names because their roles differ and may diverge:
+#   MASK_PENALTY     — graph constant: (mask - 1) * MASK_PENALTY drops eligibility-masked items
+#   EXCLUDE_SENTINEL — default repeat_penalty value reproducing "exclude already-watched"
 MASK_PENALTY = 1e9
 EXCLUDE_SENTINEL = 1e9
 OPSET = 17
@@ -71,11 +74,11 @@ def _validate_exportable(payload: ExportPayload) -> None:
 
 def export_onnx(
     model,
-    output_dir,
+    output_dir: str | Path,
     *,
     top_k_default: int = 100,
     dtype: str = "fp32",
-    repeat_penalty_default="exclude",
+    repeat_penalty_default: str | float = "exclude",
     mlflow: bool = False,
 ) -> ExportResult:
     """Export a trained EASE ``FeaseModel`` to ONNX + sidecar (+ optional MLflow).
