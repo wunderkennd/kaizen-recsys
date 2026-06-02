@@ -10,6 +10,7 @@ on:
 jobs:
   lint-and-test:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
 
     steps:
     - name: Check out code
@@ -45,6 +46,15 @@ jobs:
     # vacuously.
     - name: Run ml-models-gated tests (SASRec)
       run: cargo test --features ml-models sasrec
+
+    # The ml-models feature pulls in burn + its large transitive tree.
+    # The accumulated default + ml-models debug build trees bloat target/
+    # enough to exhaust the runner disk during the subsequent maturin
+    # build (and inflate the cache Swatinem/rust-cache saves, so a later
+    # run's cache *restore* refills the disk). Evict the Rust build
+    # artifacts before the Python build to keep disk bounded.
+    - name: Free disk — evict ml-models build artifacts
+      run: cargo clean
 
     - name: Set up Python
       uses: actions/setup-python@v6

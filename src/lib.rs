@@ -16,6 +16,7 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::time::Instant;
 
+mod data;
 mod data_pipeline;
 mod data_validation;
 pub mod evaluation;
@@ -198,10 +199,14 @@ impl FeaseModel {
             });
         }
 
-        // Run batch prediction with top-K filtering.
+        // Run batch prediction with top-K filtering through the
+        // generalized `&dyn RecModel` path. `EaseAdapterRef` borrows the
+        // model (no deep clone of the S matrix).
         // Release the GIL so other Python threads can proceed during rayon parallel work.
-        let batch_results =
-            py.detach(|| serving::predict_batch_top_k(&self.model, &batch_inputs, top_k));
+        let adapter = crate::models::EaseAdapterRef::new(&self.model);
+        let batch_results = py
+            .detach(|| serving::predict_batch_top_k(&adapter, &batch_inputs, top_k))
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
 
         // Convert results back to Python
         let py_outer = PyList::empty(py);
@@ -210,7 +215,7 @@ impl FeaseModel {
             for (idx, score) in user_results {
                 if let Some(guid) = self.model.mappings.idx_to_item.get(idx) {
                     let py_guid = PyString::new(py, guid);
-                    let py_score = PyFloat::new(py, score);
+                    let py_score = PyFloat::new(py, score as f64);
                     py_inner.append((py_guid, py_score))?;
                 }
             }
@@ -801,23 +806,32 @@ fn build_and_train(
 
 /// A Python-accessible registry for territory-based multi-model routing.
 ///
-/// This wraps the Rust `FeaseModelRegistry`, allowing Python callers to register
-/// multiple trained `FeaseModel` instances (one per territory/region) and route
-/// predictions to the correct model based on a territory key.
+/// This wraps the Rust `ModelRegistry`, allowing Python callers to register
+/// trained EASE / SASRec / Two-Tower models (one per territory/region) and route
+/// predictions to the correct model based on a territory key (#56).
+///
+/// Note on `fallback_territory` + per-model predict (#56): the fallback
+/// is resolved purely by territory key, not by model kind. If the
+/// registered fallback's kind doesn't match the `predict_top_k_*`
+/// method being called, the call errors with the same kind-mismatch
+/// message you'd get on a directly-registered mismatch (e.g. calling
+/// `predict_top_k_sasrec("JP", ...)` when "JP" is unknown and the
+/// fallback "US" holds an EASE model). The error message points at the
+/// correct method for the actual model kind, so callers can recover.
 ///
 /// Example:
-///     >>> registry = FeaseRegistry(fallback_territory="US")
+///     >>> registry = ModelRegistry(fallback_territory="US")
 ///     >>> registry.register("US", us_model)
 ///     >>> registry.register("BR", br_model)
 ///     >>> scores = registry.predict("US", [(0, 1.0)], [(0, 1.0)])
 ///     >>> top_recs = registry.predict_top_k("JP", [(0, 1.0)], 10)  # falls back to US
 #[pyclass]
-struct FeaseRegistry {
-    inner: serving::FeaseModelRegistry,
+struct ModelRegistry {
+    inner: serving::ModelRegistry,
 }
 
 #[pymethods]
-impl FeaseRegistry {
+impl ModelRegistry {
     /// Creates a new, empty registry.
     ///
     /// Args:
@@ -827,10 +841,10 @@ impl FeaseRegistry {
     #[pyo3(signature = (fallback_territory=None))]
     fn new(fallback_territory: Option<String>) -> Self {
         let inner = match fallback_territory {
-            Some(fb) => serving::FeaseModelRegistry::with_fallback(fb),
-            None => serving::FeaseModelRegistry::new(),
+            Some(fb) => serving::ModelRegistry::with_fallback(fb),
+            None => serving::ModelRegistry::new(),
         };
-        FeaseRegistry { inner }
+        ModelRegistry { inner }
     }
 
     /// Registers a trained FeaseModel for a territory.
@@ -903,6 +917,7 @@ impl FeaseRegistry {
         let features = user_features.unwrap_or_default();
         self.inner
             .predict(territory, &user_interactions, &features)
+            .map(|scores| scores.into_iter().map(|s| s as f64).collect())
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))
     }
 
@@ -928,22 +943,10 @@ impl FeaseRegistry {
         user_features: Option<Vec<(usize, f64)>>,
     ) -> PyResult<Vec<(usize, f64)>> {
         let features = user_features.unwrap_or_default();
-        let model = self.inner.get_model(territory).ok_or_else(|| {
-            PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-                "No model registered for territory '{}' (and no fallback available)",
-                territory
-            ))
-        })?;
-
-        let scores = model.predict(&user_interactions, &features, model.beta);
-        let interacted_indices: Vec<usize> =
-            user_interactions.iter().map(|(idx, _)| *idx).collect();
-
-        Ok(serving::filter_sort_top_k(
-            scores,
-            &interacted_indices,
-            top_k,
-        ))
+        self.inner
+            .predict_top_k(territory, &user_interactions, &features, top_k)
+            .map(|ranked| ranked.into_iter().map(|(i, s)| (i, s as f64)).collect())
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))
     }
 
     /// Predicts similar items for a given item index in a specific territory.
@@ -967,8 +970,126 @@ impl FeaseRegistry {
     ) -> PyResult<Vec<(usize, f64)>> {
         self.inner
             .predict_similar_items(territory, item_idx, top_k)
+            .map(|ranked| ranked.into_iter().map(|(i, s)| (i, s as f64)).collect())
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))
     }
+
+    /// Registers a trained SASRec model for a territory (#56). Mirrors
+    /// `register` (EASE) but for `SASRecModel`. The underlying trained
+    /// model is cloned into the registry; the source `SASRecModel`
+    /// instance remains usable. Available only when the extension is
+    /// built with `--features ml-models`.
+    #[cfg(feature = "ml-models")]
+    fn register_sasrec(&mut self, territory: String, model: &sasrec_py::SASRecModel) {
+        self.inner
+            .register_model(territory, Box::new(model.model.clone()));
+    }
+
+    /// Registers a trained Two-Tower model for a territory (#56).
+    /// Mirrors `register` (EASE) but for `TwoTowerModel`. Available
+    /// only when the extension is built with `--features ml-models`.
+    #[cfg(feature = "ml-models")]
+    fn register_two_tower(&mut self, territory: String, model: &two_tower_py::TwoTowerModel) {
+        self.inner
+            .register_model(territory, Box::new(model.model.clone()));
+    }
+
+    /// Predicts top-K items for an EASE territory using string ids
+    /// (#56). Mirrors `FeaseModel.predict`'s API surface so callers no
+    /// longer have to map `dict[str, float]` to integer indices by
+    /// hand. The existing index-based `predict_top_k` is preserved for
+    /// back-compat.
+    ///
+    /// Scores are routed through the `RecModel` trait, whose contract is
+    /// f32 — so output values differ from a direct `FeaseModel.predict`
+    /// call (which keeps EASE math in f64) by sub-ulp rounding (~1e-7).
+    /// Ranking is unaffected; never compare scores bit-exact across the
+    /// two surfaces.
+    ///
+    /// Errors:
+    ///     ValueError: territory is unknown, or the registered model
+    ///         is not EASE.
+    #[pyo3(signature = (territory, interactions, features=None, top_k=100))]
+    fn predict_top_k_ease(
+        &self,
+        territory: &str,
+        interactions: &Bound<'_, PyDict>,
+        features: Option<&Bound<'_, PyDict>>,
+        top_k: usize,
+    ) -> PyResult<Vec<(String, f64)>> {
+        let interactions_map = pydict_to_str_f64(interactions)?;
+        let features_map = match features {
+            Some(d) => pydict_to_str_f64(d)?,
+            None => ahash::AHashMap::new(),
+        };
+        self.inner
+            .predict_top_k_ease(territory, &interactions_map, &features_map, top_k)
+            .map(|ranked| ranked.into_iter().map(|(i, s)| (i, s as f64)).collect())
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))
+    }
+
+    /// Predicts top-K items for a SASRec territory using string ids
+    /// (#56). `history` is the user's chronological item-id list,
+    /// oldest first — same convention as `SASRecModel.predict`.
+    /// Unknown item ids are silently skipped.
+    ///
+    /// Errors:
+    ///     ValueError: territory is unknown, or the registered model
+    ///         is not SASRec.
+    #[cfg(feature = "ml-models")]
+    #[pyo3(signature = (territory, history, top_k=100))]
+    fn predict_top_k_sasrec(
+        &self,
+        territory: &str,
+        history: Vec<String>,
+        top_k: usize,
+    ) -> PyResult<Vec<(String, f64)>> {
+        self.inner
+            .predict_top_k_sasrec(territory, &history, top_k)
+            .map(|ranked| ranked.into_iter().map(|(i, s)| (i, s as f64)).collect())
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))
+    }
+
+    /// Predicts top-K items for a Two-Tower territory using string ids
+    /// (#56). Warm users use their learned id row; unknown users fall
+    /// back to the reserved cold-start row. Optional `features`
+    /// follows the same routing rules as `TwoTowerModel.predict`
+    /// (one-hot → cat embedding, numeric → dense column, unknown
+    /// silently skipped — see #55).
+    ///
+    /// Errors:
+    ///     ValueError: territory is unknown, or the registered model
+    ///         is not Two-Tower.
+    #[cfg(feature = "ml-models")]
+    #[pyo3(signature = (territory, user_id, features=None, top_k=100))]
+    fn predict_top_k_two_tower(
+        &self,
+        territory: &str,
+        user_id: &str,
+        features: Option<&Bound<'_, PyDict>>,
+        top_k: usize,
+    ) -> PyResult<Vec<(String, f64)>> {
+        let features_map = match features {
+            Some(d) => pydict_to_str_f64(d)?,
+            None => ahash::AHashMap::new(),
+        };
+        self.inner
+            .predict_top_k_two_tower(territory, user_id, &features_map, top_k)
+            .map(|ranked| ranked.into_iter().map(|(i, s)| (i, s as f64)).collect())
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))
+    }
+}
+
+/// Convert a `dict[str, float]` PyDict into the
+/// `ahash::AHashMap<String, f64>` the Rust registry methods consume.
+fn pydict_to_str_f64(d: &Bound<'_, PyDict>) -> PyResult<ahash::AHashMap<String, f64>> {
+    let mut map = ahash::AHashMap::with_capacity(d.len());
+    for (k, v) in d.iter() {
+        let key: String = k.extract()?;
+        let val: f64 = v.extract()?;
+        map.insert(key, val);
+    }
+    Ok(map)
 }
 
 // --- Ranking Evaluation Metrics (PyO3 wrappers) ---
@@ -1131,6 +1252,319 @@ fn random_search_py(
     search_result_to_py(py, &result)
 }
 
+// ---------------------------------------------------------------------------
+// Per-model search entrypoints
+// ---------------------------------------------------------------------------
+//
+// The search machinery (`tuning::grid_search_with` / `random_search_with`)
+// is generic over `tuning::FoldEvaluator<P>` and `tuning::SearchSpace`, so
+// each model family gets its own PyO3 entrypoint over its own param schema:
+// EASE uses the `(alpha, beta, lambda_, ...)` grid; SASRec uses
+// `(embedding_dim, num_heads, num_layers, dropout, learning_rate,
+// num_epochs)`; Two-Tower uses `(embedding_dim, temperature,
+// learning_rate, id_dropout)`. All three run end-to-end through the shared
+// k-fold + rayon runner and return the same result shape. The
+// burn-backed SASRec / Two-Tower searches require the `ml-models` build
+// feature; an EASE-only build reports that as a build-config error.
+
+/// EASE grid search over hyperparameters with k-fold CV.
+///
+/// Identical behavior and result shape to `grid_search`; named explicitly
+/// per model so SASRec/Two-Tower entrypoints can mirror it.
+#[pyfunction]
+#[pyo3(signature = (
+    interactions_path,
+    user_features_path,
+    item_features_path,
+    param_grid,
+    n_folds = 3,
+    eval_k = 10,
+    seed = 42
+))]
+#[allow(clippy::too_many_arguments)]
+fn grid_search_ease(
+    py: Python<'_>,
+    interactions_path: &str,
+    user_features_path: &str,
+    item_features_path: &str,
+    param_grid: &Bound<'_, PyDict>,
+    n_folds: usize,
+    eval_k: usize,
+    seed: u64,
+) -> PyResult<Py<PyAny>> {
+    grid_search_py(
+        py,
+        interactions_path,
+        user_features_path,
+        item_features_path,
+        param_grid,
+        n_folds,
+        eval_k,
+        seed,
+    )
+}
+
+/// EASE random search over hyperparameters with k-fold CV.
+#[pyfunction]
+#[pyo3(signature = (
+    interactions_path,
+    user_features_path,
+    item_features_path,
+    param_grid,
+    n_trials = 10,
+    n_folds = 3,
+    eval_k = 10,
+    seed = 42
+))]
+#[allow(clippy::too_many_arguments)]
+fn random_search_ease(
+    py: Python<'_>,
+    interactions_path: &str,
+    user_features_path: &str,
+    item_features_path: &str,
+    param_grid: &Bound<'_, PyDict>,
+    n_trials: usize,
+    n_folds: usize,
+    eval_k: usize,
+    seed: u64,
+) -> PyResult<Py<PyAny>> {
+    random_search_py(
+        py,
+        interactions_path,
+        user_features_path,
+        item_features_path,
+        param_grid,
+        n_trials,
+        n_folds,
+        eval_k,
+        seed,
+    )
+}
+
+/// SASRec grid search over its architecture/optimizer hyperparameters
+/// with k-fold CV.
+///
+/// `param_grid` keys: "embedding_dim", "num_heads", "num_layers"
+/// (integers), "dropout", "learning_rate" (floats), "num_epochs"
+/// (integers). Missing keys fall back to a single sensible default. The
+/// interactions file must carry a numeric `days_ago` column (SASRec is
+/// order-sensitive). `user_features_path` / `item_features_path` are
+/// accepted for surface parity with EASE but unused: SASRec is a
+/// sequence model. Result shape matches `grid_search_ease`. Requires the
+/// `ml-models` build feature.
+#[pyfunction]
+#[pyo3(signature = (
+    interactions_path,
+    user_features_path,
+    item_features_path,
+    param_grid,
+    n_folds = 3,
+    eval_k = 10,
+    seed = 42
+))]
+#[allow(clippy::too_many_arguments, unused_variables)]
+fn grid_search_sasrec(
+    py: Python<'_>,
+    interactions_path: &str,
+    user_features_path: &str,
+    item_features_path: &str,
+    param_grid: &Bound<'_, PyDict>,
+    n_folds: usize,
+    eval_k: usize,
+    seed: u64,
+) -> PyResult<Py<PyAny>> {
+    #[cfg(feature = "ml-models")]
+    {
+        let grid = parse_sasrec_grid(param_grid)?;
+        let result = py
+            .detach(|| {
+                let evaluator = tuning::SasRecFoldEvaluator::default();
+                tuning::grid_search_with(
+                    &evaluator,
+                    interactions_path,
+                    &grid,
+                    n_folds,
+                    eval_k,
+                    seed,
+                )
+            })
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+        sasrec_search_result_to_py(py, &result)
+    }
+    #[cfg(not(feature = "ml-models"))]
+    {
+        Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+            "SASRec hyperparameter search requires the `ml-models` build feature \
+             (the burn-backed SASRec model is not compiled into this EASE-only build).",
+        ))
+    }
+}
+
+/// SASRec random search over its architecture/optimizer hyperparameters
+/// with k-fold CV. Same `param_grid` keys and result shape as
+/// `grid_search_sasrec`. Requires the `ml-models` build feature.
+#[pyfunction]
+#[pyo3(signature = (
+    interactions_path,
+    user_features_path,
+    item_features_path,
+    param_grid,
+    n_trials = 10,
+    n_folds = 3,
+    eval_k = 10,
+    seed = 42
+))]
+#[allow(clippy::too_many_arguments, unused_variables)]
+fn random_search_sasrec(
+    py: Python<'_>,
+    interactions_path: &str,
+    user_features_path: &str,
+    item_features_path: &str,
+    param_grid: &Bound<'_, PyDict>,
+    n_trials: usize,
+    n_folds: usize,
+    eval_k: usize,
+    seed: u64,
+) -> PyResult<Py<PyAny>> {
+    #[cfg(feature = "ml-models")]
+    {
+        let grid = parse_sasrec_grid(param_grid)?;
+        let result = py
+            .detach(|| {
+                let evaluator = tuning::SasRecFoldEvaluator::default();
+                tuning::random_search_with(
+                    &evaluator,
+                    interactions_path,
+                    &grid,
+                    n_trials,
+                    n_folds,
+                    eval_k,
+                    seed,
+                )
+            })
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+        sasrec_search_result_to_py(py, &result)
+    }
+    #[cfg(not(feature = "ml-models"))]
+    {
+        Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+            "SASRec hyperparameter search requires the `ml-models` build feature \
+             (the burn-backed SASRec model is not compiled into this EASE-only build).",
+        ))
+    }
+}
+
+/// Two-Tower grid search over its hyperparameters with k-fold CV.
+///
+/// `param_grid` keys: "embedding_dim" (integers), "temperature",
+/// "learning_rate", "id_dropout" (floats). Missing keys fall back to a
+/// single sensible default. The model trains id-only from the
+/// interactions file (the tuning surface takes no side-feature files);
+/// `user_features_path` / `item_features_path` are accepted for surface
+/// parity but unused. Result shape matches `grid_search_ease`. Requires
+/// the `ml-models` build feature.
+#[pyfunction]
+#[pyo3(signature = (
+    interactions_path,
+    user_features_path,
+    item_features_path,
+    param_grid,
+    n_folds = 3,
+    eval_k = 10,
+    seed = 42
+))]
+#[allow(clippy::too_many_arguments, unused_variables)]
+fn grid_search_two_tower(
+    py: Python<'_>,
+    interactions_path: &str,
+    user_features_path: &str,
+    item_features_path: &str,
+    param_grid: &Bound<'_, PyDict>,
+    n_folds: usize,
+    eval_k: usize,
+    seed: u64,
+) -> PyResult<Py<PyAny>> {
+    #[cfg(feature = "ml-models")]
+    {
+        let grid = parse_two_tower_grid(param_grid)?;
+        let result = py
+            .detach(|| {
+                let evaluator = tuning::TwoTowerFoldEvaluator::default();
+                tuning::grid_search_with(
+                    &evaluator,
+                    interactions_path,
+                    &grid,
+                    n_folds,
+                    eval_k,
+                    seed,
+                )
+            })
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+        two_tower_search_result_to_py(py, &result)
+    }
+    #[cfg(not(feature = "ml-models"))]
+    {
+        Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+            "Two-Tower hyperparameter search requires the `ml-models` build feature \
+             (the burn-backed Two-Tower model is not compiled into this EASE-only build).",
+        ))
+    }
+}
+
+/// Two-Tower random search over its hyperparameters with k-fold CV. Same
+/// `param_grid` keys and result shape as `grid_search_two_tower`.
+/// Requires the `ml-models` build feature.
+#[pyfunction]
+#[pyo3(signature = (
+    interactions_path,
+    user_features_path,
+    item_features_path,
+    param_grid,
+    n_trials = 10,
+    n_folds = 3,
+    eval_k = 10,
+    seed = 42
+))]
+#[allow(clippy::too_many_arguments, unused_variables)]
+fn random_search_two_tower(
+    py: Python<'_>,
+    interactions_path: &str,
+    user_features_path: &str,
+    item_features_path: &str,
+    param_grid: &Bound<'_, PyDict>,
+    n_trials: usize,
+    n_folds: usize,
+    eval_k: usize,
+    seed: u64,
+) -> PyResult<Py<PyAny>> {
+    #[cfg(feature = "ml-models")]
+    {
+        let grid = parse_two_tower_grid(param_grid)?;
+        let result = py
+            .detach(|| {
+                let evaluator = tuning::TwoTowerFoldEvaluator::default();
+                tuning::random_search_with(
+                    &evaluator,
+                    interactions_path,
+                    &grid,
+                    n_trials,
+                    n_folds,
+                    eval_k,
+                    seed,
+                )
+            })
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+        two_tower_search_result_to_py(py, &result)
+    }
+    #[cfg(not(feature = "ml-models"))]
+    {
+        Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+            "Two-Tower hyperparameter search requires the `ml-models` build feature \
+             (the burn-backed Two-Tower model is not compiled into this EASE-only build).",
+        ))
+    }
+}
+
 /// Parses a Python dict into a ParamGrid, using defaults for missing keys.
 fn parse_param_grid(dict: &Bound<'_, PyDict>) -> PyResult<tuning::ParamGrid> {
     fn extract_vec(dict: &Bound<'_, PyDict>, key: &str, default: f64) -> PyResult<Vec<f64>> {
@@ -1200,6 +1634,697 @@ fn search_result_to_py(py: Python<'_>, result: &tuning::SearchResult) -> PyResul
     Ok(dict.into())
 }
 
+// --- SASRec / Two-Tower search param parsing + result serialization ------
+//
+// ml-models-gated: these only have call sites under the same feature, and
+// their grid types live behind the burn-backed model code.
+
+#[cfg(feature = "ml-models")]
+fn extract_f64_vec(dict: &Bound<'_, PyDict>, key: &str, default: f64) -> PyResult<Vec<f64>> {
+    match dict.get_item(key)? {
+        Some(v) => {
+            let list: Vec<f64> = v.extract()?;
+            Ok(if list.is_empty() { vec![default] } else { list })
+        }
+        None => Ok(vec![default]),
+    }
+}
+
+#[cfg(feature = "ml-models")]
+fn extract_usize_vec(dict: &Bound<'_, PyDict>, key: &str, default: usize) -> PyResult<Vec<usize>> {
+    match dict.get_item(key)? {
+        Some(v) => {
+            let list: Vec<usize> = v.extract()?;
+            Ok(if list.is_empty() { vec![default] } else { list })
+        }
+        None => Ok(vec![default]),
+    }
+}
+
+/// Parse a Python dict into a [`tuning::SasRecParamGrid`], defaulting any
+/// missing axis to a single sensible value.
+#[cfg(feature = "ml-models")]
+fn parse_sasrec_grid(dict: &Bound<'_, PyDict>) -> PyResult<tuning::SasRecParamGrid> {
+    Ok(tuning::SasRecParamGrid {
+        embedding_dim: extract_usize_vec(dict, "embedding_dim", 64)?,
+        num_heads: extract_usize_vec(dict, "num_heads", 2)?,
+        num_layers: extract_usize_vec(dict, "num_layers", 2)?,
+        dropout: extract_f64_vec(dict, "dropout", 0.2)?,
+        learning_rate: extract_f64_vec(dict, "learning_rate", 1e-3)?,
+        num_epochs: extract_usize_vec(dict, "num_epochs", 50)?,
+    })
+}
+
+/// Parse a Python dict into a [`tuning::TwoTowerParamGrid`], defaulting
+/// any missing axis to a single sensible value.
+#[cfg(feature = "ml-models")]
+fn parse_two_tower_grid(dict: &Bound<'_, PyDict>) -> PyResult<tuning::TwoTowerParamGrid> {
+    Ok(tuning::TwoTowerParamGrid {
+        embedding_dim: extract_usize_vec(dict, "embedding_dim", 32)?,
+        temperature: extract_f64_vec(dict, "temperature", 0.05)?,
+        learning_rate: extract_f64_vec(dict, "learning_rate", 0.01)?,
+        id_dropout: extract_f64_vec(dict, "id_dropout", 0.1)?,
+    })
+}
+
+/// Serialize a SASRec [`tuning::SearchResult`] into the same dict shape as
+/// EASE (`best_params` / `best_score` / `metric` / `trials`), with
+/// SASRec's param keys.
+#[cfg(feature = "ml-models")]
+fn sasrec_search_result_to_py(
+    py: Python<'_>,
+    result: &tuning::SearchResult<tuning::SasRecParams>,
+) -> PyResult<Py<PyAny>> {
+    fn params_dict<'py>(py: Python<'py>, p: &tuning::SasRecParams) -> PyResult<Bound<'py, PyDict>> {
+        let d = PyDict::new(py);
+        d.set_item("embedding_dim", p.embedding_dim)?;
+        d.set_item("num_heads", p.num_heads)?;
+        d.set_item("num_layers", p.num_layers)?;
+        d.set_item("dropout", p.dropout)?;
+        d.set_item("learning_rate", p.learning_rate)?;
+        d.set_item("num_epochs", p.num_epochs)?;
+        Ok(d)
+    }
+
+    let dict = PyDict::new(py);
+    dict.set_item("best_params", params_dict(py, &result.best_params)?)?;
+    dict.set_item("best_score", result.best_score)?;
+    dict.set_item("metric", &result.metric_name)?;
+    let trials_list = PyList::empty(py);
+    for trial in &result.all_trials {
+        let trial_dict = PyDict::new(py);
+        trial_dict.set_item("params", params_dict(py, &trial.params)?)?;
+        trial_dict.set_item("mean_score", trial.mean_score)?;
+        trial_dict.set_item("fold_scores", trial.fold_scores.clone())?;
+        trials_list.append(trial_dict)?;
+    }
+    dict.set_item("trials", trials_list)?;
+    Ok(dict.into())
+}
+
+/// Serialize a Two-Tower [`tuning::SearchResult`] into the same dict shape
+/// as EASE, with Two-Tower's param keys.
+#[cfg(feature = "ml-models")]
+fn two_tower_search_result_to_py(
+    py: Python<'_>,
+    result: &tuning::SearchResult<tuning::TwoTowerParams>,
+) -> PyResult<Py<PyAny>> {
+    fn params_dict<'py>(
+        py: Python<'py>,
+        p: &tuning::TwoTowerParams,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let d = PyDict::new(py);
+        d.set_item("embedding_dim", p.embedding_dim)?;
+        d.set_item("temperature", p.temperature)?;
+        d.set_item("learning_rate", p.learning_rate)?;
+        d.set_item("id_dropout", p.id_dropout)?;
+        Ok(d)
+    }
+
+    let dict = PyDict::new(py);
+    dict.set_item("best_params", params_dict(py, &result.best_params)?)?;
+    dict.set_item("best_score", result.best_score)?;
+    dict.set_item("metric", &result.metric_name)?;
+    let trials_list = PyList::empty(py);
+    for trial in &result.all_trials {
+        let trial_dict = PyDict::new(py);
+        trial_dict.set_item("params", params_dict(py, &trial.params)?)?;
+        trial_dict.set_item("mean_score", trial.mean_score)?;
+        trial_dict.set_item("fold_scores", trial.fold_scores.clone())?;
+        trials_list.append(trial_dict)?;
+    }
+    dict.set_item("trials", trials_list)?;
+    Ok(dict.into())
+}
+
+// --- SASRec PyO3 surface (ml-models feature) -----------------------------
+//
+// Mirrors the `FeaseModel` class (predict / evaluate / save / load) for
+// the burn-based SASRec sequence recommender. Gated on `ml-models` so the
+// default EASE-only build neither pulls burn nor exposes these symbols —
+// the Python package guards the import accordingly.
+
+#[cfg(feature = "ml-models")]
+mod sasrec_py {
+    use super::*;
+    use crate::data::sequences::build_sequences;
+    use crate::models::sasrec::{SasRecConfig, SasRecTrainingConfig, TrainedSasRec, train_sasrec};
+    use crate::models::{ModelInput, RecModel};
+    use burn::backend::ndarray::NdArrayDevice;
+    use burn::backend::{Autodiff, NdArray};
+
+    /// A trained SASRec model, callable from Python.
+    #[pyclass]
+    pub struct SASRecModel {
+        // `pub(crate)` so `ModelRegistry::register_sasrec` (sibling
+        // module in lib.rs) can clone the underlying TrainedSasRec
+        // into the trait-object registry (#56).
+        pub(crate) model: TrainedSasRec,
+        #[pyo3(get)]
+        num_items: usize,
+        #[pyo3(get)]
+        max_seq_len: usize,
+    }
+
+    #[pymethods]
+    impl SASRecModel {
+        /// Score recommendations from a chronologically-ordered history.
+        ///
+        /// Args:
+        ///     history (list[str]): Item ids, oldest first. Unknown ids
+        ///         are skipped.
+        ///     top_k (int): Number of recommendations to return.
+        ///
+        /// Returns:
+        ///     list[tuple[str, float]]: (item_id, score), descending,
+        ///     excluding items already in `history`.
+        #[pyo3(signature = (history, top_k=100))]
+        fn predict<'py>(
+            &self,
+            py: Python<'py>,
+            history: &Bound<'_, PyList>,
+            top_k: usize,
+        ) -> PyResult<Bound<'py, PyList>> {
+            let mut hist_idx: Vec<usize> = Vec::with_capacity(history.len());
+            for obj in history.iter() {
+                let id: String = obj.extract()?;
+                if let Some(&idx) = self.model.item_mapping().item_to_idx.get(&id) {
+                    hist_idx.push(idx);
+                }
+            }
+
+            let scores = self
+                .model
+                .predict_scores(ModelInput::Sequence { history: &hist_idx })
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+
+            let seen: HashSet<usize> = hist_idx.iter().copied().collect();
+            let mut ranked: Vec<(usize, f32)> = scores
+                .into_iter()
+                .enumerate()
+                .filter(|(idx, _)| !seen.contains(idx))
+                .collect();
+            ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+            let out = PyList::empty(py);
+            let map = self.model.item_mapping();
+            for (idx, score) in ranked.into_iter().take(top_k) {
+                if let Some(guid) = map.idx_to_item.get(idx) {
+                    out.append((PyString::new(py, guid), PyFloat::new(py, score as f64)))?;
+                }
+            }
+            Ok(out)
+        }
+
+        /// Top-K items most similar to `item_id` by item-embedding cosine.
+        #[pyo3(signature = (item_id, top_k=20))]
+        fn predict_similar_items<'py>(
+            &self,
+            py: Python<'py>,
+            item_id: &str,
+            top_k: usize,
+        ) -> PyResult<Bound<'py, PyList>> {
+            let out = PyList::empty(py);
+            let map = self.model.item_mapping();
+            let Some(&idx) = map.item_to_idx.get(item_id) else {
+                return Ok(out);
+            };
+            let sim = self
+                .model
+                .predict_similar_items(idx, top_k)
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            for (i, score) in sim {
+                if let Some(guid) = map.idx_to_item.get(i) {
+                    out.append((PyString::new(py, guid), PyFloat::new(py, score as f64)))?;
+                }
+            }
+            Ok(out)
+        }
+
+        /// Self-check the model state. Returns `(passed, messages)`.
+        fn validate<'py>(&self, py: Python<'py>) -> PyResult<(bool, Bound<'py, PyList>)> {
+            let report = self.model.validate();
+            Ok((report.passed, PyList::new(py, &report.messages)?))
+        }
+
+        /// Evaluate against test interactions via the generalized
+        /// `&dyn RecModel` harness (same metrics dict as `FeaseModel`).
+        #[pyo3(signature = (test_interactions_path, train_interactions_path, k_values=None))]
+        fn evaluate<'py>(
+            &self,
+            py: Python<'py>,
+            test_interactions_path: &str,
+            train_interactions_path: &str,
+            k_values: Option<Vec<usize>>,
+        ) -> PyResult<Bound<'py, PyDict>> {
+            let config = evaluation::EvalConfig {
+                k_values: k_values.unwrap_or_else(|| vec![5, 10, 20, 50]),
+            };
+            let report = evaluation::evaluate_model(
+                &self.model,
+                test_interactions_path,
+                train_interactions_path,
+                None,
+                &config,
+            )
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+
+            let result = PyDict::new(py);
+            result.set_item("num_users", report.num_users)?;
+            result.set_item("num_interactions", report.num_interactions)?;
+            result.set_item("coverage", report.coverage)?;
+            let metrics_list = PyList::empty(py);
+            for m in &report.metrics_at_k {
+                let d = PyDict::new(py);
+                d.set_item("k", m.k)?;
+                d.set_item("precision", m.precision)?;
+                d.set_item("recall", m.recall)?;
+                d.set_item("ndcg", m.ndcg)?;
+                d.set_item("map", m.map)?;
+                d.set_item("hit_rate", m.hit_rate)?;
+                metrics_list.append(d)?;
+            }
+            result.set_item("metrics", metrics_list)?;
+            Ok(result)
+        }
+
+        /// Persist the model to `path` (framed `FSAS` format).
+        fn save(&self, path: String) -> PyResult<()> {
+            self.model
+                .save(Path::new(&path))
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))
+        }
+    }
+
+    /// Train a SASRec model from a long-format interactions file.
+    ///
+    /// The interactions file must carry a numeric `days_ago` column so
+    /// each user's history can be ordered chronologically (SASRec is
+    /// order-sensitive; the data path fails loudly otherwise).
+    ///
+    /// Args:
+    ///     interactions_path (str): Parquet/CSV with `user_id`,
+    ///         `item_id`, `value`, `days_ago`.
+    ///     embedding_dim, num_heads, num_layers, dropout: architecture.
+    ///     max_seq_len: history length (also the positional-embedding cap).
+    ///     num_epochs, batch_size, learning_rate, patience, seed: training.
+    ///
+    /// Returns:
+    ///     SASRecModel
+    #[pyfunction]
+    #[pyo3(signature = (
+        interactions_path,
+        embedding_dim = 64,
+        max_seq_len = 50,
+        num_heads = 2,
+        num_layers = 2,
+        dropout = 0.2,
+        num_epochs = 50,
+        batch_size = 16,
+        learning_rate = 1e-3,
+        patience = 5,
+        seed = 42
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_and_train_sasrec(
+        interactions_path: String,
+        embedding_dim: usize,
+        max_seq_len: usize,
+        num_heads: usize,
+        num_layers: usize,
+        dropout: f64,
+        num_epochs: usize,
+        batch_size: usize,
+        learning_rate: f64,
+        patience: usize,
+        seed: u64,
+    ) -> PyResult<SASRecModel> {
+        let mappings = data_pipeline::build_interaction_mappings(&interactions_path)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?;
+
+        let dataset = build_sequences(&interactions_path, &mappings, max_seq_len)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?;
+
+        // vocab = catalog items + reserved pad token (see data::sequences).
+        let vocab_size = mappings.idx_to_item.len() + 1;
+        let model_config = SasRecConfig::new(
+            vocab_size,
+            embedding_dim,
+            max_seq_len,
+            num_heads,
+            num_layers,
+        )
+        .with_dropout(dropout);
+        let train_config = SasRecTrainingConfig::new()
+            .with_num_epochs(num_epochs)
+            .with_batch_size(batch_size)
+            .with_learning_rate(learning_rate)
+            .with_patience(patience)
+            .with_seed(seed);
+
+        let device = NdArrayDevice::default();
+        let fitted =
+            train_sasrec::<Autodiff<NdArray<f32>>>(&model_config, &train_config, &dataset, &device)
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+
+        let trained = TrainedSasRec::new(fitted, model_config, mappings);
+        let report = trained.validate();
+        if !report.passed {
+            let msg = format!(
+                "SASRec model validation failed:\n{}",
+                report.messages.join("\n")
+            );
+            return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(msg));
+        }
+        let num_items = RecModel::num_items(&trained);
+        Ok(SASRecModel {
+            model: trained,
+            num_items,
+            max_seq_len,
+        })
+    }
+
+    /// Load a SASRec model previously written by `SASRecModel.save`.
+    #[pyfunction]
+    pub fn load_sasrec_model(path: String) -> PyResult<SASRecModel> {
+        let model = TrainedSasRec::load_from(Path::new(&path))
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
+        let report = model.validate();
+        if !report.passed {
+            let msg = format!(
+                "Loaded SASRec model failed validation:\n{}",
+                report.messages.join("\n")
+            );
+            return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(msg));
+        }
+        let num_items = RecModel::num_items(&model);
+        let max_seq_len = model.config_max_seq_len();
+        Ok(SASRecModel {
+            model,
+            num_items,
+            max_seq_len,
+        })
+    }
+}
+
+/// Two-Tower Python wrapper. Compiled only with the `ml-models` feature
+/// because the underlying model depends on `burn`.
+///
+/// Training inputs are the same long-format Parquet/CSV files as EASE
+/// (`user_id`, `item_id`, `value` for interactions; long-format user /
+/// item feature tables). Predict-time inputs are limited to a string
+/// user id: warm users use their learned id embedding, unknown users
+/// fall back to the reserved cold-start row that id-dropout trains as a
+/// learned average-user prior (ADR-0001, PR #46). Predict-time arbitrary
+/// user features are not currently supported — the trained model does
+/// not persist a feature-name → category-index map.
+#[cfg(feature = "ml-models")]
+mod two_tower_py {
+    use super::*;
+    use crate::data::triples::{FeatureTable, load_features, load_triples};
+    use crate::models::two_tower::{TrainParams, TrainedTwoTower, train};
+    use crate::models::{ModelInput, RecModel};
+
+    /// A trained Two-Tower model, callable from Python.
+    #[pyclass]
+    pub struct TwoTowerModel {
+        // `pub(crate)` so `ModelRegistry::register_two_tower` (sibling
+        // module in lib.rs) can clone the underlying TrainedTwoTower
+        // into the trait-object registry (#56).
+        pub(crate) model: TrainedTwoTower,
+        #[pyo3(get)]
+        num_items: usize,
+        #[pyo3(get)]
+        num_users: usize,
+    }
+
+    #[pymethods]
+    impl TwoTowerModel {
+        /// Score recommendations for `user_id`.
+        ///
+        /// Warm users (id seen in training) use their learned id-row
+        /// embedding. Unknown users transparently fall back to the
+        /// reserved cold-start row. Items the user already interacted
+        /// with in training are *not* excluded — Two-Tower has no
+        /// access to a user's full history at predict time.
+        ///
+        /// When `features` is supplied, each entry is matched against the
+        /// user-feature maps captured at training time (#55):
+        /// - One-hot/categorical features (`{"plan_free": 1.0}`) add the
+        ///   slot's categorical-embedding to the user vector.
+        /// - Dense numeric features (`{"tenure_days": 42.0}`) write into
+        ///   the matching dense column.
+        /// - Feature names unknown to the model are silently skipped.
+        ///
+        /// For cold-start users (unknown `user_id`), this is how to
+        /// combine the learned cold-start prior with the new user's
+        /// side info instead of falling back to the bare cold-start row.
+        ///
+        /// Args:
+        ///     user_id (str): String user id.
+        ///     features (dict[str, float], optional): Predict-time
+        ///         user features. See above for routing rules.
+        ///     top_k (int): Number of recommendations to return.
+        ///
+        /// Returns:
+        ///     list[tuple[str, float]]: (item_id, score), descending.
+        #[pyo3(signature = (user_id, features=None, top_k=100))]
+        fn predict<'py>(
+            &self,
+            py: Python<'py>,
+            user_id: &str,
+            features: Option<&Bound<'_, PyDict>>,
+            top_k: usize,
+        ) -> PyResult<Bound<'py, PyList>> {
+            let user_idx = self.model.item_mapping().user_to_idx.get(user_id).copied();
+
+            // Translate predict-time string features through the
+            // user-feature maps persisted on the trained model.
+            let (cat_features, dense_features) = if let Some(d) = features {
+                let mut map: ahash::AHashMap<String, f64> = ahash::AHashMap::new();
+                for (k, v) in d.iter() {
+                    let name: String = k.extract()?;
+                    let value: f64 = v.extract()?;
+                    map.insert(name, value);
+                }
+                self.model.resolve_user_features(&map)
+            } else {
+                (Vec::new(), Vec::new())
+            };
+
+            let scores = self
+                .model
+                .predict_scores(ModelInput::TowerUser {
+                    user_idx,
+                    cat_features: &cat_features,
+                    dense_features: &dense_features,
+                })
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+
+            let mut ranked: Vec<(usize, f32)> = scores.into_iter().enumerate().collect();
+            ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+            let out = PyList::empty(py);
+            let map = self.model.item_mapping();
+            for (idx, score) in ranked.into_iter().take(top_k) {
+                if let Some(guid) = map.idx_to_item.get(idx) {
+                    out.append((PyString::new(py, guid), PyFloat::new(py, score as f64)))?;
+                }
+            }
+            Ok(out)
+        }
+
+        /// Top-K items most similar to `item_id` by item-embedding score.
+        #[pyo3(signature = (item_id, top_k=20))]
+        fn predict_similar_items<'py>(
+            &self,
+            py: Python<'py>,
+            item_id: &str,
+            top_k: usize,
+        ) -> PyResult<Bound<'py, PyList>> {
+            let out = PyList::empty(py);
+            let map = self.model.item_mapping();
+            let Some(&idx) = map.item_to_idx.get(item_id) else {
+                return Ok(out);
+            };
+            let sim = self
+                .model
+                .predict_similar_items(idx, top_k)
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            for (i, score) in sim {
+                if let Some(guid) = map.idx_to_item.get(i) {
+                    out.append((PyString::new(py, guid), PyFloat::new(py, score as f64)))?;
+                }
+            }
+            Ok(out)
+        }
+
+        /// Self-check the model state. Returns `(passed, messages)`.
+        fn validate<'py>(&self, py: Python<'py>) -> PyResult<(bool, Bound<'py, PyList>)> {
+            let report = self.model.validate();
+            Ok((report.passed, PyList::new(py, &report.messages)?))
+        }
+
+        /// Evaluate against test interactions via the `&dyn RecModel`
+        /// harness routed through `TwoTowerEvalAdapter` (same metrics
+        /// dict shape as `FeaseModel.evaluate`).
+        #[pyo3(signature = (test_interactions_path, train_interactions_path, k_values=None))]
+        fn evaluate<'py>(
+            &self,
+            py: Python<'py>,
+            test_interactions_path: &str,
+            train_interactions_path: &str,
+            k_values: Option<Vec<usize>>,
+        ) -> PyResult<Bound<'py, PyDict>> {
+            let config = evaluation::EvalConfig {
+                k_values: k_values.unwrap_or_else(|| vec![5, 10, 20, 50]),
+            };
+            let report = evaluation::evaluate_model(
+                &self.model,
+                test_interactions_path,
+                train_interactions_path,
+                None,
+                &config,
+            )
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+
+            let result = PyDict::new(py);
+            result.set_item("num_users", report.num_users)?;
+            result.set_item("num_interactions", report.num_interactions)?;
+            result.set_item("coverage", report.coverage)?;
+            let metrics_list = PyList::empty(py);
+            for m in &report.metrics_at_k {
+                let d = PyDict::new(py);
+                d.set_item("k", m.k)?;
+                d.set_item("precision", m.precision)?;
+                d.set_item("recall", m.recall)?;
+                d.set_item("ndcg", m.ndcg)?;
+                d.set_item("map", m.map)?;
+                d.set_item("hit_rate", m.hit_rate)?;
+                metrics_list.append(d)?;
+            }
+            result.set_item("metrics", metrics_list)?;
+            Ok(result)
+        }
+
+        /// Persist the model to `path` (framed `FTWO` format).
+        fn save(&self, path: String) -> PyResult<()> {
+            self.model
+                .save_to(Path::new(&path))
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))
+        }
+    }
+
+    /// Train a Two-Tower model from a long-format interactions file plus
+    /// optional user/item feature files.
+    ///
+    /// Args:
+    ///     interactions_path (str): Parquet/CSV with `user_id`, `item_id`,
+    ///         optional `value` (rows with `value <= 0` are skipped).
+    ///     user_features_path (str, optional): Long-format user features
+    ///         (`user_id`, `feature_name`, `value`). One-hot-only feature
+    ///         names route through the categorical embedding; others
+    ///         become a dense vector.
+    ///     item_features_path (str, optional): Same shape, with `item_id`.
+    ///     embedding_dim, temperature, learning_rate, epochs, batch_size,
+    ///         id_dropout, seed: training hyperparameters.
+    ///
+    /// Returns:
+    ///     TwoTowerModel
+    #[pyfunction]
+    #[pyo3(signature = (
+        interactions_path,
+        user_features_path = None,
+        item_features_path = None,
+        embedding_dim = 32,
+        temperature = 0.05,
+        learning_rate = 0.01,
+        epochs = 50,
+        batch_size = 256,
+        id_dropout = 0.1,
+        seed = 0,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_and_train_two_tower(
+        interactions_path: String,
+        user_features_path: Option<String>,
+        item_features_path: Option<String>,
+        embedding_dim: usize,
+        temperature: f64,
+        learning_rate: f64,
+        epochs: usize,
+        batch_size: usize,
+        id_dropout: f64,
+        seed: u64,
+    ) -> PyResult<TwoTowerModel> {
+        let data = load_triples(&interactions_path)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?;
+
+        let user_ft = match user_features_path {
+            Some(p) => load_features(&p, "user_id", &data.user_to_idx, data.num_users())
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?,
+            None => FeatureTable::empty(data.num_users()),
+        };
+        let item_ft = match item_features_path {
+            Some(p) => load_features(&p, "item_id", &data.item_to_idx, data.num_items())
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?,
+            None => FeatureTable::empty(data.num_items()),
+        };
+
+        let params = TrainParams {
+            embedding_dim,
+            temperature,
+            learning_rate,
+            epochs,
+            batch_size,
+            id_dropout,
+            seed,
+        };
+
+        let trained = train(&data, &user_ft, &item_ft, params)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+
+        let report = trained.validate();
+        if !report.passed {
+            let msg = format!(
+                "Two-Tower model validation failed:\n{}",
+                report.messages.join("\n")
+            );
+            return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(msg));
+        }
+
+        let num_items = RecModel::num_items(&trained);
+        let num_users = data.num_users();
+        Ok(TwoTowerModel {
+            model: trained,
+            num_items,
+            num_users,
+        })
+    }
+
+    /// Load a Two-Tower model previously written by `TwoTowerModel.save`.
+    #[pyfunction]
+    pub fn load_two_tower_model(path: String) -> PyResult<TwoTowerModel> {
+        let model = TrainedTwoTower::load_from(Path::new(&path))
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
+        let report = model.validate();
+        if !report.passed {
+            let msg = format!(
+                "Loaded Two-Tower model failed validation:\n{}",
+                report.messages.join("\n")
+            );
+            return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(msg));
+        }
+        let num_items = RecModel::num_items(&model);
+        let num_users = model.item_mapping().idx_to_user.len();
+        Ok(TwoTowerModel {
+            model,
+            num_items,
+            num_users,
+        })
+    }
+}
+
 /// Defines the Python module.
 /// This function is called when Python runs `import kzn_recsys._native`.
 #[pymodule]
@@ -1218,7 +2343,27 @@ fn _native(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(leave_k_out_split, m)?)?;
     m.add_function(wrap_pyfunction!(grid_search_py, m)?)?;
     m.add_function(wrap_pyfunction!(random_search_py, m)?)?;
+    m.add_function(wrap_pyfunction!(grid_search_ease, m)?)?;
+    m.add_function(wrap_pyfunction!(random_search_ease, m)?)?;
+    m.add_function(wrap_pyfunction!(grid_search_sasrec, m)?)?;
+    m.add_function(wrap_pyfunction!(random_search_sasrec, m)?)?;
+    m.add_function(wrap_pyfunction!(grid_search_two_tower, m)?)?;
+    m.add_function(wrap_pyfunction!(random_search_two_tower, m)?)?;
     m.add_class::<FeaseModel>()?;
-    m.add_class::<FeaseRegistry>()?;
+    m.add_class::<ModelRegistry>()?;
+
+    #[cfg(feature = "ml-models")]
+    {
+        m.add_function(wrap_pyfunction!(sasrec_py::build_and_train_sasrec, m)?)?;
+        m.add_function(wrap_pyfunction!(sasrec_py::load_sasrec_model, m)?)?;
+        m.add_class::<sasrec_py::SASRecModel>()?;
+        m.add_function(wrap_pyfunction!(
+            two_tower_py::build_and_train_two_tower,
+            m
+        )?)?;
+        m.add_function(wrap_pyfunction!(two_tower_py::load_two_tower_model, m)?)?;
+        m.add_class::<two_tower_py::TwoTowerModel>()?;
+    }
+
     Ok(())
 }
