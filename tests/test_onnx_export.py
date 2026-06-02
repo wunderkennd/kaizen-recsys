@@ -1,3 +1,4 @@
+import json
 import tempfile
 from pathlib import Path
 
@@ -243,3 +244,80 @@ def test_batch_inference(trained_model, tmp_path):
     top = out[names.index("top_indices")]
     assert top.shape == (2, M)
     assert top[0][-1] == 0  # user 0's seen item sinks to bottom
+
+
+def test_vocab_contents(trained_model, tmp_path):
+    from kzn_recsys.onnx_export import _payload_from_model, export_onnx
+
+    payload = _payload_from_model(trained_model)
+    res = export_onnx(trained_model, tmp_path, top_k_default=7)
+    vocab = json.loads(res.vocab_path.read_text())
+
+    assert vocab["format_version"] == 1
+    assert vocab["model_kind"] == "ease"
+    assert vocab["num_items"] == payload.num_items
+    assert vocab["num_user_features"] == payload.num_user_features
+    assert vocab["top_k_default"] == 7
+    assert vocab["constants"] == {"MASK_PENALTY": 1e9, "EXCLUDE_SENTINEL": 1e9}
+    assert vocab["repeat_policy"]["default_penalty"] == 1e9
+    assert vocab["repeat_policy"]["per_user_table_present"] is False
+    assert len(vocab["item_index_to_guid"]) == payload.num_items
+    assert vocab["provenance"]["sparsity_threshold"] is None
+
+    names = [i["name"] for i in vocab["io_signature"]["inputs"]]
+    assert names == ["interactions", "features", "mask", "seen", "repeat_penalty", "k"]
+    out_names = [o["name"] for o in vocab["io_signature"]["outputs"]]
+    assert out_names == ["top_indices", "top_scores", "raw_scores"]
+
+
+@pytest.fixture(scope="module")
+def model_no_user_features():
+    """Trained EASE model with K = 0 (no user features)."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        i_path = Path(tmpdir) / "interactions.parquet"
+        u_path = Path(tmpdir) / "user_features.parquet"
+        t_path = Path(tmpdir) / "item_features.parquet"
+        pl.DataFrame(
+            {"user_id": ["u0", "u0", "u1"], "item_id": ["G0", "G2", "G1"], "value": [5.0, 4.0, 6.0]}
+        ).write_parquet(i_path)
+        # Empty user features → K = 0 (typed to avoid null-dtype rejection by Polars/Rust).
+        pl.DataFrame(
+            {"user_id": pl.Series([], dtype=pl.Utf8), "feature_name": pl.Series([], dtype=pl.Utf8), "value": pl.Series([], dtype=pl.Float64)}
+        ).write_parquet(u_path)
+        pl.DataFrame(
+            {"item_id": ["G0", "G1", "G2", "G3"], "feature_name": ["a", "a", "a", "a"], "value": [1.0] * 4}
+        ).write_parquet(t_path)
+        yield fease.build_and_train(
+            interactions_path=str(i_path),
+            user_features_path=str(u_path),
+            item_features_path=str(t_path),
+            alpha=1.0,
+            beta=1.0,
+            lambda_=10.0,
+            meta_weight=0.0,
+        )
+
+
+def test_k0_uniform_signature(model_no_user_features, tmp_path):
+    from kzn_recsys.onnx_export import _payload_from_model, export_onnx
+
+    payload = _payload_from_model(model_no_user_features)
+    assert payload.num_user_features == 0
+    res = export_onnx(model_no_user_features, tmp_path)
+    sess = ort.InferenceSession(str(res.onnx_path))
+    in_names = [i.name for i in sess.get_inputs()]
+    assert in_names == ["interactions", "features", "mask", "seen", "repeat_penalty", "k"]
+    M = payload.num_items
+    out = sess.run(
+        None,
+        {
+            "interactions": np.zeros((1, M), np.float32),
+            "features": np.zeros((1, 0), np.float32),  # width-0
+            "mask": np.ones((1, M), np.float32),
+            "seen": np.zeros((1, M), np.float32),
+            "repeat_penalty": np.array([[0.0]], np.float32),
+            "k": np.array([M], np.int64),
+        },
+    )
+    names = [o.name for o in sess.get_outputs()]
+    assert out[names.index("raw_scores")].shape == (1, M)
