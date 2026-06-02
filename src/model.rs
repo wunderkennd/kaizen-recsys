@@ -367,8 +367,8 @@ impl RustFeaseModel {
         let z = DVector::from_vec(z_vec);
 
         // 3. Predict scores: p = S * z
-        // The FEASE paper defines the prediction as p = z^T * S.
-        // S is symmetric, so S * z == S^T * z.
+        // Row i of S dotted with z gives item i's score. S is not symmetric in
+        // general (S[i,j] = -P[i,j]/P[j,j]); we use S directly, so that's fine.
         let p_full = &self.s_matrix * &z;
 
         // 4. We only want the item scores, which are the first M entries

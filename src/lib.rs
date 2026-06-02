@@ -11,7 +11,7 @@
 
 use model::RustFeaseModel; // The internal Rust struct
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyFloat, PyList, PyString};
+use pyo3::types::{PyBytes, PyDict, PyFloat, PyList, PyString};
 use std::collections::HashSet;
 use std::path::Path;
 use std::time::Instant;
@@ -23,6 +23,7 @@ pub mod evaluation;
 pub mod metrics;
 mod model;
 mod models;
+pub(crate) mod onnx_export;
 mod serialization;
 mod serving;
 pub mod tuning;
@@ -340,6 +341,81 @@ impl FeaseModel {
         result.set_item("metrics", metrics_list)?;
 
         Ok(result)
+    }
+
+    /// Returns everything the Python ONNX exporter needs to author the graph:
+    /// the raw `S_items` weight bytes (row-major little-endian f64) plus its
+    /// shape, the model hyperparameters, and the id<->index mappings.
+    ///
+    /// The returned `s_items_bytes` is the RAW `S[0:M, :]` (NOT yet β-folded);
+    /// the Python layer folds β into the user-feature columns when it builds the
+    /// graph, keeping that transform testable in one place.
+    ///
+    /// Returns:
+    ///     dict: A dictionary with the following keys:
+    ///         - "kind" (str): Model architecture tag, e.g. ``"ease"``.
+    ///         - "s_items_bytes" (bytes): Row-major little-endian f64 bytes of
+    ///           the raw ``S[0:M, :]`` submatrix (shape ``M × (M + K_u)``).
+    ///         - "s_items_shape" (tuple[int, int]): ``(rows, cols)`` of the
+    ///           submatrix above.
+    ///         - "beta" (float): User-feature weight hyper-parameter.
+    ///         - "num_items" (int): Number of items ``M`` in the trained model.
+    ///         - "num_user_features" (int): Number of user-feature columns ``K_u``.
+    ///         - "num_item_features" (int): Number of item-feature rows ``K_t``.
+    ///         - "alpha" (float): Item-feature weight hyper-parameter.
+    ///         - "lambda_" (float): L2 regularisation strength.
+    ///         - "meta_weight" (float): Metadata-row weight in the Gram matrix.
+    ///         - "sparsity_threshold" (float | None): Pruning threshold used
+    ///           during training, or ``None`` when no weighting config was set.
+    ///         - "item_index_to_guid" (list[str]): Mapping from item index to
+    ///           item GUID string; index ``i`` → ``item_index_to_guid[i]``.
+    ///         - "feature_name_to_index" (dict[str, int]): Inverse mapping from
+    ///           user-feature name to its column index in ``S``.
+    #[pyo3(signature = ())]
+    fn export_payload<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        use crate::models::{ModelKind, RecModel};
+
+        let (s_bytes, rows, cols) = crate::onnx_export::s_items_row_major_le_bytes(&self.model);
+
+        // FeaseModel only ever wraps an Ease model today; sourcing the kind string
+        // from RecModel::kind() keeps this honest to the trait rather than
+        // hardcoding "ease". The non-Ease arms are defensive.
+        let kind = match crate::models::EaseAdapterRef::new(&self.model).kind() {
+            ModelKind::Ease => "ease",
+            ModelKind::SasRec => "sasrec",
+            ModelKind::TwoTower => "two_tower",
+        };
+
+        let d = PyDict::new(py);
+        d.set_item("kind", kind)?;
+        d.set_item("s_items_bytes", PyBytes::new(py, &s_bytes))?;
+        d.set_item("s_items_shape", (rows, cols))?;
+        d.set_item("beta", self.model.beta)?;
+        d.set_item("num_items", self.model.num_items)?;
+        d.set_item("num_user_features", self.model.num_user_features)?;
+        d.set_item("num_item_features", self.model.num_item_features)?;
+        d.set_item("alpha", self.model.alpha)?;
+        d.set_item("lambda_", self.model.lambda_)?;
+        d.set_item("meta_weight", self.model.meta_weight)?;
+        // None when weighting was not used during training (kept distinct from 0.0).
+        let sparsity: Option<f64> = self
+            .model
+            .weighting_config
+            .as_ref()
+            .map(|w| w.sparsity_threshold);
+        d.set_item("sparsity_threshold", sparsity)?;
+        d.set_item(
+            "item_index_to_guid",
+            self.model.mappings.idx_to_item.as_slice(),
+        )?;
+
+        let feat = PyDict::new(py);
+        for (name, idx) in self.model.mappings.user_feature_to_idx.iter() {
+            feat.set_item(name, *idx)?;
+        }
+        d.set_item("feature_name_to_index", feat)?;
+
+        Ok(d)
     }
 
     /// Saves the trained model to a binary file.

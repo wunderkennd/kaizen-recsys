@@ -89,3 +89,13 @@ if _HAS_ML_MODELS:
         "random_search_sasrec",
         "random_search_two_tower",
     ]
+
+try:  # pragma: no cover - import guard, exercised by build matrix
+    from kzn_recsys.onnx_export import export_onnx  # noqa: F401
+
+    _HAS_ONNX = True
+except ImportError:
+    _HAS_ONNX = False
+
+if _HAS_ONNX:
+    __all__ += ["export_onnx"]
