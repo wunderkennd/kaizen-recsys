@@ -29,7 +29,6 @@ mod tests {
     use crate::data_pipeline::Mappings;
     use ahash::AHashMap;
     use nalgebra::DMatrix;
-    use ndarray;
 
     fn dummy_mappings() -> Mappings {
         Mappings {
@@ -84,9 +83,9 @@ mod tests {
 
     #[test]
     fn ort_fixture_matches_expected_raw_scores() {
-        use std::fs;
-        use ort::value::TensorRef;
         use ort::session::Session;
+        use ort::value::TensorRef;
+        use std::fs;
 
         let onnx = std::path::Path::new("tests/fixtures/fixture.onnx");
         assert!(
@@ -125,10 +124,7 @@ mod tests {
         let m = inter.len();
         let k = feat.len();
 
-        let mut session = Session::builder()
-            .unwrap()
-            .commit_from_file(onnx)
-            .unwrap();
+        let mut session = Session::builder().unwrap().commit_from_file(onnx).unwrap();
 
         let interactions = ndarray::Array2::from_shape_vec((1, m), inter).unwrap();
         let features = ndarray::Array2::from_shape_vec((1, k), feat).unwrap();
@@ -152,10 +148,7 @@ mod tests {
         let raw_flat: Vec<f32> = raw.iter().copied().collect();
         assert_eq!(raw_flat.len(), exp.len(), "raw_scores length mismatch");
         for (a, b) in raw_flat.iter().zip(exp.iter()) {
-            assert!(
-                (a - b).abs() < 1e-4,
-                "ort raw_scores mismatch: {a} vs {b}"
-            );
+            assert!((a - b).abs() < 1e-4, "ort raw_scores mismatch: {a} vs {b}");
         }
     }
 }

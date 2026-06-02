@@ -404,7 +404,10 @@ impl FeaseModel {
             .as_ref()
             .map(|w| w.sparsity_threshold);
         d.set_item("sparsity_threshold", sparsity)?;
-        d.set_item("item_index_to_guid", self.model.mappings.idx_to_item.as_slice())?;
+        d.set_item(
+            "item_index_to_guid",
+            self.model.mappings.idx_to_item.as_slice(),
+        )?;
 
         let feat = PyDict::new(py);
         for (name, idx) in self.model.mappings.user_feature_to_idx.iter() {
