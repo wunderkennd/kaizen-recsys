@@ -2,11 +2,19 @@ import json
 import tempfile
 from pathlib import Path
 
-import numpy as np
-import onnxruntime as ort
-import pandas as pd
 import polars as pl
 import pytest
+
+# The ONNX export tests require the optional ``[onnx]`` extra. When it isn't
+# installed (e.g. the default CI Python job, which builds the EASE-only wheel
+# without onnx deps), skip the whole module cleanly — mirroring the
+# ``_HAS_ML_MODELS`` skip in test_sasrec.py. These are Python deps, so we must
+# guard the imports themselves (importorskip), not just the test items.
+np = pytest.importorskip("numpy")
+ort = pytest.importorskip("onnxruntime")
+pd = pytest.importorskip("pandas")
+pytest.importorskip("onnx")
+pytest.importorskip("mlflow")
 
 import kzn_recsys as fease
 from kzn_recsys.onnx_export import (
