@@ -4,6 +4,7 @@ from pathlib import Path
 
 import numpy as np
 import onnxruntime as ort
+import pandas as pd
 import polars as pl
 import pytest
 
@@ -378,3 +379,28 @@ def test_quantized_io_is_fp32(trained_model, tmp_path):
 
     sess = ort.InferenceSession(str(export_onnx(trained_model, tmp_path, dtype="fp16").onnx_path))
     assert sess.get_outputs()[[o.name for o in sess.get_outputs()].index("raw_scores")].type == "tensor(float)"
+
+
+# ---------------------------------------------------------------------------
+# Task 8: MLflow pyfunc wrapper
+# ---------------------------------------------------------------------------
+
+
+def test_mlflow_roundtrip_guid_in_guid_out(trained_model, tmp_path):
+    import mlflow.pyfunc
+
+    from kzn_recsys.onnx_export import export_onnx
+
+    res = export_onnx(trained_model, tmp_path, mlflow=True)
+    assert res.mlflow_path is not None
+
+    loaded = mlflow.pyfunc.load_model(str(res.mlflow_path))
+    # u0 interacted with G0; default policy must exclude already-watched G0.
+    df = pd.DataFrame(
+        [{"interactions": {"G0": 5.0}, "features": {}, "exclude": [], "top_k": 3}]
+    )
+    out = loaded.predict(df)
+    guids = list(out["item_guid"])
+    assert "G0" not in guids  # excluded by default repeat policy
+    assert len(guids) == 3
+    assert {"user_row", "rank", "item_guid", "score"} <= set(out.columns)
