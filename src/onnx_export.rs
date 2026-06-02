@@ -8,8 +8,6 @@
 
 use crate::model::RustFeaseModel;
 
-// allow(dead_code): the caller, FeaseModel::export_payload, lands in the next task (Task 2)
-#[allow(dead_code)]
 /// Returns `(bytes, rows, cols)` where `bytes` is the row-major little-endian
 /// `f64` encoding of `S[0..M, 0..M+K]`, `rows == num_items` (M) and
 /// `cols == num_items + num_user_features` (M + K).

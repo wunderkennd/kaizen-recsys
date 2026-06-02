@@ -11,7 +11,7 @@
 
 use model::RustFeaseModel; // The internal Rust struct
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyFloat, PyList, PyString};
+use pyo3::types::{PyBytes, PyDict, PyFloat, PyList, PyString};
 use std::collections::HashSet;
 use std::path::Path;
 use std::time::Instant;
@@ -336,6 +336,53 @@ impl FeaseModel {
         result.set_item("metrics", metrics_list)?;
 
         Ok(result)
+    }
+
+    /// Returns everything the Python ONNX exporter needs to author the graph:
+    /// the raw `S_items` weight bytes (row-major little-endian f64) plus its
+    /// shape, the model hyperparameters, and the id<->index mappings.
+    ///
+    /// The returned `s_items_bytes` is the RAW `S[0:M, :]` (NOT yet β-folded);
+    /// the Python layer folds β into the user-feature columns when it builds the
+    /// graph, keeping that transform testable in one place.
+    fn export_payload<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        use crate::models::{ModelKind, RecModel};
+
+        let (s_bytes, rows, cols) = crate::onnx_export::s_items_row_major_le_bytes(&self.model);
+
+        let kind = match crate::models::EaseAdapterRef::new(&self.model).kind() {
+            ModelKind::Ease => "ease",
+            ModelKind::SasRec => "sasrec",
+            ModelKind::TwoTower => "two_tower",
+        };
+
+        let d = PyDict::new(py);
+        d.set_item("kind", kind)?;
+        d.set_item("s_items_bytes", PyBytes::new(py, &s_bytes))?;
+        d.set_item("s_items_shape", (rows, cols))?;
+        d.set_item("beta", self.model.beta)?;
+        d.set_item("num_items", self.model.num_items)?;
+        d.set_item("num_user_features", self.model.num_user_features)?;
+        d.set_item("num_item_features", self.model.num_item_features)?;
+        d.set_item("alpha", self.model.alpha)?;
+        d.set_item("lambda_", self.model.lambda_)?;
+        d.set_item("meta_weight", self.model.meta_weight)?;
+        // None when weighting was not used during training (kept distinct from 0.0).
+        let sparsity: Option<f64> = self
+            .model
+            .weighting_config
+            .as_ref()
+            .map(|w| w.sparsity_threshold);
+        d.set_item("sparsity_threshold", sparsity)?;
+        d.set_item("item_index_to_guid", self.model.mappings.idx_to_item.clone())?;
+
+        let feat = PyDict::new(py);
+        for (name, idx) in self.model.mappings.user_feature_to_idx.iter() {
+            feat.set_item(name, *idx)?;
+        }
+        d.set_item("feature_name_to_index", feat)?;
+
+        Ok(d)
     }
 
     /// Saves the trained model to a binary file.
