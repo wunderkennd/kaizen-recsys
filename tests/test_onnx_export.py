@@ -2,6 +2,7 @@ import tempfile
 from pathlib import Path
 
 import numpy as np
+import onnxruntime as ort
 import polars as pl
 import pytest
 
@@ -84,3 +85,49 @@ def test_constants():
     assert EXCLUDE_SENTINEL == 1e9
     assert MASK_PENALTY == 1e9
     assert OPSET == 17
+
+
+def _build_inputs(payload, interactions_idx_val, feature_idx_val):
+    """Dense fp32 input vectors for one user."""
+    M, K = payload.num_items, payload.num_user_features
+    inter = np.zeros((1, M), np.float32)
+    for idx, val in interactions_idx_val:
+        inter[0, idx] = val
+    feat = np.zeros((1, K), np.float32)
+    for idx, val in feature_idx_val:
+        feat[0, idx] = val
+    return inter, feat
+
+
+def _ref_scores(payload, inter, feat):
+    """Reference raw affinity: β-folded S_items @ [interactions | features]."""
+    M = payload.num_items
+    W = payload.s_items.copy()
+    if payload.num_user_features > 0:
+        W[:, M:] *= payload.beta
+    z = np.concatenate([inter[0], feat[0]]).astype(np.float64)
+    return (W @ z).astype(np.float32)
+
+
+def test_graph_raw_scores_parity(trained_model, tmp_path):
+    from kzn_recsys.onnx_export import _payload_from_model, export_onnx
+
+    payload = _payload_from_model(trained_model)
+    res = export_onnx(trained_model, tmp_path)
+    sess = ort.InferenceSession(str(res.onnx_path))
+
+    inter, feat = _build_inputs(payload, [(0, 5.0)], [(1, 1.0)])
+    out = sess.run(
+        None,
+        {
+            "interactions": inter,
+            "features": feat,
+            "mask": np.ones((1, payload.num_items), np.float32),
+            "seen": np.zeros((1, payload.num_items), np.float32),
+            "repeat_penalty": np.array([[0.0]], np.float32),  # neutral → raw == adjusted
+            "k": np.array([payload.num_items], np.int64),
+        },
+    )
+    names = [o.name for o in sess.get_outputs()]
+    raw = out[names.index("raw_scores")][0]
+    np.testing.assert_allclose(raw, _ref_scores(payload, inter, feat), rtol=1e-5, atol=1e-5)
