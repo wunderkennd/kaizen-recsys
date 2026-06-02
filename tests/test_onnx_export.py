@@ -148,28 +148,21 @@ def _run(sess, payload, inter, feat, *, mask=None, seen=None, rp=0.0, k=None):
     return {n: out[i] for i, n in enumerate(names)}
 
 
-def test_default_excludes_seen(trained_model, tmp_path):
+def _rank_of(idx_row, item):
+    """Position of `item` in a sorted top_indices row (0 = top)."""
+    return idx_row.tolist().index(item)
+
+
+def test_default_excludes_seen_sinks_to_bottom(trained_model, tmp_path):
     from kzn_recsys.onnx_export import _payload_from_model, export_onnx
 
     payload = _payload_from_model(trained_model)
     sess = ort.InferenceSession(str(export_onnx(trained_model, tmp_path).onnx_path))
     inter, feat = _build_inputs(payload, [(0, 5.0)], [])
-    # Default repeat_penalty (exclude sentinel) baked in → omit it to get default.
-    out = sess.run(
-        None,
-        {
-            "interactions": inter,
-            "features": feat,
-            "mask": np.ones((1, payload.num_items), np.float32),
-            "seen": np.zeros((1, payload.num_items), np.float32),
-            "repeat_penalty": np.array([[1e9]], np.float32),
-            "k": np.array([payload.num_items], np.int64),
-        },
-    )
-    names = [o.name for o in sess.get_outputs()]
-    top_idx = out[names.index("top_indices")][0]
-    # Item 0 was interacted → must not be the top recommendation.
-    assert top_idx[0] != 0
+    # Default exclude policy (sentinel) drives the seen item to the LAST rank.
+    out = _run(sess, payload, inter, feat, rp=1e9)
+    assert out["top_indices"][0][-1] == 0
+    assert out["top_indices"][0][0] != 0
 
 
 def test_repeat_boost_surfaces_seen_item(trained_model, tmp_path):
@@ -180,29 +173,27 @@ def test_repeat_boost_surfaces_seen_item(trained_model, tmp_path):
     inter, feat = _build_inputs(payload, [(0, 5.0)], [])
     neutral = _run(sess, payload, inter, feat, rp=0.0)["top_scores"][0]
     boosted = _run(sess, payload, inter, feat, rp=-1e6)["top_scores"][0]
-    # Boost lifts the seen item's score versus neutral.
     assert boosted.max() > neutral.max()
 
 
-def test_seen_input_overrides_zero_value(trained_model, tmp_path):
+def test_seen_input_extends_derived_penalty(trained_model, tmp_path):
     from kzn_recsys.onnx_export import _payload_from_model, export_onnx
 
     payload = _payload_from_model(trained_model)
     M = payload.num_items
     sess = ort.InferenceSession(str(export_onnx(trained_model, tmp_path).onnx_path))
-    # Item 0 present as a key with value 0.0 → derived path treats it unseen…
-    inter = np.zeros((1, M), np.float32)
-    feat = np.zeros((1, payload.num_user_features), np.float32)
+    # Real nonzero interaction on item 1 (so scores are non-degenerate and item 1
+    # is "seen" via the derived nonzero path). Item 0 is NOT nonzero-seen.
+    inter, feat = _build_inputs(payload, [(1, 5.0)], [])
     derived = _run(sess, payload, inter, feat, rp=1e9)["top_indices"][0]
-    assert 0 in derived.tolist()  # not excluded by derivation alone
-    # …but an explicit seen marks it → excluded.
+    # Explicitly mark item 0 as seen too → it must drop in rank vs the derived run.
     seen = np.zeros((1, M), np.float32)
     seen[0, 0] = 1.0
     explicit = _run(sess, payload, inter, feat, seen=seen, rp=1e9)["top_indices"][0]
-    assert 0 not in explicit.tolist()
+    assert _rank_of(explicit, 0) > _rank_of(derived, 0)
 
 
-def test_mask_overrides_boost(trained_model, tmp_path):
+def test_mask_sinks_item_despite_boost(trained_model, tmp_path):
     from kzn_recsys.onnx_export import _payload_from_model, export_onnx
 
     payload = _payload_from_model(trained_model)
@@ -211,8 +202,9 @@ def test_mask_overrides_boost(trained_model, tmp_path):
     inter, feat = _build_inputs(payload, [(0, 5.0)], [])
     mask = np.ones((1, M), np.float32)
     mask[0, 0] = 0.0  # exclude item 0 for compliance
+    # Even a strong repeat boost cannot lift a masked item: it ranks LAST.
     idx = _run(sess, payload, inter, feat, mask=mask, rp=-1e6)["top_indices"][0]
-    assert 0 not in idx.tolist()  # mask wins even with a strong boost
+    assert idx[-1] == 0
 
 
 def test_top_k_clamped(trained_model, tmp_path):
@@ -223,4 +215,31 @@ def test_top_k_clamped(trained_model, tmp_path):
     sess = ort.InferenceSession(str(export_onnx(trained_model, tmp_path).onnx_path))
     inter, feat = _build_inputs(payload, [], [(0, 1.0)])
     out = _run(sess, payload, inter, feat, k=M + 50)
-    assert out["top_indices"].shape[1] == M  # clamped to catalog size
+    assert out["top_indices"].shape[1] == M  # Min(k, M) clamp
+
+
+def test_batch_inference(trained_model, tmp_path):
+    from kzn_recsys.onnx_export import _payload_from_model, export_onnx
+
+    payload = _payload_from_model(trained_model)
+    M, K = payload.num_items, payload.num_user_features
+    sess = ort.InferenceSession(str(export_onnx(trained_model, tmp_path).onnx_path))
+    # Two users with DIFFERENT exclusions in one batch.
+    interactions = np.zeros((2, M), np.float32)
+    interactions[0, 0] = 5.0  # user 0 saw item 0
+    feats = np.zeros((2, K), np.float32)
+    out = sess.run(
+        None,
+        {
+            "interactions": interactions,
+            "features": feats,
+            "mask": np.ones((2, M), np.float32),
+            "seen": np.zeros((2, M), np.float32),
+            "repeat_penalty": np.array([[1e9], [1e9]], np.float32),
+            "k": np.array([M], np.int64),
+        },
+    )
+    names = [o.name for o in sess.get_outputs()]
+    top = out[names.index("top_indices")]
+    assert top.shape == (2, M)
+    assert top[0][-1] == 0  # user 0's seen item sinks to bottom
