@@ -22,7 +22,7 @@ pub mod evaluation;
 pub mod metrics;
 mod model;
 mod models;
-mod onnx_export;
+pub(crate) mod onnx_export;
 mod serialization;
 mod serving;
 pub mod tuning;
