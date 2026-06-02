@@ -6,6 +6,15 @@ from pathlib import Path
 
 import numpy as np
 
+try:
+    import onnx as _onnx  # noqa: F401
+    import onnxruntime as _onnxruntime  # noqa: F401
+except ImportError as _exc:  # pragma: no cover - exercised by the build matrix
+    raise ImportError(
+        "kzn_recsys ONNX export requires optional dependencies. "
+        "Install them with:  pip install 'kzn_recsys[onnx]'"
+    ) from _exc
+
 # Two distinct concepts that currently share the magnitude 1e9 (spec §13 glossary),
 # kept as separate names because their roles differ and may diverge:
 #   MASK_PENALTY     — graph constant: (mask - 1) * MASK_PENALTY drops eligibility-masked items
@@ -62,6 +71,9 @@ def _payload_from_model(model) -> ExportPayload:
 
 def _validate_exportable(payload: ExportPayload) -> None:
     """Mirror RustFeaseModel::validate() — refuse to export a bad model."""
+    # Dimension check (Rust validate() check 1) is unnecessary here: s_items shape
+    # comes directly from the trained model's export_payload (np.frombuffer(...).reshape(rows, cols)),
+    # so dimensions are internally consistent by construction.
     if payload.num_items == 0:
         raise ValueError("Cannot export a model with zero items")
     if np.isnan(payload.s_items).any():

@@ -29,3 +29,7 @@ venv/
 
 # Auto-memory hook runtime state (logs, PID files) — machine-local only.
 .remember/
+
+# MLflow local test artifacts
+mlflow.db
+mlruns/
