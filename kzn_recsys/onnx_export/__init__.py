@@ -4,9 +4,8 @@ from __future__ import annotations
 import dataclasses
 from pathlib import Path
 
-import numpy as np
-
 try:
+    import numpy as np
     import onnx as _onnx  # noqa: F401
     import onnxruntime as _onnxruntime  # noqa: F401
 except ImportError as _exc:  # pragma: no cover - exercised by the build matrix

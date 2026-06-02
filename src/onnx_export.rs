@@ -89,11 +89,10 @@ mod tests {
         use ort::session::Session;
 
         let onnx = std::path::Path::new("tests/fixtures/fixture.onnx");
-        // CI must ensure tests/fixtures/ is committed; this graceful-skip is for partial local checkouts.
-        if !onnx.exists() {
-            eprintln!("skipping: tests/fixtures/fixture.onnx missing");
-            return;
-        }
+        assert!(
+            onnx.exists(),
+            "tests/fixtures/fixture.onnx missing — regenerate via kzn_recsys.onnx_export._write_rust_fixture"
+        );
 
         let inputs: serde_json::Value =
             serde_json::from_str(&fs::read_to_string("tests/fixtures/inputs.json")

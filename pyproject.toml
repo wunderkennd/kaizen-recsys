@@ -21,7 +21,6 @@ onnx = [
     "numpy>=1.24",
     "onnx>=1.16",
     "onnxruntime>=1.18",
-    "onnxconverter-common>=1.14",
     "mlflow>=2.12",
     "sympy>=1.12",  # required by onnxruntime.quantization (int8 path)
 ]
