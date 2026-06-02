@@ -56,3 +56,33 @@ def test_export_payload_shapes_and_fields(trained_model):
     assert isinstance(d["item_index_to_guid"], list) and len(d["item_index_to_guid"]) == m
     assert d["sparsity_threshold"] is None  # no weighting config used
     assert set(d["feature_name_to_index"].values()) == set(range(d["num_user_features"]))
+
+
+from kzn_recsys.onnx_export import (
+    ExportPayload,
+    EXCLUDE_SENTINEL,
+    MASK_PENALTY,
+    OPSET,
+    _payload_from_model,
+    _validate_exportable,
+)
+
+
+def test_payload_from_model_builds_dataclass(trained_model):
+    p = _payload_from_model(trained_model)
+    assert isinstance(p, ExportPayload)
+    assert p.kind == "ease"
+    assert p.s_items.shape == (p.num_items, p.num_items + p.num_user_features)
+
+
+def test_validate_exportable_rejects_nan(trained_model):
+    p = _payload_from_model(trained_model)
+    p.s_items[0, 0] = float("nan")
+    with pytest.raises(ValueError, match="NaN"):
+        _validate_exportable(p)
+
+
+def test_constants():
+    assert EXCLUDE_SENTINEL == 1e9
+    assert MASK_PENALTY == 1e9
+    assert OPSET == 17

@@ -50,3 +50,13 @@ __all__ = [
     "EngagementSchema",
     "MetadataSchema",
 ]
+
+try:  # pragma: no cover - import guard, exercised by build matrix
+    from kzn_recsys.onnx_export import export_onnx  # noqa: F401
+
+    _HAS_ONNX = True
+except ImportError:
+    _HAS_ONNX = False
+
+if _HAS_ONNX:
+    __all__ += ["export_onnx"]
