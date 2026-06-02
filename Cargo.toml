@@ -86,5 +86,5 @@ fast-blas = ["dep:nalgebra-lapack"]
 # (src/onnx_export.rs #[cfg(test)]). Not in the default or wheel dependency
 # graph. `download-binaries` lets ort fetch a prebuilt ONNX Runtime so CI needs
 # no system install.
-ort = { version = "=2.0.0-rc.12", default-features = false, features = ["download-binaries", "tls-native", "ndarray"] }
+ort = { version = "=2.0.0-rc.12", default-features = false, features = ["download-binaries", "tls-native", "ndarray", "std"] }
 ndarray = "0.17"

@@ -130,3 +130,55 @@ def export_onnx(
         mlflow_path = build_mlflow(onnx_path, vocab_path, output_dir / "mlflow_model")
 
     return ExportResult(onnx_path=onnx_path, vocab_path=vocab_path, mlflow_path=mlflow_path)
+
+
+def _write_rust_fixture(model, fixtures_dir) -> None:
+    """Emit fixture.onnx + inputs.json + expected.json for the Rust ort test.
+
+    Run once to (re)generate committed fixtures; not part of normal export.
+    Exports into a temporary directory and copies only fixture.onnx so that
+    tests/fixtures/ contains exactly the three committed files.
+    """
+    import json as _json
+    import shutil as _shutil
+    import tempfile as _tempfile
+
+    import numpy as _np
+
+    fixtures_dir = Path(fixtures_dir)
+    fixtures_dir.mkdir(parents=True, exist_ok=True)
+
+    # Export into a temp dir so model.onnx / vocab.json don't land in fixtures_dir.
+    with _tempfile.TemporaryDirectory() as _tmp:
+        _tmp_path = Path(_tmp)
+        res = export_onnx(model, _tmp_path)
+        _shutil.copy2(res.onnx_path, fixtures_dir / "fixture.onnx")
+
+        payload = _payload_from_model(model)
+        M, K = payload.num_items, payload.num_user_features
+        inter = _np.zeros(M, _np.float32)
+        if M > 0:
+            inter[0] = 3.0
+        feat = _np.zeros(K, _np.float32)
+        if K > 0:
+            feat[0] = 1.0
+        inputs = {"interactions": inter.tolist(), "features": feat.tolist()}
+        (fixtures_dir / "inputs.json").write_text(_json.dumps(inputs))
+
+        import onnxruntime as _ort
+
+        sess = _ort.InferenceSession(str(fixtures_dir / "fixture.onnx"))
+        out = sess.run(
+            None,
+            {
+                "interactions": inter.reshape(1, M),
+                "features": feat.reshape(1, K),
+                "mask": _np.ones((1, M), _np.float32),
+                "seen": _np.zeros((1, M), _np.float32),
+                "repeat_penalty": _np.array([[0.0]], _np.float32),
+                "k": _np.array([M], _np.int64),
+            },
+        )
+        names = [o.name for o in sess.get_outputs()]
+        raw = out[names.index("raw_scores")][0]
+        (fixtures_dir / "expected.json").write_text(_json.dumps({"raw_scores": raw.tolist()}))

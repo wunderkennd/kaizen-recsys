@@ -29,6 +29,8 @@ mod tests {
     use crate::data_pipeline::Mappings;
     use ahash::AHashMap;
     use nalgebra::DMatrix;
+    #[cfg(test)]
+    use ndarray;
 
     fn dummy_mappings() -> Mappings {
         Mappings {
@@ -79,5 +81,80 @@ mod tests {
             .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
             .collect();
         assert_eq!(decoded, vec![0.0, 1.0, 2.0, 10.0, 11.0, 12.0]);
+    }
+
+    #[test]
+    fn ort_fixture_matches_expected_raw_scores() {
+        use std::fs;
+        use ort::value::TensorRef;
+        use ort::session::Session;
+
+        let onnx = std::path::Path::new("tests/fixtures/fixture.onnx");
+        if !onnx.exists() {
+            eprintln!("skipping: tests/fixtures/fixture.onnx missing");
+            return;
+        }
+
+        let inputs: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string("tests/fixtures/inputs.json").unwrap())
+                .unwrap();
+        let expected: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string("tests/fixtures/expected.json").unwrap())
+                .unwrap();
+
+        let inter: Vec<f32> = inputs["interactions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_f64().unwrap() as f32)
+            .collect();
+        let feat: Vec<f32> = inputs["features"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_f64().unwrap() as f32)
+            .collect();
+        let exp: Vec<f32> = expected["raw_scores"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_f64().unwrap() as f32)
+            .collect();
+
+        let m = inter.len();
+        let k = feat.len();
+
+        let mut session = Session::builder()
+            .unwrap()
+            .commit_from_file(onnx)
+            .unwrap();
+
+        let interactions = ndarray::Array2::from_shape_vec((1, m), inter).unwrap();
+        let features = ndarray::Array2::from_shape_vec((1, k), feat).unwrap();
+        let mask = ndarray::Array2::<f32>::ones((1, m));
+        let seen = ndarray::Array2::<f32>::zeros((1, m));
+        let repeat_penalty = ndarray::Array2::<f32>::zeros((1, 1));
+        let k_arr = ndarray::Array1::<i64>::from_vec(vec![m as i64]);
+
+        let outputs = session
+            .run(ort::inputs! {
+                "interactions" => TensorRef::from_array_view(interactions.view()).unwrap(),
+                "features" => TensorRef::from_array_view(features.view()).unwrap(),
+                "mask" => TensorRef::from_array_view(mask.view()).unwrap(),
+                "seen" => TensorRef::from_array_view(seen.view()).unwrap(),
+                "repeat_penalty" => TensorRef::from_array_view(repeat_penalty.view()).unwrap(),
+                "k" => TensorRef::from_array_view(k_arr.view()).unwrap(),
+            })
+            .unwrap();
+
+        let raw = outputs["raw_scores"].try_extract_array::<f32>().unwrap();
+        let raw_flat: Vec<f32> = raw.iter().copied().collect();
+        assert_eq!(raw_flat.len(), exp.len(), "raw_scores length mismatch");
+        for (a, b) in raw_flat.iter().zip(exp.iter()) {
+            assert!(
+                (a - b).abs() < 1e-4,
+                "ort raw_scores mismatch: {a} vs {b}"
+            );
+        }
     }
 }
