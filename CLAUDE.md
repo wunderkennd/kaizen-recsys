@@ -241,13 +241,11 @@ GitHub API and is conflict-free.
 
 ## PR Review Policy
 
-All PRs require a review from Devin (`devin-ai-integration[bot]`) before merging. When creating PRs, always request review:
+Devin (`devin-ai-integration[bot]`) auto-reviews every PR via the `.github/workflows/request_devin_review.yml` workflow (triggered on `opened` and `ready_for_review`) and via the Devin GitHub App's webhook. **No manual action is required to request the review.**
 
-```bash
-gh pr edit <number> --add-reviewer devin-ai-integration[bot]
-```
+Do not attempt to add Devin as a reviewer via `gh pr edit --add-reviewer 'devin-ai-integration[bot]'` from a local checkout: the GitHub REST API does not let user PATs request reviews from GitHub Apps, and the call fails with `Could not resolve user`. The CI workflow itself appends `|| true` to acknowledge that the same call can fail under GitHub's own token; the actual review request reaches Devin through its app webhook, not through the reviewer-request endpoint.
 
-Do not merge PRs without an approved review from Devin. This is enforced via branch protection on `main`.
+This repository is currently solo-developed and `main` is not branch-protected. Devin's review is therefore a strong signal to consult, not a hard merge gate — wait for it on anything non-trivial, but you can self-merge when the change is small, the review is positive, or the situation warrants it. When a collaborator is added, restore branch protection (Settings → Branches, or `gh api -X PUT /repos/wunderkennd/kaizen-recsys/branches/main/protection`) and treat Devin's approval as required again.
 
 ## Python Module Name
 
