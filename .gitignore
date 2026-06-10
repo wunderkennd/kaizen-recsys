@@ -33,3 +33,9 @@ venv/
 # MLflow local test artifacts
 mlflow.db
 mlruns/
+
+# Graphify knowledge-graph output (generated tooling artifact, machine-local)
+graphify-out/
+
+# Research source binaries — content is committed as the .md alongside each
+research/*.pdf
