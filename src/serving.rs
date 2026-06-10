@@ -349,12 +349,20 @@ pub fn predict_batch(model: &dyn RecModel, users: &[UserInput]) -> Result<Vec<Ve
         .collect()
 }
 
-/// Filters scores by removing interacted items, sorts descending, and
-/// truncates to top-K.
+/// Filters scores by removing interacted items, selects the top-K by
+/// descending score, and returns them sorted.
 ///
 /// Generic over the score scalar (`f32` from the `RecModel` path, `f64`
 /// from the concrete EASE path) so both registry/batch prediction and the
 /// existing concrete EASE serving call site share one implementation.
+///
+/// Uses a quickselect partition (`select_nth_unstable_by`, O(n) average)
+/// to isolate the top-K candidates, then sorts only that K-element slice
+/// (O(K log K)) — cheaper than the old full O(n log n) sort when
+/// `top_k << num_items`, which is the common serving case. Ties are broken
+/// by ascending item index, making the order a *total* order: the result is
+/// byte-identical to the previous stable `sort_by`, and deterministic
+/// despite `select_nth_unstable`/`sort_unstable` not preserving input order.
 pub fn filter_sort_top_k<T: PartialOrd + Copy>(
     scores: Vec<T>,
     interacted: &[usize],
@@ -368,8 +376,25 @@ pub fn filter_sort_top_k<T: PartialOrd + Copy>(
         .filter(|(idx, _)| !interacted_set.contains(idx))
         .collect();
 
-    ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    ranked.truncate(top_k);
+    // Descending by score; NaN/unorderable treated as equal (matching the
+    // prior behavior), then ascending by index as a deterministic tie-break.
+    let cmp = |a: &(usize, T), b: &(usize, T)| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    };
+
+    if top_k == 0 {
+        return Vec::new();
+    }
+
+    if top_k < ranked.len() {
+        // Partition so the first `top_k` elements are the top-K (unordered
+        // among themselves), then sort just that slice.
+        ranked.select_nth_unstable_by(top_k - 1, cmp);
+        ranked.truncate(top_k);
+    }
+    ranked.sort_unstable_by(cmp);
     ranked
 }
 
@@ -705,5 +730,42 @@ mod tests {
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].0, 2); // 0.9
         assert_eq!(result[1].0, 0); // 0.3
+    }
+
+    /// Tied scores must break by ascending item index, matching the prior
+    /// stable sort. This is what keeps the quickselect-based top-K
+    /// byte-identical despite the underlying algorithm being unstable.
+    #[test]
+    fn test_filter_sort_top_k_breaks_ties_by_index() {
+        // Items 1, 3, 4 all tie at 0.5; item 2 is the clear top.
+        let scores: Vec<f64> = vec![0.1, 0.5, 0.9, 0.5, 0.5];
+        let result = filter_sort_top_k(scores, &[], 3);
+
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0].0, 2); // 0.9 first
+        // Among the 0.5 ties, lowest index wins the remaining slot.
+        assert_eq!(result[1].0, 1);
+        assert_eq!(result[2].0, 3);
+    }
+
+    /// `top_k >= len` must skip the partition and just sort everything,
+    /// returning every (non-interacted) item.
+    #[test]
+    fn test_filter_sort_top_k_k_exceeds_len() {
+        let scores: Vec<f64> = vec![0.3, 0.9, 0.1];
+        let result = filter_sort_top_k(scores, &[], 10);
+
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0].0, 1); // 0.9
+        assert_eq!(result[1].0, 0); // 0.3
+        assert_eq!(result[2].0, 2); // 0.1
+    }
+
+    /// `top_k == 0` returns nothing without touching the data.
+    #[test]
+    fn test_filter_sort_top_k_zero_k() {
+        let scores: Vec<f64> = vec![0.3, 0.9, 0.1];
+        let result = filter_sort_top_k(scores, &[], 0);
+        assert!(result.is_empty());
     }
 }
