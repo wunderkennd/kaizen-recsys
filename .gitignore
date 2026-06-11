@@ -33,3 +33,10 @@ venv/
 # MLflow local test artifacts
 mlflow.db
 mlruns/
+
+# Graphify knowledge-graph output (generated tooling artifact, machine-local)
+graphify-out/
+
+# Research source binaries — the text content is committed as a .md alongside
+# each PDF (e.g. research/silver_torch_research.md), so the binary is redundant.
+research/*.pdf
