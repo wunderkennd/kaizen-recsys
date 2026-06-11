@@ -146,9 +146,17 @@ impl ModelRegistry {
         user_features: &[(usize, f64)],
         top_k: usize,
     ) -> Result<Vec<(usize, f32)>> {
-        let scores = self.predict(territory, user_interactions, user_features)?;
+        let model = self.route(territory)?;
         let interacted: Vec<usize> = user_interactions.iter().map(|(idx, _)| *idx).collect();
-        Ok(filter_sort_top_k(scores, &interacted, top_k))
+        retrieve_or_dense(
+            model,
+            ModelInput::Sparse {
+                interactions: user_interactions,
+                user_features,
+            },
+            &interacted,
+            top_k,
+        )
     }
 
     /// Predicts similar items in a specific territory.
@@ -191,12 +199,16 @@ impl ModelRegistry {
             .iter()
             .filter_map(|(name, &v)| mappings.user_feature_to_idx.get(name).map(|&i| (i, v)))
             .collect();
-        let scores = model.predict_scores(ModelInput::Sparse {
-            interactions: &interactions_idx,
-            user_features: &features_idx,
-        })?;
         let interacted: Vec<usize> = interactions_idx.iter().map(|(idx, _)| *idx).collect();
-        let ranked = filter_sort_top_k(scores, &interacted, top_k);
+        let ranked = retrieve_or_dense(
+            model,
+            ModelInput::Sparse {
+                interactions: &interactions_idx,
+                user_features: &features_idx,
+            },
+            &interacted,
+            top_k,
+        )?;
         Ok(idx_scores_to_str(&ranked, mappings))
     }
 
@@ -225,12 +237,16 @@ impl ModelRegistry {
             .iter()
             .filter_map(|id| mappings.item_to_idx.get(id).copied())
             .collect();
-        let scores = model.predict_scores(ModelInput::Sequence {
-            history: &history_idx,
-        })?;
         // SASRec ranking excludes items already in the user's history,
         // matching SASRecModel.predict's behaviour.
-        let ranked = filter_sort_top_k(scores, &history_idx, top_k);
+        let ranked = retrieve_or_dense(
+            model,
+            ModelInput::Sequence {
+                history: &history_idx,
+            },
+            &history_idx,
+            top_k,
+        )?;
         Ok(idx_scores_to_str(&ranked, mappings))
     }
 
@@ -260,14 +276,18 @@ impl ModelRegistry {
         let mappings = model.item_mapping();
         let user_idx = mappings.user_to_idx.get(user_id).copied();
         let (cat_features, dense_features) = model.resolve_user_features(features);
-        let scores = model.predict_scores(ModelInput::TowerUser {
-            user_idx,
-            cat_features: &cat_features,
-            dense_features: &dense_features,
-        })?;
         // Two-Tower has no per-request history to exclude — matches
         // `TwoTowerModel.predict`'s behaviour.
-        let ranked = filter_sort_top_k(scores, &[], top_k);
+        let ranked = retrieve_or_dense(
+            model,
+            ModelInput::TowerUser {
+                user_idx,
+                cat_features: &cat_features,
+                dense_features: &dense_features,
+            },
+            &[],
+            top_k,
+        )?;
         Ok(idx_scores_to_str(&ranked, mappings))
     }
 
@@ -398,6 +418,28 @@ pub fn filter_sort_top_k<T: PartialOrd + Copy>(
     ranked
 }
 
+/// Routes top-K retrieval through the model's [`RetrievalIndex`] when it
+/// exposes one (ADR-0004 Phase 1), otherwise falls back to exact dense
+/// scoring + [`filter_sort_top_k`].
+///
+/// The fallback branch is byte-identical to scoring directly, so models
+/// without an index — today, all of them — are unchanged. `exclude` is the
+/// set of item indices to drop (e.g. already-interacted items).
+fn retrieve_or_dense(
+    model: &dyn RecModel,
+    input: ModelInput<'_>,
+    exclude: &[usize],
+    top_k: usize,
+) -> Result<Vec<(usize, f32)>> {
+    match model.retrieval_index() {
+        Some(index) => index.retrieve(input, top_k, exclude),
+        None => {
+            let scores = model.predict_scores(input)?;
+            Ok(filter_sort_top_k(scores, exclude, top_k))
+        }
+    }
+}
+
 /// Batch prediction that also returns top-K results per user, over any
 /// [`RecModel`].
 ///
@@ -431,6 +473,7 @@ pub fn predict_batch_top_k(
 mod tests {
     use super::*;
     use crate::data_pipeline::Mappings;
+    use crate::models::RetrievalIndex;
     use nalgebra::DMatrix;
 
     fn dummy_mappings() -> Mappings {
@@ -767,5 +810,132 @@ mod tests {
         let scores: Vec<f64> = vec![0.3, 0.9, 0.1];
         let result = filter_sort_top_k(scores, &[], 0);
         assert!(result.is_empty());
+    }
+
+    // --- ADR-0004 Phase 1: optional retrieval-index seam ---
+
+    /// A test double that returns a fixed result regardless of input,
+    /// letting us prove serving routed through the index path.
+    struct StubIndex {
+        out: Vec<(usize, f32)>,
+    }
+
+    impl RetrievalIndex for StubIndex {
+        fn retrieve(
+            &self,
+            _input: ModelInput<'_>,
+            _top_k: usize,
+            _exclude: &[usize],
+        ) -> Result<Vec<(usize, f32)>> {
+            Ok(self.out.clone())
+        }
+    }
+
+    /// A minimal `RecModel` whose dense scores and optional retrieval
+    /// index are both injectable, so a test can assert which path serving
+    /// takes.
+    struct StubModel {
+        scores: Vec<f32>,
+        mappings: Mappings,
+        index: Option<StubIndex>,
+    }
+
+    impl RecModel for StubModel {
+        fn kind(&self) -> ModelKind {
+            ModelKind::Ease
+        }
+        fn num_items(&self) -> usize {
+            self.scores.len()
+        }
+        fn item_mapping(&self) -> &Mappings {
+            &self.mappings
+        }
+        fn predict_scores(&self, _input: ModelInput<'_>) -> Result<Vec<f32>> {
+            Ok(self.scores.clone())
+        }
+        fn predict_similar_items(
+            &self,
+            _item_idx: usize,
+            _top_k: usize,
+        ) -> Result<Vec<(usize, f32)>> {
+            Ok(Vec::new())
+        }
+        fn validate(&self) -> crate::model::ValidationReport {
+            crate::model::ValidationReport {
+                passed: true,
+                messages: Vec::new(),
+            }
+        }
+        fn save(&self, _path: &std::path::Path) -> Result<()> {
+            Ok(())
+        }
+        fn retrieval_index(&self) -> Option<&dyn RetrievalIndex> {
+            self.index.as_ref().map(|ix| ix as &dyn RetrievalIndex)
+        }
+    }
+
+    /// When a model exposes a `RetrievalIndex`, serving must use it — the
+    /// sentinel `(99, 7.0)` cannot come from the 4 dense scores, so its
+    /// presence proves the index path was taken.
+    #[test]
+    fn predict_top_k_routes_through_retrieval_index_when_present() {
+        let mut registry = ModelRegistry::new();
+        registry.register_model(
+            "T".to_string(),
+            Box::new(StubModel {
+                scores: vec![0.1, 0.2, 0.3, 0.4],
+                mappings: dummy_mappings(),
+                index: Some(StubIndex {
+                    out: vec![(99, 7.0)],
+                }),
+            }),
+        );
+
+        let result = registry
+            .predict_top_k("T", &[], &[], 4)
+            .expect("predict_top_k should succeed");
+
+        assert_eq!(
+            result,
+            vec![(99, 7.0)],
+            "expected the index's output, not the dense top-K"
+        );
+    }
+
+    /// With no `RetrievalIndex`, serving falls back to dense scoring +
+    /// `filter_sort_top_k` — the path every model takes today.
+    #[test]
+    fn predict_top_k_falls_back_to_dense_when_no_index() {
+        let mut registry = ModelRegistry::new();
+        registry.register_model(
+            "T".to_string(),
+            Box::new(StubModel {
+                scores: vec![0.1, 0.9, 0.3, 0.5],
+                mappings: dummy_mappings(),
+                index: None,
+            }),
+        );
+
+        let result = registry.predict_top_k("T", &[], &[], 2).unwrap();
+        assert_eq!(result, vec![(1, 0.9), (3, 0.5)]);
+    }
+
+    /// The dense fallback still excludes already-interacted items — guards
+    /// the `predict_top_k` rewire that now routes through `retrieve_or_dense`.
+    #[test]
+    fn predict_top_k_dense_fallback_excludes_interacted() {
+        let mut registry = ModelRegistry::new();
+        registry.register_model(
+            "T".to_string(),
+            Box::new(StubModel {
+                scores: vec![0.1, 0.9, 0.3, 0.5],
+                mappings: dummy_mappings(),
+                index: None,
+            }),
+        );
+
+        // Exclude item 1 (the top score) → top-2 of the rest: (3, 0.5), (2, 0.3).
+        let result = registry.predict_top_k("T", &[(1, 1.0)], &[], 2).unwrap();
+        assert_eq!(result, vec![(3, 0.5), (2, 0.3)]);
     }
 }

@@ -107,6 +107,37 @@ pub trait RecModel: Send + Sync {
     ) -> (Vec<usize>, Vec<f32>) {
         (Vec::new(), Vec::new())
     }
+
+    /// Returns `Some` if this model can retrieve top-K items without
+    /// scoring the full catalog — i.e. it exposes an approximate-nearest-
+    /// neighbor index (ADR-0004 Phase 1). Default `None` → serving falls
+    /// back to dense `predict_scores` + `filter_sort_top_k`.
+    ///
+    /// Embedding models (Two-Tower; SASRec item-similarity) will return
+    /// `Some` once a benched ANN backend lands in Phase 2. EASE has no
+    /// embedding space and always returns `None`.
+    fn retrieval_index(&self) -> Option<&dyn RetrievalIndex> {
+        None
+    }
+}
+
+/// Optional capability: top-K retrieval without scoring the full catalog
+/// (ADR-0004). A query embedding (e.g. a Two-Tower user vector) is matched
+/// against an approximate-nearest-neighbor index in sublinear time.
+///
+/// Object-safe and `Send + Sync` so serving can hold `&dyn RetrievalIndex`.
+/// The model computes its own query embedding from `input` internally, then
+/// queries the index — keeping serving model-agnostic, the same property the
+/// [`ModelInput`] enum preserves for `predict_scores`.
+pub trait RetrievalIndex: Send + Sync {
+    /// Top-K `(item_idx, score)` for `input`, excluding the item indices in
+    /// `exclude` (e.g. items the user has already interacted with).
+    fn retrieve(
+        &self,
+        input: ModelInput<'_>,
+        top_k: usize,
+        exclude: &[usize],
+    ) -> Result<Vec<(usize, f32)>>;
 }
 
 #[cfg(test)]
