@@ -419,7 +419,7 @@ pub fn filter_sort_top_k<T: PartialOrd + Copy>(
 }
 
 /// Routes top-K retrieval through the model's [`RetrievalIndex`] when it
-/// exposes one (ADR-0004 Phase 1), otherwise falls back to exact dense
+/// exposes one (ADR-0004), otherwise falls back to exact dense
 /// scoring + [`filter_sort_top_k`].
 ///
 /// The fallback branch is byte-identical to scoring directly, so models
@@ -812,7 +812,7 @@ mod tests {
         assert!(result.is_empty());
     }
 
-    // --- ADR-0004 Phase 1: optional retrieval-index seam ---
+    // --- ADR-0004: optional retrieval-index seam ---
 
     /// A test double that returns a fixed result regardless of input,
     /// letting us prove serving routed through the index path.

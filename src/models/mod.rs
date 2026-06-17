@@ -110,12 +110,11 @@ pub trait RecModel: Send + Sync {
 
     /// Returns `Some` if this model can retrieve top-K items without
     /// scoring the full catalog — i.e. it exposes an approximate-nearest-
-    /// neighbor index (ADR-0004 Phase 1). Default `None` → serving falls
-    /// back to dense `predict_scores` + `filter_sort_top_k`.
+    /// neighbor index (ADR-0004). Default `None` → serving falls back to
+    /// dense `predict_scores` + `filter_sort_top_k`.
     ///
-    /// Embedding models (Two-Tower; SASRec item-similarity) will return
-    /// `Some` once a benched ANN backend lands in Phase 2. EASE has no
-    /// embedding space and always returns `None`.
+    /// A model that owns an ANN index over its item embeddings returns
+    /// `Some`; EASE has no embedding space and always returns `None`.
     fn retrieval_index(&self) -> Option<&dyn RetrievalIndex> {
         None
     }
