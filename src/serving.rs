@@ -456,13 +456,17 @@ pub fn predict_batch_top_k(
     users
         .par_iter()
         .map(|user| {
-            let scores = model.predict_scores(ModelInput::Sparse {
-                interactions: &user.interactions,
-                user_features: &user.features,
-            })?;
             let interacted_indices: Vec<usize> =
                 user.interactions.iter().map(|(idx, _)| *idx).collect();
-            Ok(filter_sort_top_k(scores, &interacted_indices, top_k))
+            retrieve_or_dense(
+                model,
+                ModelInput::Sparse {
+                    interactions: &user.interactions,
+                    user_features: &user.features,
+                },
+                &interacted_indices,
+                top_k,
+            )
         })
         .collect()
 }
@@ -918,6 +922,32 @@ mod tests {
 
         let result = registry.predict_top_k("T", &[], &[], 2).unwrap();
         assert_eq!(result, vec![(1, 0.9), (3, 0.5)]);
+    }
+
+    /// `predict_batch_top_k` must also route through `retrieve_or_dense`
+    /// so batch and single-user paths are consistent (ADR-0004).
+    #[test]
+    fn predict_batch_top_k_routes_through_retrieval_index_when_present() {
+        let model = StubModel {
+            scores: vec![0.1, 0.2, 0.3, 0.4],
+            mappings: dummy_mappings(),
+            index: Some(StubIndex {
+                out: vec![(99, 7.0)],
+            }),
+        };
+
+        let users = vec![UserInput {
+            interactions: vec![],
+            features: vec![],
+        }];
+
+        let result = predict_batch_top_k(&model, &users, 4).expect("batch should succeed");
+        assert_eq!(result.len(), 1);
+        assert_eq!(
+            result[0],
+            vec![(99, 7.0)],
+            "expected the index's output, not the dense top-K"
+        );
     }
 
     /// The dense fallback still excludes already-interacted items — guards
