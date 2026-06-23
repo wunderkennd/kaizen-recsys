@@ -1,6 +1,7 @@
 //! Approximate-nearest-neighbor retrieval backends (ADR-0004 Phase 2).
 //! Feature-gated (`ann`); not in default or EASE-only builds.
 pub mod exact;
+pub mod usearch_backend;
 
 /// A vector-level ANN index built once over an item-embedding matrix, then
 /// queried for approximate top-K. The bench builds one per backend and
