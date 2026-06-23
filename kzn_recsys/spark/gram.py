@@ -82,25 +82,28 @@ def gram_distributed(interactions_df, user_features_df, item_features_df,
                                    m.item_to_idx, m.item_to_idx, M, M)
 
     # XtU[i,k] = sum over users of value(u,i)*ufeat(u,k): join interactions to user features
-    uf = user_features_df.select(F.col("user_id").alias("uk2"),
-                                 F.col("feature_name").alias("fn"),
-                                 F.col("value").alias("fv"))
-    xtu_df = (idf.select(F.col("item_id").alias("li"), F.col("value").alias("lv"),
-                         F.col("user_id").alias("uk"))
-                 .join(uf, F.col("uk") == F.col("uk2")))
-    XtU = _block_from_cooccurrence(xtu_df, "li", "lv", "fn", "fv",
-                                   m.item_to_idx, m.user_feature_to_idx, M, K)
+    XtU = np.zeros((M, K), dtype=np.float64)
+    UtU = np.zeros((K, K), dtype=np.float64)
+    if K > 0:
+        uf = user_features_df.select(F.col("user_id").alias("uk2"),
+                                     F.col("feature_name").alias("fn"),
+                                     F.col("value").alias("fv"))
+        xtu_df = (idf.select(F.col("item_id").alias("li"), F.col("value").alias("lv"),
+                             F.col("user_id").alias("uk"))
+                     .join(uf, F.col("uk") == F.col("uk2")))
+        XtU = _block_from_cooccurrence(xtu_df, "li", "lv", "fn", "fv",
+                                       m.item_to_idx, m.user_feature_to_idx, M, K)
 
-    # UtU[k,l] = sum over users of ufeat(u,k)*ufeat(u,l): self-join user features on user_id
-    uleft = user_features_df.select(F.col("user_id").alias("uk"),
-                                    F.col("feature_name").alias("lk"),
-                                    F.col("value").alias("lv"))
-    uright = user_features_df.select(F.col("user_id").alias("uk2"),
-                                     F.col("feature_name").alias("rk"),
-                                     F.col("value").alias("rv"))
-    utu_df = uleft.join(uright, uleft.uk == uright.uk2)
-    UtU = _block_from_cooccurrence(utu_df, "lk", "lv", "rk", "rv",
-                                   m.user_feature_to_idx, m.user_feature_to_idx, K, K)
+        # UtU[k,l] = sum over users of ufeat(u,k)*ufeat(u,l): self-join user features on user_id
+        uleft = user_features_df.select(F.col("user_id").alias("uk"),
+                                        F.col("feature_name").alias("lk"),
+                                        F.col("value").alias("lv"))
+        uright = user_features_df.select(F.col("user_id").alias("uk2"),
+                                         F.col("feature_name").alias("rk"),
+                                         F.col("value").alias("rv"))
+        utu_df = uleft.join(uright, uleft.uk == uright.uk2)
+        UtU = _block_from_cooccurrence(utu_df, "lk", "lv", "rk", "rv",
+                                       m.user_feature_to_idx, m.user_feature_to_idx, K, K)
 
     total = M + K
     G = np.zeros((total, total), dtype=np.float64)

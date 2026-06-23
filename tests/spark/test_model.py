@@ -37,3 +37,9 @@ def test_save_load_roundtrip_predicts_identically(spark, tmp_path):
     reloaded = load_model(path)
     after = reloaded.predict({"i1": 1.0}, {}, top_k=3)
     assert before == after
+
+
+def test_build_and_train_rejects_unknown_strategy(spark):
+    i, u, t = _frames(spark)
+    with pytest.raises(ValueError, match="unknown strategy"):
+        build_and_train(i, u, t, alpha=1.0, beta=1.0, lambda_=10.0, strategy="nope")

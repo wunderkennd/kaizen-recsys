@@ -85,9 +85,11 @@ def build_and_train(interactions_df, user_features_df, item_features_df,
     if strategy == "distributed":
         S = _gram.gram_distributed(interactions_df, user_features_df, item_features_df,
                                    mappings, params, weighting)
-    else:
+    elif strategy == "collect":
         S = _gram.gram_collect(interactions_df, user_features_df, item_features_df,
                                mappings, params, weighting)
+    else:
+        raise ValueError(f"unknown strategy {strategy!r}; expected 'collect' or 'distributed'")
     if weighting is not None and getattr(weighting, "sparsity_threshold", 0.0) > 0.0:
         _core.prune_sparse(S, weighting.sparsity_threshold)
     return SparkEaseModel(S, mappings, params, weighting,
