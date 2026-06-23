@@ -87,3 +87,48 @@ def build_csr_inputs(interactions_df, user_features_df, item_features_df, mappin
     T_ml = sp.csr_matrix((tv, (tr, tc)), shape=(M, L))
     T = T_ml.transpose().tocsr()
     return X, U, T
+
+
+def apply_weighting(interactions_df, weighting, mappings):
+    """Apply event -> decay -> IPS weighting to interaction `value`.
+
+    Mirrors data_pipeline.rs:126-176 + weighting.rs. Returns a new DataFrame.
+    Columns event_type / days_ago are used only when present and configured.
+    """
+    from pyspark.sql import functions as F
+    from itertools import chain
+
+    df = interactions_df
+    cols = set(df.columns)
+
+    # 1. Event-type weights (requires event_type column)
+    if weighting.event_weights and "event_type" in cols:
+        pairs = list(chain(*[(F.lit(k), F.lit(float(v)))
+                             for k, v in weighting.event_weights.items()]))
+        wmap = F.create_map(*pairs)
+        mult = F.coalesce(wmap[F.col("event_type")], F.lit(1.0))
+        df = df.withColumn("value", F.col("value") * mult)
+
+    # 2. Temporal decay (requires days_ago column)
+    if weighting.decay_rate and weighting.decay_rate > 0.0 and "days_ago" in cols:
+        df = df.withColumn(
+            "value",
+            F.when(F.col("days_ago").isNotNull(),
+                   F.col("value") * F.exp(F.lit(-weighting.decay_rate) * F.col("days_ago")))
+             .otherwise(F.col("value")),
+        )
+
+    # 3. IPS: propensity = (item_count / max_count) ^ alpha; value /= propensity
+    if weighting.ips_alpha and weighting.ips_alpha > 0.0:
+        counts = df.groupBy("item_id").agg(F.count(F.lit(1)).alias("_cnt"))
+        max_cnt = counts.agg(F.max("_cnt").alias("_m")).collect()[0]["_m"]
+        if max_cnt and max_cnt > 0:
+            counts = counts.withColumn(
+                "_prop", (F.col("_cnt") / F.lit(float(max_cnt))) ** F.lit(weighting.ips_alpha)
+            )
+            df = (df.join(counts.select("item_id", "_prop"), on="item_id", how="left")
+                    .withColumn("value",
+                                F.when(F.col("_prop") > 1e-12, F.col("value") / F.col("_prop"))
+                                 .otherwise(F.col("value")))
+                    .drop("_prop"))
+    return df

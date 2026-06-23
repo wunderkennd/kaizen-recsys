@@ -39,3 +39,36 @@ def test_build_csr_shapes(spark):
     assert T.shape == (1, 2)   # 1 item-feature x 2 items (transposed)
     # X value for (u2, i2) == 2.0
     assert X[m.user_to_idx["u2"], m.item_to_idx["i2"]] == 2.0
+
+
+from kzn_recsys.spark.feas_codec import WeightingConfig
+from kzn_recsys.spark.dataframes import apply_weighting
+
+
+def test_event_weights_multiply(spark):
+    df = spark.createDataFrame(
+        [("u1", "i1", 1.0, "click"), ("u1", "i2", 1.0, "purchase")],
+        ["user_id", "item_id", "value", "event_type"],
+    )
+    m = build_mappings(df.select("user_id", "item_id", "value"),
+                       spark.createDataFrame([], "user_id string, feature_name string, value double"),
+                       spark.createDataFrame([], "item_id string, feature_name string, value double"))
+    wc = WeightingConfig(event_weights={"purchase": 5.0}, decay_rate=0.0,
+                         ips_alpha=0.0, sparsity_threshold=0.0)
+    out = {(r["item_id"]): r["value"] for r in apply_weighting(df, wc, m).collect()}
+    assert out["i1"] == 1.0      # unknown -> unchanged
+    assert out["i2"] == 5.0      # purchase -> x5
+
+
+def test_temporal_decay(spark):
+    df = spark.createDataFrame(
+        [("u1", "i1", 10.0, 0.0), ("u1", "i2", 10.0, 100.0)],
+        ["user_id", "item_id", "value", "days_ago"],
+    )
+    m = build_mappings(df.select("user_id", "item_id", "value"),
+                       spark.createDataFrame([], "user_id string, feature_name string, value double"),
+                       spark.createDataFrame([], "item_id string, feature_name string, value double"))
+    wc = WeightingConfig(event_weights=None, decay_rate=0.01, ips_alpha=0.0, sparsity_threshold=0.0)
+    out = {(r["item_id"]): r["value"] for r in apply_weighting(df, wc, m).collect()}
+    assert abs(out["i1"] - 10.0) < 1e-9
+    assert abs(out["i2"] - 10.0 * np.exp(-1.0)) < 1e-6
