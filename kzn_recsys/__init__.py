@@ -1,31 +1,36 @@
 """kzn_recsys — Python wrapper for the Rust FEASE recommender."""
 
-from kzn_recsys._native import (
-    FeaseModel,
-    ModelRegistry,
-    build_and_train,
-    coverage,
-    grid_search_ease,
-    grid_search_py as grid_search,
-    hit_rate_at_k,
-    load_model,
-    mean_average_precision,
-    ndcg_at_k,
-    precision_at_k,
-    random_search_ease,
-    random_search_py as random_search,
-    recall_at_k,
-    validate_data,
-    random_split,
-    temporal_split,
-    leave_k_out_split,
-)
-from kzn_recsys.fease_wrapper import (
-    SplitResult,
-    leave_k_out_split_safe,
-    random_split_safe,
-    temporal_split_safe,
-)
+try:  # The compiled Rust extension is absent in pure-Python (e.g. Spark) installs.
+    from kzn_recsys._native import (
+        FeaseModel,
+        ModelRegistry,
+        build_and_train,
+        coverage,
+        grid_search_ease,
+        grid_search_py as grid_search,
+        hit_rate_at_k,
+        load_model,
+        mean_average_precision,
+        ndcg_at_k,
+        precision_at_k,
+        random_search_ease,
+        random_search_py as random_search,
+        recall_at_k,
+        validate_data,
+        random_split,
+        temporal_split,
+        leave_k_out_split,
+    )
+    from kzn_recsys.fease_wrapper import (
+        SplitResult,
+        leave_k_out_split_safe,
+        random_split_safe,
+        temporal_split_safe,
+    )
+    _HAS_NATIVE = True
+except ImportError:
+    _HAS_NATIVE = False
+
 from kzn_recsys.schemas import EngagementSchema, MetadataSchema
 
 # SASRec and Two-Tower are only present when the extension is built with
@@ -50,31 +55,35 @@ except ImportError:
     _HAS_ML_MODELS = False
 
 __all__ = [
-    "FeaseModel",
-    "ModelRegistry",
-    "build_and_train",
-    "coverage",
-    "grid_search",
-    "grid_search_ease",
-    "hit_rate_at_k",
-    "load_model",
-    "mean_average_precision",
-    "ndcg_at_k",
-    "precision_at_k",
-    "random_search",
-    "random_search_ease",
-    "recall_at_k",
-    "validate_data",
-    "random_split",
-    "temporal_split",
-    "leave_k_out_split",
-    "SplitResult",
-    "random_split_safe",
-    "temporal_split_safe",
-    "leave_k_out_split_safe",
     "EngagementSchema",
     "MetadataSchema",
 ]
+
+if _HAS_NATIVE:
+    __all__ += [
+        "FeaseModel",
+        "ModelRegistry",
+        "build_and_train",
+        "coverage",
+        "grid_search",
+        "grid_search_ease",
+        "hit_rate_at_k",
+        "load_model",
+        "mean_average_precision",
+        "ndcg_at_k",
+        "precision_at_k",
+        "random_search",
+        "random_search_ease",
+        "recall_at_k",
+        "validate_data",
+        "random_split",
+        "temporal_split",
+        "leave_k_out_split",
+        "SplitResult",
+        "random_split_safe",
+        "temporal_split_safe",
+        "leave_k_out_split_safe",
+    ]
 
 if _HAS_ML_MODELS:
     __all__ += [
