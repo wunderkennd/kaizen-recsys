@@ -923,6 +923,15 @@ impl TrainedTwoTower {
 
         Ok(self.model.score_all(user_vec, self.item_matrix.clone()))
     }
+
+    /// The full `(num_items, dim)` L2-normalized item-embedding matrix as
+    /// host rows. Used by the ANN bench exporter (ADR-0004 Phase 2).
+    pub fn item_embeddings(&self) -> Vec<Vec<f32>> {
+        let dims = self.item_matrix.dims(); // [num_items, dim]
+        let data = self.item_matrix.clone().into_data();
+        let flat: Vec<f32> = data.iter::<f32>().collect();
+        flat.chunks(dims[1]).map(|c| c.to_vec()).collect()
+    }
 }
 
 impl RecModel for TrainedTwoTower {
@@ -1129,6 +1138,25 @@ mod tests {
                 u - 1
             );
         }
+    }
+
+    #[test]
+    fn item_embeddings_shape_matches_catalog() {
+        let (data, uft, ift) = tiny_data();
+        let model = train(
+            &data,
+            &uft,
+            &ift,
+            TrainParams {
+                embedding_dim: 16,
+                epochs: 5,
+                ..TrainParams::default()
+            },
+        )
+        .unwrap();
+        let emb = model.item_embeddings();
+        assert_eq!(emb.len(), model.num_items()); // one row per item
+        assert!(emb.iter().all(|r| r.len() == 16)); // dim matches embedding_dim
     }
 
     #[test]
