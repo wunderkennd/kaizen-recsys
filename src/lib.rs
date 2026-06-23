@@ -16,6 +16,8 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::time::Instant;
 
+#[cfg(feature = "ann")]
+mod ann;
 mod data;
 mod data_pipeline;
 mod data_validation;
