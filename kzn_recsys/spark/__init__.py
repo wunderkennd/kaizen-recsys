@@ -6,6 +6,7 @@ the compiled extension cannot be installed.
 from kzn_recsys.spark.ease_core import EaseParams
 from kzn_recsys.spark.feas_codec import WeightingConfig
 from kzn_recsys.spark.model import SparkEaseModel, build_and_train, load_model
+from kzn_recsys.spark.tuning import grid_search, random_search
 
 __all__ = [
     "EaseParams",
@@ -13,4 +14,6 @@ __all__ = [
     "SparkEaseModel",
     "build_and_train",
     "load_model",
+    "grid_search",
+    "random_search",
 ]
