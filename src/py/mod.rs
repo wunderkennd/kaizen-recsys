@@ -9,7 +9,7 @@
 //! submodules are placeholders until their content is moved from
 //! `src/lib.rs`.
 
-pub mod registry;
-pub mod metrics;
 pub mod eval;
+pub mod metrics;
+pub mod registry;
 // model, tuning, sasrec, two_tower modules pending follow-up commits.
