@@ -71,7 +71,9 @@ jobs:
       run: .venv/bin/maturin develop
 
     - name: Run Python tests
-      run: .venv/bin/pytest tests/ -v
+      # Invoke via the python binary, not the .venv/bin/pytest console script
+      # (whose absolute-path shebang is brittle if the workspace dir moves).
+      run: .venv/bin/python -m pytest tests/ -v
 
   build-wheel:
     needs: lint-and-test
