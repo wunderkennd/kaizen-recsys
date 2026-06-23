@@ -53,3 +53,47 @@ def test_train_matches_direct_formula():
     B = -P / np.diag(P)[None, :]
     np.fill_diagonal(B, 0.0)
     assert np.allclose(S, B, atol=1e-9)
+
+
+from kzn_recsys.spark.ease_core import predict_scores, predict_similar_items, prune_sparse
+
+
+def test_predict_scores_against_S_at_z():
+    X, U, T = _toy_inputs()
+    S = train_ease(X, U, T, EaseParams(lambda_=10.0))
+    # User with items 0 and 1
+    interactions = [(0, 1.0), (1, 1.0)]
+    scores = predict_scores(S, num_items=3, num_user_features=0,
+                            interactions=interactions, features=[], beta=1.0)
+    # Reference: z = [1,1,0], scores = (S @ z)[:3]
+    z = np.array([1.0, 1.0, 0.0])
+    assert np.allclose(scores, (S @ z)[:3], atol=1e-12)
+    assert scores.shape == (3,)
+
+
+def test_predict_scores_applies_beta_to_features():
+    # 1 item, 1 user-feature: total dim 2
+    S = np.asfortranarray(np.array([[0.0, 0.5], [0.7, 0.0]]))
+    scores = predict_scores(S, num_items=1, num_user_features=1,
+                            interactions=[(0, 2.0)], features=[(0, 3.0)], beta=0.5)
+    # z = [2.0, 0.5*3.0] = [2.0, 1.5]; score_item0 = 0.0*2.0 + 0.5*1.5 = 0.75
+    assert np.allclose(scores, [0.75], atol=1e-12)
+
+
+def test_predict_similar_items_excludes_self_and_sorts():
+    S = np.asfortranarray(np.array([
+        [0.0, 0.9, 0.1],
+        [0.9, 0.0, 0.5],
+        [0.1, 0.5, 0.0],
+    ]))
+    out = predict_similar_items(S, item_idx=0, num_items=3, top_k=2)
+    assert out[0][0] == 1  # highest column-0 score, excluding self
+    assert out[1][0] == 2
+    assert all(idx != 0 for idx, _ in out)
+
+
+def test_prune_sparse_zeros_small_entries():
+    S = np.asfortranarray(np.array([[0.0, 0.001], [0.5, 0.0]]))
+    prune_sparse(S, threshold=0.01)
+    assert S[0, 1] == 0.0
+    assert S[1, 0] == 0.5
