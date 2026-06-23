@@ -67,7 +67,7 @@ def train_ease(X, U, T, params: EaseParams) -> np.ndarray:
     return np.asfortranarray(S)
 
 
-def predict_scores(S, num_items, num_user_features, interactions, features, beta):
+def predict_scores(S, num_items, num_user_features, interactions, features, beta) -> np.ndarray:
     """Score all items for one user. Mirrors RustFeaseModel::predict (model.rs:341-378).
 
     interactions: list of (item_idx, value); features: list of (feature_idx, value).
@@ -84,12 +84,14 @@ def predict_scores(S, num_items, num_user_features, interactions, features, beta
     return (S @ z)[:num_items]
 
 
-def predict_similar_items(S, item_idx, num_items, top_k):
+def predict_similar_items(S, item_idx, num_items, top_k) -> list:
     """Item-item similarity from the S item block. Mirrors model.rs:390+.
 
     Returns up to top_k (item_index, score) pairs sorted by descending score,
     excluding item_idx itself.
     """
+    if item_idx < 0 or item_idx >= num_items:
+        return []
     col = np.asarray(S[:num_items, item_idx]).ravel()
     order = np.argsort(-col, kind="stable")
     out = []
@@ -103,5 +105,9 @@ def predict_similar_items(S, item_idx, num_items, top_k):
 
 
 def prune_sparse(S, threshold) -> None:
-    """Zero entries with |value| < threshold, in place. Mirrors model.rs:233-248."""
+    """Zero entries with |value| < threshold, in place. Mirrors model.rs:233-248.
+
+    S must be a dense numpy array (train_ease returns one); scipy sparse inputs
+    are not supported.
+    """
     S[np.abs(S) < threshold] = 0.0

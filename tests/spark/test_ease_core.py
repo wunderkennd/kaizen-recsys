@@ -97,3 +97,9 @@ def test_prune_sparse_zeros_small_entries():
     prune_sparse(S, threshold=0.01)
     assert S[0, 1] == 0.0
     assert S[1, 0] == 0.5
+
+
+def test_predict_similar_items_out_of_range_returns_empty():
+    S = np.asfortranarray(np.zeros((3, 3)))
+    assert predict_similar_items(S, item_idx=5, num_items=3, top_k=2) == []
+    assert predict_similar_items(S, item_idx=-1, num_items=3, top_k=2) == []
