@@ -19,7 +19,6 @@ def _assign_folds(interactions_df, k_folds, seed):
     stable list index as the row id. Avoids F.monotonically_increasing_id(), which
     is nondeterministic across the separate executions a collect-then-join triggers.
     """
-    from pyspark.sql import functions as F  # noqa: F401
     from pyspark.sql.types import IntegerType, StructField, StructType
 
     rows = interactions_df.collect()
