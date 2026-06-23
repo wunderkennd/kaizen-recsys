@@ -1,44 +1,57 @@
 """Train/test splits on interaction DataFrames. Semantics mirror
 src/evaluation.rs; determinism is via a Python-seeded RNG (NOT row-identical
-to the Rust StdRng splits — see plan parity fact 5)."""
+to the Rust StdRng splits — see plan parity fact 5).
+
+random_split / leave_k_out_split collect rows to the driver once and use the
+stable list index as the row id, then rebuild train/test frames. This avoids
+F.monotonically_increasing_id(), which is nondeterministic across the separate
+Spark executions that collecting-then-filtering would trigger."""
 from __future__ import annotations
 
 import random
 
 
-def _add_row_index(df):
-    # stable per-row id for reproducible masking
-    from pyspark.sql import functions as F
-    return df.withColumn("_rid", F.monotonically_increasing_id())
+def _positions_by_user(rows):
+    by_user = {}
+    for idx, r in enumerate(rows):
+        by_user.setdefault(r["user_id"], []).append(idx)
+    return by_user
+
+
+def _rebuild_from(interactions_df, rows, held_out):
+    """Build (train_df, test_df) from the single `rows` materialization."""
+    spark = interactions_df.sparkSession
+    schema = interactions_df.schema
+    test_rows = [rows[i] for i in range(len(rows)) if i in held_out]
+    train_rows = [rows[i] for i in range(len(rows)) if i not in held_out]
+    return (spark.createDataFrame(train_rows, schema),
+            spark.createDataFrame(test_rows, schema))
 
 
 def random_split(interactions_df, test_ratio: float, seed: int):
     """For each user, hold out round(test_ratio * n) rows (clamped to [1, n-1]
-    for users with >= 2 interactions). Mirrors evaluation.rs:103-173 semantics."""
+    for users with >= 2 interactions). Mirrors evaluation.rs:103-173 semantics.
+
+    Deterministic given `seed`; not row-identical to the Rust StdRng split.
+    """
     if not 0.0 <= test_ratio <= 1.0:
         raise ValueError("test_ratio must be between 0.0 and 1.0")
-    df = _add_row_index(interactions_df)
-    rows = df.select("user_id", "_rid").collect()
-    by_user = {}
-    for r in rows:
-        by_user.setdefault(r["user_id"], []).append(r["_rid"])
+    rows = interactions_df.collect()
+    by_user = _positions_by_user(rows)
 
     rng = random.Random(seed)
-    test_ids = set()
+    held_out = set()
     for uid in sorted(by_user):
-        rids = list(by_user[uid])
-        rng.shuffle(rids)
-        n = len(rids)
+        positions = list(by_user[uid])
+        rng.shuffle(positions)
+        n = len(positions)
         if n < 2:
             n_test = 0
         else:
             n_test = max(1, min(round(n * test_ratio), n - 1))
-        test_ids.update(rids[:n_test])
+        held_out.update(positions[:n_test])
 
-    from pyspark.sql import functions as F
-    test_df = df.where(F.col("_rid").isin(list(test_ids))).drop("_rid")
-    train_df = df.where(~F.col("_rid").isin(list(test_ids))).drop("_rid")
-    return train_df, test_df
+    return _rebuild_from(interactions_df, rows, held_out)
 
 
 def temporal_split(interactions_df, days_ago_cutoff: float):
@@ -52,23 +65,20 @@ def temporal_split(interactions_df, days_ago_cutoff: float):
 
 
 def leave_k_out_split(interactions_df, k: int, seed: int):
-    """Hold out exactly k rows per user with >= k+1 interactions. Mirrors evaluation.rs:230+."""
-    df = _add_row_index(interactions_df)
-    rows = df.select("user_id", "_rid").collect()
-    by_user = {}
-    for r in rows:
-        by_user.setdefault(r["user_id"], []).append(r["_rid"])
+    """Hold out exactly k rows per user with >= k+1 interactions. Mirrors evaluation.rs:230+.
+
+    Deterministic given `seed`; not row-identical to the Rust StdRng split.
+    """
+    rows = interactions_df.collect()
+    by_user = _positions_by_user(rows)
 
     rng = random.Random(seed)
-    test_ids = set()
+    held_out = set()
     for uid in sorted(by_user):
-        rids = list(by_user[uid])
-        if len(rids) < k + 1:
+        positions = list(by_user[uid])
+        if len(positions) < k + 1:
             continue
-        rng.shuffle(rids)
-        test_ids.update(rids[:k])
+        rng.shuffle(positions)
+        held_out.update(positions[:k])
 
-    from pyspark.sql import functions as F
-    test_df = df.where(F.col("_rid").isin(list(test_ids))).drop("_rid")
-    train_df = df.where(~F.col("_rid").isin(list(test_ids))).drop("_rid")
-    return train_df, test_df
+    return _rebuild_from(interactions_df, rows, held_out)

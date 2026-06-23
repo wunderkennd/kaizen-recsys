@@ -43,3 +43,13 @@ def test_leave_k_out(spark):
         test_by_user[r["user_id"]] += 1
     assert test_by_user.get("u1") == 1
     assert test_by_user.get("u2") == 1
+
+
+def test_random_split_is_exact_complement(spark):
+    df = _interactions(spark)
+    train, test = random_split(df, test_ratio=0.5, seed=3)
+    train_rows = set((r["user_id"], r["item_id"]) for r in train.collect())
+    test_rows = set((r["user_id"], r["item_id"]) for r in test.collect())
+    all_rows = set((r["user_id"], r["item_id"]) for r in df.collect())
+    assert train_rows | test_rows == all_rows      # nothing lost
+    assert train_rows & test_rows == set()         # nothing duplicated
