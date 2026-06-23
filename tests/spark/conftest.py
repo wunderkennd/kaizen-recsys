@@ -1,5 +1,12 @@
 """Shared fixtures for PySpark EASE tests."""
+import os
 import pytest
+
+# PySpark 4.x requires a JDK that still ships jdk.internal.ref.Cleaner (pre-JDK 9 API).
+# Java 26 removed it; set JAVA_HOME to Microsoft JDK 25 which retains compatibility.
+_MS_JDK25 = "/Library/Java/JavaVirtualMachines/microsoft-25.jdk/Contents/Home"
+if os.path.isdir(_MS_JDK25) and os.environ.get("JAVA_HOME", "") != _MS_JDK25:
+    os.environ["JAVA_HOME"] = _MS_JDK25
 
 
 @pytest.fixture(scope="session")
