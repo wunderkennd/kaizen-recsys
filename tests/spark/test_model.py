@@ -43,3 +43,27 @@ def test_build_and_train_rejects_unknown_strategy(spark):
     i, u, t = _frames(spark)
     with pytest.raises(ValueError, match="unknown strategy"):
         build_and_train(i, u, t, alpha=1.0, beta=1.0, lambda_=10.0, strategy="nope")
+
+
+def test_evaluate_returns_metric_report(spark):
+    train = spark.createDataFrame(
+        [("u1", "i1", 1.0), ("u1", "i2", 1.0),
+         ("u2", "i2", 1.0), ("u2", "i3", 1.0),
+         ("u3", "i1", 1.0), ("u3", "i3", 1.0)],
+        ["user_id", "item_id", "value"],
+    )
+    test = spark.createDataFrame(
+        [("u1", "i3", 1.0), ("u2", "i1", 1.0)],
+        ["user_id", "item_id", "value"],
+    )
+    empty_u = spark.createDataFrame([], "user_id string, feature_name string, value double")
+    empty_t = spark.createDataFrame([], "item_id string, feature_name string, value double")
+    model = build_and_train(train, empty_u, empty_t, alpha=1.0, beta=1.0, lambda_=10.0)
+    report = model.evaluate(test, train, empty_u, k_values=[1, 2, 3])
+    assert "metrics" in report and "coverage" in report
+    ks = {m["k"] for m in report["metrics"]}
+    assert ks == {1, 2, 3}
+    for m in report["metrics"]:
+        assert 0.0 <= m["ndcg"] <= 1.0
+        assert 0.0 <= m["recall"] <= 1.0
+    assert report["num_users"] >= 1

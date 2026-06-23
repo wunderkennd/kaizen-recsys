@@ -8,6 +8,7 @@ from . import dataframes as _df
 from . import ease_core as _core
 from . import gram as _gram
 from . import feas_codec as _codec
+from . import metrics as _metrics
 
 
 class SparkEaseModel:
@@ -52,6 +53,74 @@ class SparkEaseModel:
             self.s_matrix, m.item_to_idx[item_id], self.num_items, top_k
         )
         return [(m.idx_to_item[j], score) for j, score in pairs]
+
+    def evaluate(self, test_interactions_df, train_interactions_df,
+                 user_features_df, k_values):
+        """Score test users and compute precision/recall/ndcg/map/hit_rate@k + coverage.
+
+        Mirrors src/evaluation.rs::evaluate_model semantics for EASE: each user's
+        training interactions form the input; held-out test items are the relevant set.
+        """
+        m = self.mappings
+        max_k = max(k_values)
+
+        def _collect_by_user(df, val=True):
+            out = {}
+            for r in df.select("user_id", "item_id", "value").collect():
+                out.setdefault(r["user_id"], {})[r["item_id"]] = float(r["value"])
+            return out
+
+        train_by_user = _collect_by_user(train_interactions_df)
+        test_by_user = _collect_by_user(test_interactions_df)
+
+        # user features as {user_id: {feature_name: value}}
+        feats_by_user = {}
+        for r in user_features_df.select("user_id", "feature_name", "value").collect():
+            feats_by_user.setdefault(r["user_id"], {})[r["feature_name"]] = float(r["value"])
+
+        per_k = {k: {"precision": 0.0, "recall": 0.0, "ndcg": 0.0,
+                     "map": 0.0, "hit_rate": 0.0} for k in k_values}
+        all_recs = []
+        n_users = 0
+        n_interactions = 0
+
+        for uid, relevant_map in test_by_user.items():
+            relevant = set(relevant_map)
+            if not relevant:
+                continue
+            interactions = train_by_user.get(uid, {})
+            features = feats_by_user.get(uid, {})
+            recs = self.predict(interactions, features, top_k=max_k)
+            rec_ids = [item_id for item_id, _ in recs]
+            rec_idx = [m.item_to_idx[i] for i in rec_ids if i in m.item_to_idx]
+            all_recs.append(rec_idx)
+            relevant_idx = {m.item_to_idx[i] for i in relevant if i in m.item_to_idx}
+            n_users += 1
+            n_interactions += len(relevant)
+            for k in k_values:
+                per_k[k]["precision"] += _metrics.precision_at_k(rec_idx, relevant_idx, k)
+                per_k[k]["recall"] += _metrics.recall_at_k(rec_idx, relevant_idx, k)
+                per_k[k]["ndcg"] += _metrics.ndcg_at_k(rec_idx, relevant_idx, k)
+                per_k[k]["hit_rate"] += _metrics.hit_rate_at_k(rec_idx, relevant_idx, k)
+                per_k[k]["map"] += _metrics.mean_average_precision(rec_idx, relevant_idx)
+
+        denom = max(n_users, 1)
+        metrics_out = []
+        for k in sorted(k_values):
+            metrics_out.append({
+                "k": k,
+                "precision": per_k[k]["precision"] / denom,
+                "recall": per_k[k]["recall"] / denom,
+                "ndcg": per_k[k]["ndcg"] / denom,
+                "map": per_k[k]["map"] / denom,
+                "hit_rate": per_k[k]["hit_rate"] / denom,
+            })
+        return {
+            "metrics": metrics_out,
+            "coverage": _metrics.coverage(all_recs, self.num_items),
+            "num_users": n_users,
+            "num_interactions": n_interactions,
+        }
 
     def save(self, path: str) -> None:
         m = self.mappings
