@@ -102,7 +102,7 @@ class SparkEaseModel:
                 per_k[k]["recall"] += _metrics.recall_at_k(rec_idx, relevant_idx, k)
                 per_k[k]["ndcg"] += _metrics.ndcg_at_k(rec_idx, relevant_idx, k)
                 per_k[k]["hit_rate"] += _metrics.hit_rate_at_k(rec_idx, relevant_idx, k)
-                per_k[k]["map"] += _metrics.mean_average_precision(rec_idx, relevant_idx)
+                per_k[k]["map"] += _metrics.mean_average_precision(rec_idx[:k], relevant_idx)
 
         denom = max(n_users, 1)
         metrics_out = []
