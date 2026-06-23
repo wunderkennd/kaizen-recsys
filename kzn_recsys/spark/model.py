@@ -78,11 +78,16 @@ class SparkEaseModel:
 
 
 def build_and_train(interactions_df, user_features_df, item_features_df,
-                    alpha=1.0, beta=1.0, lambda_=150.0, meta_weight=0.0, weighting=None):
+                    alpha=1.0, beta=1.0, lambda_=150.0, meta_weight=0.0,
+                    weighting=None, strategy="collect"):
     params = _core.EaseParams(alpha=alpha, beta=beta, lambda_=lambda_, meta_weight=meta_weight)
     mappings = _df.build_mappings(interactions_df, user_features_df, item_features_df)
-    S = _gram.gram_collect(interactions_df, user_features_df, item_features_df,
-                           mappings, params, weighting)
+    if strategy == "distributed":
+        S = _gram.gram_distributed(interactions_df, user_features_df, item_features_df,
+                                   mappings, params, weighting)
+    else:
+        S = _gram.gram_collect(interactions_df, user_features_df, item_features_df,
+                               mappings, params, weighting)
     if weighting is not None and getattr(weighting, "sparsity_threshold", 0.0) > 0.0:
         _core.prune_sparse(S, weighting.sparsity_threshold)
     return SparkEaseModel(S, mappings, params, weighting,

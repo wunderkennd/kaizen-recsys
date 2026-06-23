@@ -19,6 +19,21 @@ class EaseParams:
     meta_weight: float = 0.0  # diagonal metadata weighting; 0 => treated as 1.0
 
 
+def solve_from_gram(G: np.ndarray, lambda_: float) -> np.ndarray:
+    """Given the dense Gram G ((M+K)x(M+K)), return S (Fortran-order).
+
+    G is modified in place (lambda added to diagonal). Mirrors model.rs:190-224.
+    """
+    total = G.shape[0]
+    G.flat[:: total + 1] += lambda_
+    P = np.linalg.inv(G)
+    p_jj = np.diag(P).copy()
+    inv = np.where(np.abs(p_jj) > 1e-12, -1.0 / p_jj, 0.0)
+    S = P * inv[None, :]
+    np.fill_diagonal(S, 0.0)
+    return np.asfortranarray(S)
+
+
 def train_ease(X, U, T, params: EaseParams) -> np.ndarray:
     """Train EASE, returning the S matrix as a Fortran-order (M+K)x(M+K) array.
 
@@ -53,18 +68,8 @@ def train_ease(X, U, T, params: EaseParams) -> np.ndarray:
         G[M:, :M] = G21
         G[M:, M:] = G22
 
-    # P = inv(G + lambda I)  (model.rs:190-200)
-    G.flat[:: total + 1] += params.lambda_  # add lambda to diagonal in place
-    P = np.linalg.inv(G)
-
-    # S[i,j] = -P[i,j] / P[j,j], S[j,j] = 0  (model.rs:202-224)
-    p_jj = np.diag(P).copy()
-    inv = np.where(np.abs(p_jj) > 1e-12, -1.0 / p_jj, 0.0)
-    S = P * inv[None, :]
-    np.fill_diagonal(S, 0.0)
-
     # Column-major to match nalgebra / FEAS layout (parity fact 1).
-    return np.asfortranarray(S)
+    return solve_from_gram(G, params.lambda_)
 
 
 def predict_scores(S, num_items, num_user_features, interactions, features, beta) -> np.ndarray:
