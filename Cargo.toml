@@ -96,3 +96,12 @@ fast-blas = ["dep:nalgebra-lapack"]
 # no system install.
 ort = { version = "=2.0.0-rc.12", default-features = false, features = ["download-binaries", "tls-native", "ndarray", "std"] }
 ndarray = "0.17"
+# Benchmark harness for the ANN retrieval-index evaluation (issue #76 /
+# ADR-0004 Phase 2). Drives latency measurement for the exact baseline and,
+# later, the ANN backends. The bench itself is library-agnostic scaffolding:
+# usearch / TurboVec plug in once the backend decision is made.
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "ann_retrieval"
+harness = false
