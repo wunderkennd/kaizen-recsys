@@ -64,7 +64,7 @@ class SparkEaseModel:
         m = self.mappings
         max_k = max(k_values)
 
-        def _collect_by_user(df, val=True):
+        def _collect_by_user(df):
             out = {}
             for r in df.select("user_id", "item_id", "value").collect():
                 out.setdefault(r["user_id"], {})[r["item_id"]] = float(r["value"])

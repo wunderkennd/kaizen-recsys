@@ -3,7 +3,6 @@
 Skipped unless the compiled kzn_recsys._native extension is importable.
 Run after: .venv/bin/maturin develop
 """
-import numpy as np
 import pytest
 
 pytestmark = [pytest.mark.spark, pytest.mark.parity]

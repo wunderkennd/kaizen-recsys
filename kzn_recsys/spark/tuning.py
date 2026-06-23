@@ -8,8 +8,6 @@ from __future__ import annotations
 import itertools
 import random
 
-from pyspark.sql import functions as F
-
 from .model import build_and_train
 from . import metrics as _metrics
 
@@ -21,6 +19,7 @@ def _assign_folds(interactions_df, k_folds, seed):
     stable list index as the row id. Avoids F.monotonically_increasing_id(), which
     is nondeterministic across the separate executions a collect-then-join triggers.
     """
+    from pyspark.sql import functions as F  # noqa: F401
     from pyspark.sql.types import IntegerType, StructField, StructType
 
     rows = interactions_df.collect()
@@ -45,6 +44,7 @@ def _assign_folds(interactions_df, k_folds, seed):
 def _score_params(interactions_df, user_features_df, item_features_df,
                   params, k_folds, eval_k, seed):
     """Mean NDCG@eval_k across folds for one parameter set."""
+    from pyspark.sql import functions as F
     folded = _assign_folds(interactions_df, k_folds, seed).cache()
     ndcgs = []
     for f in range(k_folds):
