@@ -37,3 +37,14 @@ def test_random_search_respects_n_iter(spark):
         n_iter=3, k_folds=2, eval_k=3, seed=1,
     )
     assert len(result["trials"]) == 3
+
+
+def test_grid_search_is_deterministic(spark):
+    i, u, t = _frames(spark)
+    kw = dict(param_grid={"lambda_": [1.0, 100.0]}, k_folds=2, eval_k=3, seed=5)
+    r1 = grid_search(i, u, t, **kw)
+    r2 = grid_search(i, u, t, **kw)
+    s1 = [round(tr["score"], 9) for tr in r1["trials"]]
+    s2 = [round(tr["score"], 9) for tr in r2["trials"]]
+    assert s1 == s2
+    assert r1["best_params"] == r2["best_params"]
