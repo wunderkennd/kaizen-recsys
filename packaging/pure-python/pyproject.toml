@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kzn_recsys_spark"
+version = "0.1.0"
+description = "Pure-Python/PySpark EASE implementation (kzn_recsys.spark), no native extension"
+requires-python = ">=3.8"
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "pyspark>=3.4",
+]
+
+[tool.setuptools]
+# Ship only the pure-Python spark subpackage + the (native-optional) package init.
+packages = ["kzn_recsys", "kzn_recsys.spark"]
+package-dir = {"" = "../.."}
+
+[tool.setuptools.package-data]
+"kzn_recsys" = ["schemas.py", "fease_wrapper.py"]
