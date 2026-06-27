@@ -1,51 +1,71 @@
-# ANN retrieval benchmark (ADR-0004 Phase 2 · issue #76)
+# ANN retrieval backend bench-off (ADR-0004 Phase 2 · issue #76)
 
-Harness for choosing and validating the approximate-nearest-neighbor backend
-that the `RetrievalIndex` seam (ADR-0004 Phase 1, #75) routes through for
-embedding models.
+Chooses the approximate-nearest-neighbor backend the `RetrievalIndex` seam
+(ADR-0004 Phase 1, #75) routes through for embedding models, by benchmarking
+candidates against the exact maximum-inner-product baseline on real Two-Tower
+embeddings.
 
-## What this measures
+## How it runs (and why it's a test, not a criterion bench)
 
-For each catalog size (10k / 100k / 1M items, dim 64) the bench compares an ANN
-backend against the **exact** maximum-inner-product top-K baseline on three axes:
-
-| Axis | How | Gate |
-|------|-----|------|
-| **recall@K** vs exact | `recall_at_k(approx, exact_top_k(..))` | ADR CI floor (TBD, e.g. ≥0.95) |
-| **latency** p50/p99 | criterion `bench_function` per backend | must beat exact at ≥100k |
-| **resident memory** | index size vs full f32 matrix | quantization win (TurboVec's edge) |
-
-The exact baseline mirrors serving's dense path (`filter_sort_top_k`): partial
-quickselect + index tie-break, so recall ground truth matches production order.
-
-## Status — scaffolding only
-
-Landed: reproducible synthetic embeddings, exact baseline, `recall_at_k`, and a
-criterion group benchmarking the exact path. The ANN backends are **not** wired
-in yet — that's the open decision below. Each plugs in as a `bench_function`
-beside `exact`, fed the same embeddings and scored against the same ground truth.
-
-## Open decisions (gate the next increment)
-
-1. **Backend: usearch vs TurboVec.** usearch — mature Rust crate, filtered
-   search, HNSW. TurboVec — quantization-first (4–16× memory), newer /
-   single-author. Both go behind a default-off `ann` Cargo feature (composes
-   with `ml-models`). The bench picks the winner on the table above; the seam
-   stays library-agnostic so the loser is swappable.
-2. **Embedding source for the *decision* run.** Synthetic vectors validate the
-   harness shape, but the recall numbers that decide the backend should come
-   from a **real Two-Tower** `item_matrix` (`catalog_matrix`,
-   `src/models/two_tower.rs`). Options: export from a Two-Tower trained on
-   synthetic interactions, or a real catalog. Needs a small exporter
-   (`item_matrix` → flat `f32` file the bench loads).
-
-## Run
+The crate is a PyO3 `extension-module` (`crate-type = ["cdylib"]`). On macOS any
+`cargo build` / `cargo bench` / `cargo run` emits the cdylib and fails to link
+(no libpython); only `cargo test` links (it builds a test harness, never the
+cdylib). So the bench-off lives as a feature-gated, `#[ignore]`d **in-crate
+test** — `ann_backend_comparison` in `src/ann/comparison.rs` — which links *and*
+reaches the crate-internal Two-Tower training + `ann` backends:
 
 ```bash
-cargo bench --bench ann_retrieval     # latency sweep over catalog sizes
+cargo test --release --features "ann ml-models" -- --ignored ann_backend_comparison --nocapture
 ```
 
-The exact baseline mirrors the already-tested `filter_sort_top_k`
-(`src/serving.rs`); when `exact_top_k` / `recall_at_k` are promoted to a
-feature-gated `src/ann` module alongside the real backend, they get unit tests
-there (criterion benches with `harness = false` can't host libtest `#[test]`s).
+It trains a small Two-Tower on synthetic *clustered* interactions (so the
+embeddings have real neighborhood structure), takes the real `item_embeddings()`
+matrix, builds each backend, and reports recall@K (vs `exact_top_k` ground
+truth), median single-query latency, and `index_bytes`.
+
+The `benches/ann_retrieval.rs` criterion bench remains as a self-contained
+synthetic-data latency micro-bench (it can't import the crate, per the above).
+
+## Results (N_ITEMS=3000, dim=64, K=10, 12 clusters, 100 queries)
+
+Stable across runs; real trained Two-Tower embeddings.
+
+| backend  | recall@10 | median latency | index size |
+|----------|-----------|----------------|------------|
+| exact    | 1.00      | ~150 µs        | 0.73 MB    |
+| usearch  | 1.00      | ~18 µs         | 16.0 MB (measured HNSW resident) |
+| turbovec | ~0.88     | ~8 µs          | 0.10 MB (analytic packed-code estimate) |
+
+`exact` is the brute-force baseline ANN must beat. **Memory is not strictly
+apples-to-apples**: usearch reports measured resident size (incl. the HNSW
+graph); turbovec reports a packed-code lower bound. The order-of-magnitude
+footprint gap (4-bit quantization) is real regardless.
+
+## Decision
+
+**Default backend: turbovec.** It leads on the axes that motivated adding an ANN
+stage at all — ~155× smaller index and ~2× lower latency than usearch — at the
+cost of ~12 points of recall@10 (0.88 vs 1.00), a deliberate trade on the
+assumption a downstream reranker absorbs the retrieval recall loss (cf. the
+OverArch pattern in `research/silver_torch_research.md`).
+
+**usearch is kept as the exact-recall alternative**, selected when retrieval
+recall must be exact or when memory is not the binding constraint. Both implement
+`AnnBackend` behind the default-off `ann` feature, so the choice is serving
+config, not a fork — and turbovec's pre-1.0 maturity risk is mitigated by the
+seam (swappable to usearch without touching callers).
+
+### Caveats / follow-ups
+- Measured at 3000 items. The recall gap (a property of quantization) transfers;
+  the absolute latency/memory *ratios* may shift at 1M+ items where ANN earns its
+  keep. A scale bench on CI Linux is tracked as a follow-up issue.
+- turbovec requires `dim % 8 == 0` and uses positional ids (vs usearch's
+  arbitrary dims + explicit u64 keys) — see each backend's module docs.
+
+## Components
+
+- `src/ann/exact.rs` — `exact_top_k` (ground truth) + `recall_at_k` (the metric), unit-tested.
+- `src/ann/mod.rs` — `AnnBackend` trait + `ExactBackend` control.
+- `src/ann/usearch_backend.rs`, `src/ann/turbovec_backend.rs` — the two real backends.
+- `src/ann/comparison.rs` — the `#[ignore]`d bench-off test above.
+- `TrainedTwoTower::item_embeddings()` (`src/models/two_tower.rs`) — real embedding source.
