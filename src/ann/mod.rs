@@ -4,6 +4,12 @@ pub mod exact;
 pub mod turbovec_backend;
 pub mod usearch_backend;
 
+/// In-crate usearch-vs-turbovec bench-off (ADR-0004 Phase 2, issue #76).
+/// Lives as an `#[ignore]`d unit test because the crate is a PyO3 cdylib that
+/// only links under `cargo test`; needs `ml-models` for Two-Tower embeddings.
+#[cfg(all(test, feature = "ml-models"))]
+mod comparison;
+
 /// A vector-level ANN index built once over an item-embedding matrix, then
 /// queried for approximate top-K. The bench builds one per backend and
 /// scores its results against `exact::exact_top_k`.
