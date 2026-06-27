@@ -22,21 +22,35 @@
 //! `distance = 1 - dot(a, b)`. So `score = 1.0 - distance` recovers the dot
 //! product exactly, and a *smaller* distance is a *larger* dot product —
 //! matching `exact_top_k`'s descending-dot ordering once we convert back.
+//!
+//! Empty-items handling: If `build` is called with an empty items slice, the
+//! backend is created in an empty state (no index), and `search` returns an
+//! empty result set. This matches `TurbovecBackend`'s behavior.
 
 use crate::ann::AnnBackend;
 use usearch::{Index, IndexOptions, MetricKind, ScalarKind};
 
 /// HNSW (usearch) ANN backend over an item-embedding matrix, queried for
 /// approximate maximum-inner-product top-K.
+///
+/// When built with an empty items slice, `index` is `None` and `search` returns
+/// an empty result set.
 #[allow(dead_code)]
 pub struct UsearchBackend {
-    index: Index,
+    index: Option<Index>,
     dim: usize,
     num_items: usize,
 }
 
 impl AnnBackend for UsearchBackend {
     fn build(items: &[Vec<f32>]) -> Self {
+        if items.is_empty() {
+            return Self {
+                index: None,
+                dim: 0,
+                num_items: 0,
+            };
+        }
         let dim = items.first().map(|v| v.len()).unwrap_or(0);
         let options = IndexOptions {
             dimensions: dim,
@@ -50,22 +64,20 @@ impl AnnBackend for UsearchBackend {
             index.add(i as u64, item).expect("usearch: add failed");
         }
         Self {
-            index,
+            index: Some(index),
             dim,
             num_items: items.len(),
         }
     }
 
     fn search(&self, query: &[f32], k: usize, exclude: &[usize]) -> Vec<(usize, f32)> {
-        if k == 0 {
+        if k == 0 || self.index.is_none() {
             return Vec::new();
         }
         // Over-fetch so post-filtering excluded ids still yields up to k.
         let count = (k + exclude.len()).min(self.num_items);
-        let matches = self
-            .index
-            .search(query, count)
-            .expect("usearch: search failed");
+        let index = self.index.as_ref().unwrap();
+        let matches = index.search(query, count).expect("usearch: search failed");
         let ex: std::collections::HashSet<usize> = exclude.iter().copied().collect();
         matches
             .keys
@@ -80,11 +92,16 @@ impl AnnBackend for UsearchBackend {
     }
 
     fn index_bytes(&self) -> usize {
-        let reported = self.index.memory_usage();
-        if reported > 0 {
-            reported
-        } else {
-            self.num_items * self.dim * std::mem::size_of::<f32>()
+        match &self.index {
+            None => 0,
+            Some(idx) => {
+                let reported = idx.memory_usage();
+                if reported > 0 {
+                    reported
+                } else {
+                    self.num_items * self.dim * std::mem::size_of::<f32>()
+                }
+            }
         }
     }
 }
@@ -132,5 +149,13 @@ mod tests {
             approx.iter().all(|(i, _)| *i != excluded),
             "excluded id must not appear"
         );
+    }
+
+    #[test]
+    fn empty_items_builds_and_searches_empty() {
+        let be = UsearchBackend::build(&[]);
+        let result = be.search(&[1.0, 0.0, 0.0], 5, &[]);
+        assert!(result.is_empty(), "search on empty index must return empty");
+        assert_eq!(be.index_bytes(), 0, "empty index must have 0 bytes");
     }
 }

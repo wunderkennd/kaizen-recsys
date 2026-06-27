@@ -10,6 +10,13 @@
 
 **Builds on:** #79 (scaffold harness). Tracks #76. Resolves the tech debt logged in #76 (promote + unit-test bench utilities; dedupe exact baseline).
 
+> **Revision (2026-06-26):** Tasks 7-9 were pivoted from "exporter bin + criterion
+> bench" to a single in-crate `#[ignore]`d test (`src/ann/comparison.rs`). Reason:
+> the crate is a PyO3 cdylib extension module, so bins/benches can't link locally
+> (only `cargo test` does). See `benches/README.md` and issue #76 for the final
+> shape and the backend decision (turbovec default). The tasks below are the
+> original plan, retained as the historical record.
+
 ---
 
 ## File Structure
