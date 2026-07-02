@@ -26,7 +26,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        n_items: [100000, 1000000]
+        include:
+          # ~1k items per cluster at both scales — realistic neighborhood
+          # structure (a fixed 12 clusters at 1M means ~83k near-duplicates
+          # per cluster, pathological for graph indexes).
+          - n_items: 100000
+            clusters: 100
+          - n_items: 1000000
+            clusters: 1000
 
     steps:
     - name: Check out code
@@ -51,6 +58,7 @@ jobs:
         ANN_BENCH_DIM: 128
         ANN_BENCH_K: 10
         ANN_BENCH_MODE: synthetic
+        ANN_BENCH_CLUSTERS: ${{ matrix.clusters }}
       run: |
         cargo test --release --features "ann ml-models" \
           -- --ignored ann_backend_comparison --nocapture
