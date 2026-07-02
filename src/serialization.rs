@@ -216,6 +216,7 @@ impl SerializedModel {
             meta_weight: self.meta_weight,
             mappings,
             weighting_config,
+            transformation_schema: None,
         })
     }
 }
@@ -339,6 +340,7 @@ mod tests {
                 idx_to_item_feature: vec![],
             },
             weighting_config: None,
+            transformation_schema: None,
         }
     }
 

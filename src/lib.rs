@@ -29,6 +29,10 @@ pub(crate) mod onnx_export;
 mod py;
 mod serialization;
 mod serving;
+// dead_code: the PyO3 surface that registers these classes and calls
+// predict_raw lands in #71's follow-up PR (theme B); remove the allow there.
+#[allow(dead_code)]
+mod transform;
 pub mod tuning;
 mod weighting;
 
