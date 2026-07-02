@@ -23,6 +23,23 @@
 //! handful of latent clusters; each synthetic user draws its positives
 //! predominantly from one cluster), train a real Two-Tower, and bench against
 //! the trained item embeddings — which acquire genuine neighborhood structure.
+//!
+//! ## Scale runs (issue #82)
+//!
+//! The bench is parameterized via env vars so CI Linux can run it at the
+//! scale where ANN earns its keep (default values keep the local run fast):
+//!
+//! - `ANN_BENCH_N_ITEMS` (default 3000)
+//! - `ANN_BENCH_DIM`     (default 64; must be a multiple of 8 — turbovec)
+//! - `ANN_BENCH_K`       (default 10)
+//! - `ANN_BENCH_MODE`    (`trained` | `synthetic`, default `trained`)
+//!
+//! `synthetic` skips Two-Tower training and synthesizes clustered unit
+//! vectors directly. Training at 100k–1M items is impractical on hosted CI
+//! (burn-ndarray CPU); the recall *decision* was made on real trained
+//! embeddings at 3000 items (#76), and at scale the latency/memory ratios
+//! this follow-up measures are properties of catalog size and geometry, which
+//! synthesized clusters preserve.
 
 use crate::ann::exact::{exact_top_k, recall_at_k};
 use crate::ann::turbovec_backend::TurbovecBackend;
@@ -118,6 +135,75 @@ fn clustered_triples(
     }
 }
 
+/// Synthesize clustered L2-normalized embeddings directly (no training):
+/// `n_clusters` random unit centers; each item is its cluster's center plus
+/// small uniform jitter, re-normalized. Preserves the neighborhood structure
+/// ANN recall depends on, at scales where training is impractical (#82).
+fn synthetic_clustered_embeddings(
+    n_items: usize,
+    n_clusters: usize,
+    dim: usize,
+    seed: u64,
+) -> Vec<Vec<f32>> {
+    let mut rng = Lcg::new(seed);
+    // Uniform in [-1, 1).
+    let unit = |rng: &mut Lcg| (rng.next_u64() >> 40) as f32 / (1u64 << 23) as f32 - 1.0;
+    let normalize = |v: &mut Vec<f32>| {
+        let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-12);
+        v.iter_mut().for_each(|x| *x /= norm);
+    };
+    let centers: Vec<Vec<f32>> = (0..n_clusters)
+        .map(|_| {
+            let mut c: Vec<f32> = (0..dim).map(|_| unit(&mut rng)).collect();
+            normalize(&mut c);
+            c
+        })
+        .collect();
+    (0..n_items)
+        .map(|i| {
+            let center = &centers[i % n_clusters];
+            // Jitter magnitude 0.15 keeps clusters tight but overlapping enough
+            // that top-K neighborhoods aren't trivially disjoint blocks.
+            let mut v: Vec<f32> = center.iter().map(|&c| c + 0.15 * unit(&mut rng)).collect();
+            normalize(&mut v);
+            v
+        })
+        .collect()
+}
+
+/// Resident-set size in bytes via `/proc/self/statm` (Linux only). `None`
+/// where /proc doesn't exist (macOS) — callers print "n/a".
+fn resident_bytes() -> Option<usize> {
+    let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
+    let resident_pages: usize = statm.split_whitespace().nth(1)?.parse().ok()?;
+    Some(resident_pages * 4096)
+}
+
+/// Build a backend and measure the RSS delta across the build. The delta is
+/// approximate (allocator caching, other test threads) but resolves the
+/// measured-usearch vs analytic-turbovec asymmetry from the Phase 2 run.
+fn build_with_rss<B: AnnBackend>(items: &[Vec<f32>]) -> (B, Option<usize>, f64) {
+    let before = resident_bytes();
+    let start = std::time::Instant::now();
+    let backend = B::build(items);
+    let build_secs = start.elapsed().as_secs_f64();
+    let delta = match (before, resident_bytes()) {
+        (Some(b), Some(a)) => Some(a.saturating_sub(b)),
+        _ => None,
+    };
+    (backend, delta, build_secs)
+}
+
+fn env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .map(|v| {
+            v.parse()
+                .unwrap_or_else(|_| panic!("{name} must be a positive integer, got {v:?}"))
+        })
+        .unwrap_or(default)
+}
+
 /// Average recall@k of `backend` against exact ground truth over the query set.
 /// For each query item `qi`, ground truth is the exact top-k *excluding qi*,
 /// and the backend is asked for top-k *also excluding qi*, so the two are
@@ -135,133 +221,173 @@ fn mean_recall<B: AnnBackend>(backend: &B, items: &[Vec<f32>], queries: &[usize]
     total / queries.len() as f32
 }
 
-/// Median wall-clock of a single `backend.search(q, k, &[qi])` over the query
-/// set, in microseconds. Median (not mean) so a one-off allocation hiccup
-/// doesn't dominate.
-fn median_latency_us<B: AnnBackend>(
+/// Sorted per-query wall-clock of `backend.search(q, k, &[qi])` over the
+/// query set, in microseconds. Percentiles (p50/p99) are read off the sorted
+/// vec so a one-off allocation hiccup doesn't dominate the headline number.
+fn latencies_us<B: AnnBackend>(
     backend: &B,
     items: &[Vec<f32>],
     queries: &[usize],
     k: usize,
-) -> f64 {
+) -> Vec<f64> {
     let mut times_us: Vec<f64> = Vec::with_capacity(queries.len());
     for &qi in queries {
         let start = std::time::Instant::now();
         let _ = backend.search(&items[qi], k, &[qi]);
         times_us.push(start.elapsed().as_secs_f64() * 1e6);
     }
-    if times_us.is_empty() {
+    times_us.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    times_us
+}
+
+/// Nearest-rank percentile of an already-sorted sample (`p` in [0,100]).
+fn percentile(sorted: &[f64], p: f64) -> f64 {
+    if sorted.is_empty() {
         return 0.0;
     }
-    times_us.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let mid = times_us.len() / 2;
-    if times_us.len() % 2 == 1 {
-        times_us[mid]
-    } else {
-        (times_us[mid - 1] + times_us[mid]) / 2.0
+    let rank = ((p / 100.0) * (sorted.len() as f64 - 1.0)).round() as usize;
+    sorted[rank.min(sorted.len() - 1)]
+}
+
+/// Per-backend measurements for one bench run.
+struct BenchRow {
+    name: &'static str,
+    recall: f32,
+    p50_us: f64,
+    p99_us: f64,
+    index_bytes: usize,
+    rss_delta: Option<usize>,
+    build_secs: f64,
+}
+
+fn bench_backend<B: AnnBackend>(
+    name: &'static str,
+    items: &[Vec<f32>],
+    queries: &[usize],
+    k: usize,
+) -> BenchRow {
+    let (backend, rss_delta, build_secs) = build_with_rss::<B>(items);
+    let recall = mean_recall(&backend, items, queries, k);
+    let lats = latencies_us(&backend, items, queries, k);
+    BenchRow {
+        name,
+        recall,
+        p50_us: percentile(&lats, 50.0),
+        p99_us: percentile(&lats, 99.0),
+        index_bytes: backend.index_bytes(),
+        rss_delta,
+        build_secs,
     }
 }
 
 #[test]
-#[ignore = "slow bench-off (trains a Two-Tower); run with --ignored --nocapture"]
+#[ignore = "slow bench-off; run with --ignored --nocapture (env: ANN_BENCH_N_ITEMS/DIM/K/MODE)"]
 fn ann_backend_comparison() {
-    const N_ITEMS: usize = 3000;
+    let n_items = env_usize("ANN_BENCH_N_ITEMS", 3000);
+    let dim = env_usize("ANN_BENCH_DIM", 64);
+    let k = env_usize("ANN_BENCH_K", 10);
+    let mode = std::env::var("ANN_BENCH_MODE").unwrap_or_else(|_| "trained".into());
+    assert!(
+        dim % 8 == 0,
+        "ANN_BENCH_DIM must be a multiple of 8 (turbovec invariant)"
+    );
+
     const N_CLUSTERS: usize = 12;
     const N_USERS: usize = 4000;
     const POS_PER_USER: usize = 12;
-    const DIM: usize = 64; // must be a multiple of 8 (turbovec invariant).
-    const K: usize = 10;
     const SEED: u64 = 0xA11CE;
 
-    // 1) Synthetic clustered interactions + empty feature tables.
-    let data = clustered_triples(N_ITEMS, N_CLUSTERS, N_USERS, POS_PER_USER, SEED);
-    let uft = FeatureTable::empty(data.num_users());
-    let ift = FeatureTable::empty(data.num_items());
+    // 1) Item embeddings: real trained Two-Tower (the decision-grade path, #76)
+    //    or directly-synthesized clusters (the scale path, #82 — training at
+    //    100k+ items is impractical on hosted CI).
+    let items: Vec<Vec<f32>> = match mode.as_str() {
+        "trained" => {
+            let data = clustered_triples(n_items, N_CLUSTERS, N_USERS, POS_PER_USER, SEED);
+            let uft = FeatureTable::empty(data.num_users());
+            let ift = FeatureTable::empty(data.num_items());
+            let model = train(
+                &data,
+                &uft,
+                &ift,
+                TrainParams {
+                    embedding_dim: dim,
+                    epochs: 15,
+                    ..Default::default()
+                },
+            )
+            .expect("train");
+            model.item_embeddings()
+        }
+        "synthetic" => synthetic_clustered_embeddings(n_items, N_CLUSTERS, dim, SEED),
+        other => panic!("ANN_BENCH_MODE must be 'trained' or 'synthetic', got {other:?}"),
+    };
+    assert_eq!(items.len(), n_items);
+    assert!(items.iter().all(|r| r.len() == dim));
 
-    // 2) Train a real Two-Tower. embedding_dim=64 (mult. of 8); modest epochs
-    //    so the bench finishes in a couple of minutes in release.
-    let model = train(
-        &data,
-        &uft,
-        &ift,
-        TrainParams {
-            embedding_dim: DIM,
-            epochs: 15,
-            ..Default::default()
-        },
-    )
-    .expect("train");
-
-    // 3) Real L2-normalized item embeddings, shape (num_items, DIM).
-    let items = model.item_embeddings();
-    assert_eq!(items.len(), data.num_items());
-    assert!(items.iter().all(|r| r.len() == DIM));
-
-    // 4) Query set: ~100 items sampled evenly across the catalog.
+    // 2) Query set: ~100 items sampled evenly across the catalog.
     let stride = (items.len() / 100).max(1);
     let queries: Vec<usize> = (0..items.len()).step_by(stride).collect();
 
-    // 5) Build each backend and measure recall@K, median latency, footprint.
-    let exact_be = ExactBackend::build(&items);
-    let usearch_be = UsearchBackend::build(&items);
-    let turbovec_be = TurbovecBackend::build(&items);
+    // 3) Build + measure each backend (build RSS delta, recall@K, p50/p99).
+    let rows = [
+        bench_backend::<ExactBackend>("exact", &items, &queries, k),
+        bench_backend::<UsearchBackend>("usearch", &items, &queries, k),
+        bench_backend::<TurbovecBackend>("turbovec", &items, &queries, k),
+    ];
 
-    let exact_recall = mean_recall(&exact_be, &items, &queries, K);
-    let usearch_recall = mean_recall(&usearch_be, &items, &queries, K);
-    let turbovec_recall = mean_recall(&turbovec_be, &items, &queries, K);
-
-    let exact_lat = median_latency_us(&exact_be, &items, &queries, K);
-    let usearch_lat = median_latency_us(&usearch_be, &items, &queries, K);
-    let turbovec_lat = median_latency_us(&turbovec_be, &items, &queries, K);
-
-    let exact_bytes = exact_be.index_bytes();
-    let usearch_bytes = usearch_be.index_bytes();
-    let turbovec_bytes = turbovec_be.index_bytes();
-
+    // 4) Print the decision table (visible under --nocapture).
     let mb = |b: usize| b as f64 / (1024.0 * 1024.0);
-
-    // 6) Print the decision table (visible under --nocapture).
     eprintln!();
     eprintln!(
-        "ANN backend bench-off (ADR-0004 Phase 2): N_ITEMS={N_ITEMS}, dim={DIM}, K={K}, \
-         clusters={N_CLUSTERS}, queries={}",
+        "ANN backend bench-off (ADR-0004 Phase 2 / #82): N_ITEMS={n_items}, dim={dim}, K={k}, \
+         mode={mode}, clusters={N_CLUSTERS}, queries={}",
         queries.len()
     );
     eprintln!(
-        "{:<10} | {:>9} | {:>14} | {:>14} | {:>10}",
-        "backend", "recall@10", "median lat (us)", "index_bytes", "index (MB)"
+        "{:<10} | {:>9} | {:>10} | {:>10} | {:>12} | {:>12} | {:>9}",
+        "backend", "recall@K", "p50 (us)", "p99 (us)", "index (MB)", "RSS Δ (MB)", "build (s)"
     );
     eprintln!(
-        "{:-<10}-+-{:-<9}-+-{:-<14}-+-{:-<14}-+-{:-<10}",
-        "", "", "", "", ""
+        "{:-<10}-+-{:-<9}-+-{:-<10}-+-{:-<10}-+-{:-<12}-+-{:-<12}-+-{:-<9}",
+        "", "", "", "", "", "", ""
     );
-    let row = |name: &str, recall: f32, lat: f64, bytes: usize| {
+    for r in &rows {
+        let rss = r
+            .rss_delta
+            .map(|b| format!("{:.3}", mb(b)))
+            .unwrap_or_else(|| "n/a".into());
         eprintln!(
-            "{name:<10} | {recall:>9.4} | {lat:>14.2} | {bytes:>14} | {:>10.3}",
-            mb(bytes)
+            "{:<10} | {:>9.4} | {:>10.2} | {:>10.2} | {:>12.3} | {:>12} | {:>9.2}",
+            r.name,
+            r.recall,
+            r.p50_us,
+            r.p99_us,
+            mb(r.index_bytes),
+            rss,
+            r.build_secs
         );
-    };
-    row("exact", exact_recall, exact_lat, exact_bytes);
-    row("usearch", usearch_recall, usearch_lat, usearch_bytes);
-    row("turbovec", turbovec_recall, turbovec_lat, turbovec_bytes);
+    }
     eprintln!();
     eprintln!(
-        "note: usearch index_bytes = measured resident HNSW footprint (memory_usage()); \
-         turbovec = analytic packed-code estimate (len*dim*bits/8 + scales). Not directly comparable."
+        "note: index (MB) = backend-reported index_bytes (usearch: measured memory_usage(); \
+         turbovec: analytic packed-code estimate). RSS Δ = resident-set delta measured across \
+         the index build (/proc/self/statm; Linux only) — the apples-to-apples column."
     );
     eprintln!();
 
-    // 7) Real assertions (not just prints).
+    // 5) Real assertions (not just prints).
     // Exact backend is the recall==1.0 control.
+    let exact_recall = rows[0].recall;
     assert!(
         (exact_recall - 1.0).abs() < 1e-6,
         "ExactBackend recall must be 1.0, got {exact_recall}"
     );
     // usearch on structured embeddings should clear 0.80 easily. This is a real
     // floor: if it misses, that's a finding worth surfacing, not a knob to lower.
+    let usearch_recall = rows[1].recall;
     assert!(
         usearch_recall >= 0.80,
-        "UsearchBackend recall@{K} below floor: {usearch_recall} < 0.80"
+        "UsearchBackend recall@{k} below floor: {usearch_recall} < 0.80"
     );
     // No turbovec floor: quantization may legitimately trade recall — reported,
     // not asserted.
