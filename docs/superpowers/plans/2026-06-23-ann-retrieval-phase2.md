@@ -1,6 +1,6 @@
 # ANN Retrieval Backend Bench-Off Implementation Plan (ADR-0004 Phase 2)
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **Status:** Executed and complete (PR #79); progress was tracked in issue #76, per the repo's work-tracking policy. This file is the historical design record — see the revision note below for where the final shape diverged.
 
 **Goal:** Bench usearch and TurboVec against the exact top-K baseline on real Two-Tower embeddings, behind a default-off `ann` Cargo feature, to choose the `RetrievalIndex` backend per ADR-0004 — without changing default builds, eval, or EASE.
 
@@ -37,7 +37,7 @@
 **Files:**
 - Modify: `Cargo.toml`
 
-- [ ] **Step 1: Add the feature and optional deps**
+**Step 1: Add the feature and optional deps**
 
 In `[features]` add:
 ```toml
@@ -52,17 +52,17 @@ usearch = { version = "2.25", optional = true }
 turbovec = { version = "0.9", optional = true }
 ```
 
-- [ ] **Step 2: Verify default build is unchanged**
+**Step 2: Verify default build is unchanged**
 
 Run: `cargo build`
 Expected: PASS, and `cargo tree -e features | grep -E "usearch|turbovec"` prints nothing (not in the default graph).
 
-- [ ] **Step 3: Verify the feature resolves**
+**Step 3: Verify the feature resolves**
 
 Run: `cargo build --features ann`
 Expected: PASS (downloads + compiles usearch and turbovec).
 
-- [ ] **Step 4: Commit**
+**Step 4: Commit**
 
 ```bash
 git add Cargo.toml Cargo.lock
@@ -80,7 +80,7 @@ Resolves the #76 tech debt: bench utilities become unit-tested library code.
 - Create: `src/ann/exact.rs`
 - Modify: `src/lib.rs` (add `mod ann;` behind the feature)
 
-- [ ] **Step 1: Register the module**
+**Step 1: Register the module**
 
 In `src/lib.rs`, alongside the other `mod` declarations:
 ```rust
@@ -88,7 +88,7 @@ In `src/lib.rs`, alongside the other `mod` declarations:
 mod ann;
 ```
 
-- [ ] **Step 2: Write `src/ann/mod.rs` with the failing-test wiring**
+**Step 2: Write `src/ann/mod.rs` with the failing-test wiring**
 
 ```rust
 //! Approximate-nearest-neighbor retrieval backends (ADR-0004 Phase 2).
@@ -96,7 +96,7 @@ mod ann;
 pub mod exact;
 ```
 
-- [ ] **Step 3: Write the failing tests in `src/ann/exact.rs`**
+**Step 3: Write the failing tests in `src/ann/exact.rs`**
 
 ```rust
 //! Exact maximum-inner-product top-K and the recall@K metric — the ground
@@ -150,12 +150,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 4: Run the tests, verify they fail**
+**Step 4: Run the tests, verify they fail**
 
 Run: `cargo test --features ann --lib ann::exact`
 Expected: FAIL with `not implemented` panics.
 
-- [ ] **Step 5: Implement to pass**
+**Step 5: Implement to pass**
 
 Replace the two `unimplemented!()` bodies:
 ```rust
@@ -192,12 +192,12 @@ pub fn recall_at_k(approx: &[(usize, f32)], exact: &[(usize, f32)]) -> f32 {
 }
 ```
 
-- [ ] **Step 6: Run tests, verify pass**
+**Step 6: Run tests, verify pass**
 
 Run: `cargo test --features ann --lib ann::exact`
 Expected: PASS (4 tests).
 
-- [ ] **Step 7: Commit**
+**Step 7: Commit**
 
 ```bash
 git add src/lib.rs src/ann/mod.rs src/ann/exact.rs
@@ -211,7 +211,7 @@ git commit -m "feat(ann): exact MIPS baseline + recall metric as tested library 
 **Files:**
 - Modify: `src/ann/mod.rs`
 
-- [ ] **Step 1: Write the trait + a failing contract test**
+**Step 1: Write the trait + a failing contract test**
 
 Append to `src/ann/mod.rs`:
 ```rust
@@ -268,12 +268,12 @@ mod backend_tests {
 }
 ```
 
-- [ ] **Step 2: Run, verify pass** (trait + impl are concrete, no RED needed beyond compile)
+**Step 2: Run, verify pass** (trait + impl are concrete, no RED needed beyond compile)
 
 Run: `cargo test --features ann --lib ann::backend_tests`
 Expected: PASS.
 
-- [ ] **Step 3: Commit**
+**Step 3: Commit**
 
 ```bash
 git add src/ann/mod.rs
@@ -288,11 +288,11 @@ git commit -m "feat(ann): AnnBackend trait + ExactBackend reference impl"
 - Create: `src/ann/usearch_backend.rs`
 - Modify: `src/ann/mod.rs` (`pub mod usearch_backend;`)
 
-- [ ] **Step 1: Confirm the usearch Rust API**
+**Step 1: Confirm the usearch Rust API**
 
 Read https://docs.rs/usearch/2.25 — confirm `usearch::{Index, IndexOptions, MetricKind, ScalarKind}`, `Index::new(&options)`, `index.reserve(n)`, `index.add(key, &vec)`, `index.search(&query, k) -> Matches { keys, distances }`. Note: usearch keys are `u64`; we use the item index as the key. Inner-product metric = `MetricKind::IP`.
 
-- [ ] **Step 2: Write the failing test**
+**Step 2: Write the failing test**
 
 `src/ann/usearch_backend.rs`:
 ```rust
@@ -341,12 +341,12 @@ mod tests {
 ```
 (Simplify `clustered` to drop the `c_unused` scaffolding when implementing — shown only to keep the test self-contained.)
 
-- [ ] **Step 3: Run, verify it fails**
+**Step 3: Run, verify it fails**
 
 Run: `cargo test --features ann --lib ann::usearch_backend`
 Expected: FAIL (`not implemented`).
 
-- [ ] **Step 4: Implement against the confirmed API**
+**Step 4: Implement against the confirmed API**
 
 ```rust
 fn build(items: &[Vec<f32>]) -> Self {
@@ -382,12 +382,12 @@ fn index_bytes(&self) -> usize {
 ```
 Note: usearch IP returns *similarity-like* distances; confirm sign/order against docs.rs and flip if the bench's recall against `exact_top_k` (which sorts by descending dot) comes out near zero.
 
-- [ ] **Step 5: Run, verify pass**
+**Step 5: Run, verify pass**
 
 Run: `cargo test --features ann --lib ann::usearch_backend`
 Expected: PASS.
 
-- [ ] **Step 6: Commit**
+**Step 6: Commit**
 
 ```bash
 git add src/ann/mod.rs src/ann/usearch_backend.rs
@@ -402,11 +402,11 @@ git commit -m "feat(ann): usearch AnnBackend impl (IP metric)"
 - Create: `src/ann/turbovec_backend.rs`
 - Modify: `src/ann/mod.rs` (`pub mod turbovec_backend;`)
 
-- [ ] **Step 1: Confirm the turbovec Rust API**
+**Step 1: Confirm the turbovec Rust API**
 
 Read https://docs.rs/turbovec/0.9 — confirm the index type, constructor, and `add` / `add_with_ids` / `search(query, k, allowlist)` signatures (the README advertises these; the exact Rust types must be read from docs.rs, as 0.9 is pre-1.0). Map `allowlist` onto the exclude set (invert: allowlist = all ids minus excluded), or post-filter if an allowlist isn't ergonomic. Record the actual signatures in a top-of-file comment.
 
-- [ ] **Step 2: Write the failing test**
+**Step 2: Write the failing test**
 
 Mirror Task 4's structure exactly (`recovers_exact_top1_on_clustered_data`), with `TurbovecBackend` and `unimplemented!()` bodies. Note: TurboVec quantizes (2/4-bit), so on clustered data assert top-1 recovery but allow that recall@K at large K may be < 1.0 — the test asserts only top-1 cluster recovery, which quantization should preserve on well-separated clusters.
 
@@ -421,21 +421,21 @@ fn recovers_exact_top1_on_clustered_data() {
 }
 ```
 
-- [ ] **Step 3: Run, verify it fails**
+**Step 3: Run, verify it fails**
 
 Run: `cargo test --features ann --lib ann::turbovec_backend`
 Expected: FAIL.
 
-- [ ] **Step 4: Implement against the confirmed API**
+**Step 4: Implement against the confirmed API**
 
 Fill `build` / `search` / `index_bytes` using the signatures recorded in Step 1. `index_bytes` is turbovec's headline axis — use its reported quantized footprint if exposed, else estimate from `num_items * dim * bits / 8`.
 
-- [ ] **Step 5: Run, verify pass**
+**Step 5: Run, verify pass**
 
 Run: `cargo test --features ann --lib ann::turbovec_backend`
 Expected: PASS. If quantization drops even top-1 on this easy data, lower the quantization (4-bit) and record it; if still failing, flag turbovec as not meeting the recall bar and note in #76.
 
-- [ ] **Step 6: Commit**
+**Step 6: Commit**
 
 ```bash
 git add src/ann/mod.rs src/ann/turbovec_backend.rs
@@ -451,7 +451,7 @@ git commit -m "feat(ann): turbovec AnnBackend impl (quantized)"
 **Files:**
 - Modify: `src/models/two_tower.rs`
 
-- [ ] **Step 1: Write the failing test**
+**Step 1: Write the failing test**
 
 In the `#[cfg(test)] mod tests` of `src/models/two_tower.rs`, add:
 ```rust
@@ -465,12 +465,12 @@ fn item_embeddings_shape_matches_catalog() {
 }
 ```
 
-- [ ] **Step 2: Run, verify it fails**
+**Step 2: Run, verify it fails**
 
 Run: `cargo test --features ml-models --lib two_tower::tests::item_embeddings_shape_matches_catalog`
 Expected: FAIL (`no method named item_embeddings`).
 
-- [ ] **Step 3: Implement the accessor**
+**Step 3: Implement the accessor**
 
 On `impl TrainedTwoTower` (near `predict_similar_items`, which already reads `self.item_matrix`):
 ```rust
@@ -484,12 +484,12 @@ pub fn item_embeddings(&self) -> Vec<Vec<f32>> {
 ```
 (Confirm the `into_data().to_vec()` form against the existing extraction at `two_tower.rs:964-969`, which already pulls rows out of `item_matrix`; match that idiom exactly.)
 
-- [ ] **Step 4: Run, verify pass**
+**Step 4: Run, verify pass**
 
 Run: `cargo test --features ml-models --lib two_tower::tests::item_embeddings_shape_matches_catalog`
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+**Step 5: Commit**
 
 ```bash
 git add src/models/two_tower.rs
@@ -503,7 +503,7 @@ git commit -m "feat(two-tower): public item_embeddings() accessor for ANN export
 **Files:**
 - Create: `src/bin/export_tt_embeddings.rs`
 
-- [ ] **Step 1: Write the exporter**
+**Step 1: Write the exporter**
 
 ```rust
 //! Train a small Two-Tower on synthetic interactions and dump its item
@@ -537,16 +537,16 @@ fn main() {
 }
 ```
 
-- [ ] **Step 2: Add `train_synthetic` helper behind `ml-models`**
+**Step 2: Add `train_synthetic` helper behind `ml-models`**
 
 Create `src/ann_export.rs` (gated `#[cfg(feature = "ml-models")]`, declared in `lib.rs`) with `pub fn train_synthetic(n_items: usize, dim: usize) -> crate::models::two_tower::TrainedTwoTower`. It builds `TripleData` with `n_items` items and a few thousand synthetic users whose positives are drawn from a handful of latent clusters (so item embeddings acquire structure), `FeatureTable::empty(..)` for both sides, and calls `two_tower::train(.., TrainParams { embedding_dim: dim, epochs: 20, ..Default::default() })`. Confirm `TripleData` / `FeatureTable` constructors against `src/data/triples.rs`.
 
-- [ ] **Step 3: Build + run on a small size, verify output**
+**Step 3: Build + run on a small size, verify output**
 
 Run: `cargo run --release --features ml-models --bin export_tt_embeddings -- /tmp/tt.f32 2000 32`
 Expected: stderr `wrote 2000 items x 32 dim`, and `/tmp/tt.f32` is `8 + 2000*32*4` bytes.
 
-- [ ] **Step 4: Commit**
+**Step 4: Commit**
 
 ```bash
 git add src/bin/export_tt_embeddings.rs src/ann_export.rs src/lib.rs
@@ -560,11 +560,11 @@ git commit -m "feat(ann): Two-Tower embedding exporter for the recall decision r
 **Files:**
 - Modify: `benches/ann_retrieval.rs`
 
-- [ ] **Step 1: Replace the bench's local `exact_top_k`/`recall_at_k` with the library ones**
+**Step 1: Replace the bench's local `exact_top_k`/`recall_at_k` with the library ones**
 
 The bench is `harness = false`; it can `use rust_fease_recommender::ann::{...}` only when built with `--features ann`. Gate the bench body so `cargo bench --features ann` exercises the backends and `cargo bench` (no feature) still runs the synthetic exact baseline using a local fallback. Delete the now-duplicated local `exact_top_k`/`recall_at_k` definitions (dedupe — resolves the second #76 debt item) under the `ann` path.
 
-- [ ] **Step 2: Add an embedding loader**
+**Step 2: Add an embedding loader**
 
 ```rust
 fn load_embeddings(path: &str) -> Vec<Vec<f32>> {
@@ -579,7 +579,7 @@ fn load_embeddings(path: &str) -> Vec<Vec<f32>> {
 ```
 Embeddings come from `$ANN_EMB` env var if set (real export), else `gen_embeddings` (synthetic).
 
-- [ ] **Step 3: Bench each backend + print recall**
+**Step 3: Bench each backend + print recall**
 
 For each backend (`ExactBackend`, `UsearchBackend`, `TurbovecBackend`), under `#[cfg(feature = "ann")]`:
 ```rust
@@ -593,12 +593,12 @@ let exact = exact_top_k(&query, &items, TOP_K);
 eprintln!("recall@{TOP_K} usearch n={n}: {:.4}  index_bytes={}", recall_at_k(&approx, &exact), be.index_bytes());
 ```
 
-- [ ] **Step 4: Run synthetic (wiring check)**
+**Step 4: Run synthetic (wiring check)**
 
 Run: `cargo bench --features ann --bench ann_retrieval -- --sample-size 10`
 Expected: latencies for exact/usearch/turbovec; recall lines printed. (Synthetic recall is expected low — that's the documented limitation.)
 
-- [ ] **Step 5: Run real (decision)**
+**Step 5: Run real (decision)**
 
 Run:
 ```bash
@@ -607,7 +607,7 @@ ANN_EMB=/tmp/tt.f32 cargo bench --features ann --bench ann_retrieval
 ```
 Expected: recall@20 for usearch and turbovec on real geometry + latency + index_bytes.
 
-- [ ] **Step 6: Commit**
+**Step 6: Commit**
 
 ```bash
 git add benches/ann_retrieval.rs
@@ -621,9 +621,9 @@ git commit -m "bench(ann): wire usearch + turbovec backends and real-embedding l
 **Files:**
 - Modify: `benches/README.md` (results table)
 
-- [ ] **Step 1: Fill the results table** in `benches/README.md` with measured recall@20 / p50 / p99 / index_bytes for usearch and turbovec at 100k + 1M on the real embeddings.
-- [ ] **Step 2: Post the decision** as a comment on #76: which backend wins on the agreed criteria (recall floor first, then latency, then memory), and whether turbovec's memory win justifies its recall cost.
-- [ ] **Step 3: Commit + mark PR #79 ready for review** (un-draft) once the decision is recorded.
+**Step 1: Fill the results table** in `benches/README.md` with measured recall@20 / p50 / p99 / index_bytes for usearch and turbovec at 100k + 1M on the real embeddings.
+**Step 2: Post the decision** as a comment on #76: which backend wins on the agreed criteria (recall floor first, then latency, then memory), and whether turbovec's memory win justifies its recall cost.
+**Step 3: Commit + mark PR #79 ready for review** (un-draft) once the decision is recorded.
 
 ```bash
 git add benches/README.md
