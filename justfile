@@ -2,9 +2,12 @@
 # Run `just` to list recipes.
 
 # Override per-machine: `JUST_PYTHON=python3.12 just test`
+# pytest runs as `python -m pytest` (not the .venv/bin/pytest console script):
+# the script bakes an absolute-path shebang at install time, so it breaks if the
+# repo dir is renamed/moved. Invoking via the python binary is rename-immune.
 python  := env_var_or_default("JUST_PYTHON",  ".venv/bin/python")
 maturin := env_var_or_default("JUST_MATURIN", ".venv/bin/maturin")
-pytest  := env_var_or_default("JUST_PYTEST",  ".venv/bin/pytest")
+pytest  := env_var_or_default("JUST_PYTEST",  python + " -m pytest")
 
 _default:
     @just --list
