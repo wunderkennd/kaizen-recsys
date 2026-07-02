@@ -1927,21 +1927,25 @@ mod two_tower_py {
                 (Vec::new(), Vec::new())
             };
 
-            let scores = self
-                .model
-                .predict_scores(ModelInput::TowerUser {
+            // Same routing as the registry serving path: through the ANN
+            // index when one is attached (enable_ann_retrieval), dense
+            // full-catalog scoring otherwise — so enabling ANN on the
+            // model accelerates this method too, not just registry serving.
+            let ranked = crate::serving::retrieve_or_dense(
+                &self.model,
+                ModelInput::TowerUser {
                     user_idx,
                     cat_features: &cat_features,
                     dense_features: &dense_features,
-                })
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
-
-            let mut ranked: Vec<(usize, f32)> = scores.into_iter().enumerate().collect();
-            ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                },
+                &[],
+                top_k,
+            )
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
 
             let out = PyList::empty(py);
             let map = self.model.item_mapping();
-            for (idx, score) in ranked.into_iter().take(top_k) {
+            for (idx, score) in ranked {
                 if let Some(guid) = map.idx_to_item.get(idx) {
                     out.append((PyString::new(py, guid), PyFloat::new(py, score as f64)))?;
                 }
