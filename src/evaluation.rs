@@ -1028,6 +1028,7 @@ mod tests {
             meta_weight: 0.0,
             mappings: regression_mappings(),
             weighting_config: None,
+            transformation_schema: None,
         }
     }
 

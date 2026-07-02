@@ -67,6 +67,7 @@ mod tests {
             meta_weight: 0.0,
             mappings: dummy_mappings(),
             weighting_config: None,
+            transformation_schema: None,
         };
 
         let (bytes, rows, cols) = s_items_row_major_le_bytes(&model);
