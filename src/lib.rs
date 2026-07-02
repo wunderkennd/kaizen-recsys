@@ -1853,6 +1853,28 @@ mod two_tower_py {
 
     #[pymethods]
     impl TwoTowerModel {
+        /// Attach an ANN index over the item embeddings so top-K retrieval
+        /// is sublinear instead of a full-catalog score (ADR-0004, #83).
+        ///
+        /// Only available when the extension is built with the `ann` Cargo
+        /// feature. Backends: "turbovec" (default per the #76 bench-off),
+        /// "usearch" (exact-recall alternative), "exact" (control).
+        /// Rebuild after every train/load; the index is not persisted (#77).
+        #[cfg(feature = "ann")]
+        #[pyo3(signature = (backend="turbovec"))]
+        fn enable_ann_retrieval(&mut self, backend: &str) -> PyResult<()> {
+            self.model
+                .enable_ann_retrieval(backend)
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))
+        }
+
+        /// Whether an ANN index is currently attached (`ann` feature only).
+        #[cfg(feature = "ann")]
+        #[getter]
+        fn ann_enabled(&self) -> bool {
+            self.model.ann_enabled()
+        }
+
         /// Score recommendations for `user_id`.
         ///
         /// Warm users (id seen in training) use their learned id-row

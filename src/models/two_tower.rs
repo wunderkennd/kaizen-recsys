@@ -408,6 +408,14 @@ pub struct TrainedTwoTower {
     mappings: Mappings,
     item_matrix: Tensor<InfB, 2>,
     device: Dev,
+    /// Optional ANN index over `item_matrix` rows (ADR-0004 / #83). Built
+    /// on demand via [`enable_ann_retrieval`]; never persisted (rebuilt
+    /// after load — persistence is Phase 3, #77). `Arc` keeps the struct
+    /// `Clone` for the registry path; the built index is immutable.
+    ///
+    /// [`enable_ann_retrieval`]: TrainedTwoTower::enable_ann_retrieval
+    #[cfg(feature = "ann")]
+    ann_index: Option<std::sync::Arc<dyn crate::ann::AnnBackend + Send + Sync>>,
 }
 
 /// Pad a batch's per-row categorical lists to a common width, returning
@@ -716,6 +724,8 @@ fn finalize(
         mappings: build_mappings(data),
         item_matrix,
         device: *device,
+        #[cfg(feature = "ann")]
+        ann_index: None,
     })
 }
 
@@ -880,6 +890,8 @@ impl TrainedTwoTower {
             mappings,
             item_matrix,
             device,
+            #[cfg(feature = "ann")]
+            ann_index: None,
         })
     }
 
@@ -890,6 +902,19 @@ impl TrainedTwoTower {
         cat_features: &[usize],
         dense_features: &[f32],
     ) -> Result<Vec<f32>> {
+        let user_vec = self.user_vec_tensor(user_idx, cat_features, dense_features);
+        Ok(self.model.score_all(user_vec, self.item_matrix.clone()))
+    }
+
+    /// Embed a user-side input into a `[1, dim]` L2-normalized tower output.
+    /// Shared by the dense scoring path (`score_user`) and the ANN retrieval
+    /// path (`RetrievalIndex::retrieve`), so both embed identically.
+    fn user_vec_tensor(
+        &self,
+        user_idx: Option<usize>,
+        cat_features: &[usize],
+        dense_features: &[f32],
+    ) -> Tensor<InfB, 2> {
         type B = InfB;
         let dev = &self.device;
 
@@ -913,15 +938,13 @@ impl TrainedTwoTower {
             v
         };
 
-        let user_vec = self.model.user_tower.forward(
+        self.model.user_tower.forward(
             Tensor::<B, 1, Int>::from_data(TensorData::new(vec![id], [1]), dev),
             Tensor::<B, 2, Int>::from_data(TensorData::new(cat_ids, [1, w]), dev),
             Tensor::<B, 2>::from_data(TensorData::new(cat_mask, [1, w]), dev),
             Tensor::<B, 2>::from_data(TensorData::new(dense, [1, d.max(1)]), dev),
             id_scale,
-        );
-
-        Ok(self.model.score_all(user_vec, self.item_matrix.clone()))
+        )
     }
 
     /// The full `(num_items, dim)` L2-normalized item-embedding matrix as
@@ -931,6 +954,86 @@ impl TrainedTwoTower {
         let data = self.item_matrix.clone().into_data();
         let flat: Vec<f32> = data.iter::<f32>().collect();
         flat.chunks(dims[1]).map(|c| c.to_vec()).collect()
+    }
+}
+
+#[cfg(feature = "ann")]
+impl TrainedTwoTower {
+    /// Build an ANN index over the catalog item embeddings so serving
+    /// retrieves top-K without scoring the full catalog (ADR-0004, #83).
+    ///
+    /// Opt-in: without this call the dense `predict_scores` +
+    /// `filter_sort_top_k` path is used, unchanged. `backend` is
+    /// `"turbovec"` (default choice per the #76 bench-off: quantized,
+    /// smallest/fastest, approximate recall), `"usearch"` (HNSW,
+    /// exact-recall alternative), or `"exact"` (brute force under the same
+    /// interface — a testing control).
+    ///
+    /// The index is rebuilt from the item matrix after every train/load;
+    /// persisting the built index is ADR-0004 Phase 3 (#77).
+    pub fn enable_ann_retrieval(&mut self, backend: &str) -> Result<()> {
+        use crate::ann::AnnBackend as _;
+
+        let items = self.item_embeddings();
+        let dim = items.first().map(|r| r.len()).unwrap_or(0);
+        let index: std::sync::Arc<dyn crate::ann::AnnBackend + Send + Sync> = match backend {
+            "turbovec" => {
+                if !dim.is_multiple_of(8) {
+                    anyhow::bail!(
+                        "turbovec requires embedding_dim % 8 == 0, got {dim}; \
+                         use the 'usearch' backend or retrain with a \
+                         multiple-of-8 embedding_dim"
+                    );
+                }
+                std::sync::Arc::new(crate::ann::turbovec_backend::TurbovecBackend::build(&items))
+            }
+            "usearch" => {
+                std::sync::Arc::new(crate::ann::usearch_backend::UsearchBackend::build(&items))
+            }
+            "exact" => std::sync::Arc::new(crate::ann::ExactBackend::build(&items)),
+            other => anyhow::bail!(
+                "unknown ANN backend {other:?} (expected 'turbovec', 'usearch', or 'exact')"
+            ),
+        };
+        self.ann_index = Some(index);
+        Ok(())
+    }
+
+    /// Whether an ANN index is currently attached.
+    pub fn ann_enabled(&self) -> bool {
+        self.ann_index.is_some()
+    }
+}
+
+/// ANN-backed sublinear retrieval (ADR-0004). The model computes its own
+/// query embedding from the `TowerUser` input via the same tower forward the
+/// dense path uses, then queries the attached index. Scores are the
+/// backend's similarity (approximate dot product for quantized backends),
+/// not guaranteed byte-identical to `predict_scores` — rank fidelity is
+/// what the #76 bench-off measured.
+#[cfg(feature = "ann")]
+impl crate::models::RetrievalIndex for TrainedTwoTower {
+    fn retrieve(
+        &self,
+        input: ModelInput<'_>,
+        top_k: usize,
+        exclude: &[usize],
+    ) -> Result<Vec<(usize, f32)>> {
+        let index = self.ann_index.as_ref().ok_or_else(|| {
+            anyhow!("retrieve() called without an ANN index; call enable_ann_retrieval first")
+        })?;
+        let ModelInput::TowerUser {
+            user_idx,
+            cat_features,
+            dense_features,
+        } = input
+        else {
+            return Err(anyhow!("Two-Tower retrieval expects ModelInput::TowerUser"));
+        };
+        let t = self.user_vec_tensor(user_idx, cat_features, dense_features);
+        let q: Vec<f32> = t.into_data().iter::<f32>().collect();
+        // Backends handle the exclude set internally (over-fetch + filter).
+        Ok(index.search(&q, top_k, exclude))
     }
 }
 
@@ -945,6 +1048,15 @@ impl RecModel for TrainedTwoTower {
 
     fn item_mapping(&self) -> &Mappings {
         &self.mappings
+    }
+
+    /// Route serving through the ANN index when one is attached
+    /// (`retrieve_or_dense` in serving.rs checks this hook).
+    #[cfg(feature = "ann")]
+    fn retrieval_index(&self) -> Option<&dyn crate::models::RetrievalIndex> {
+        self.ann_index
+            .as_ref()
+            .map(|_| self as &dyn crate::models::RetrievalIndex)
     }
 
     fn predict_scores(&self, input: ModelInput<'_>) -> Result<Vec<f32>> {
@@ -1500,5 +1612,113 @@ mod tests {
         let (cat, dense) = trained.resolve_user_features(&f);
         assert!(cat.is_empty());
         assert_eq!(dense, vec![0.0]);
+    }
+
+    /// ANN retrieval integration (ADR-0004 / #83). Gated on `ann` so the
+    /// plain ml-models CI job is unchanged; the ann CI job runs these as
+    /// the serving-path recall gate.
+    #[cfg(feature = "ann")]
+    mod ann_retrieval {
+        use super::*;
+        use crate::models::RetrievalIndex as _;
+        use crate::serving::filter_sort_top_k;
+
+        fn trained(dim: usize) -> TrainedTwoTower {
+            let (data, uft, ift) = tiny_data();
+            train(
+                &data,
+                &uft,
+                &ift,
+                TrainParams {
+                    embedding_dim: dim,
+                    epochs: 5,
+                    ..Default::default()
+                },
+            )
+            .expect("train")
+        }
+
+        fn tower_input<'a>() -> ModelInput<'a> {
+            ModelInput::TowerUser {
+                user_idx: Some(1),
+                cat_features: &[],
+                dense_features: &[],
+            }
+        }
+
+        #[test]
+        fn exact_backend_matches_dense_path_exactly() {
+            let mut model = trained(8);
+            model.enable_ann_retrieval("exact").expect("enable");
+            assert!(model.ann_enabled());
+
+            let dense_scores = model.predict_scores(tower_input()).expect("dense");
+            let dense_top = filter_sort_top_k(dense_scores, &[], 2);
+            let ann_top = model.retrieve(tower_input(), 2, &[]).expect("retrieve");
+
+            assert_eq!(
+                ann_top.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+                dense_top.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+                "exact ANN backend must reproduce the dense ranking"
+            );
+            for ((_, a), (_, b)) in ann_top.iter().zip(dense_top.iter()) {
+                assert!((a - b).abs() < 1e-5, "score mismatch: {a} vs {b}");
+            }
+        }
+
+        #[test]
+        fn retrieval_respects_exclude() {
+            let mut model = trained(8);
+            model.enable_ann_retrieval("exact").expect("enable");
+            let full = model.retrieve(tower_input(), 1, &[]).expect("retrieve");
+            let excluded = model
+                .retrieve(tower_input(), 1, &[full[0].0])
+                .expect("retrieve");
+            assert_ne!(full[0].0, excluded[0].0);
+        }
+
+        #[test]
+        fn usearch_backend_recovers_dense_top1() {
+            let mut model = trained(8);
+            model.enable_ann_retrieval("usearch").expect("enable");
+            let dense_scores = model.predict_scores(tower_input()).expect("dense");
+            let dense_top = filter_sort_top_k(dense_scores, &[], 1);
+            let ann_top = model.retrieve(tower_input(), 1, &[]).expect("retrieve");
+            assert_eq!(ann_top[0].0, dense_top[0].0);
+        }
+
+        #[test]
+        fn turbovec_rejects_non_multiple_of_8_dim() {
+            let mut model = trained(4);
+            let err = model.enable_ann_retrieval("turbovec").unwrap_err();
+            assert!(err.to_string().contains("multiple-of-8"), "{err}");
+            assert!(!model.ann_enabled());
+        }
+
+        #[test]
+        fn turbovec_backend_enables_and_retrieves() {
+            let mut model = trained(8);
+            model.enable_ann_retrieval("turbovec").expect("enable");
+            let top = model.retrieve(tower_input(), 2, &[]).expect("retrieve");
+            assert_eq!(top.len(), 2);
+            assert!(top[0].1 >= top[1].1);
+        }
+
+        #[test]
+        fn unknown_backend_errors() {
+            let mut model = trained(8);
+            let err = model.enable_ann_retrieval("faiss").unwrap_err();
+            assert!(err.to_string().contains("unknown ANN backend"), "{err}");
+        }
+
+        #[test]
+        fn recmodel_hook_routes_to_index_only_when_enabled() {
+            let mut model = trained(8);
+            assert!(model.retrieval_index().is_none());
+            model.enable_ann_retrieval("exact").expect("enable");
+            let idx = model.retrieval_index().expect("index attached");
+            let top = idx.retrieve(tower_input(), 1, &[]).expect("retrieve");
+            assert_eq!(top.len(), 1);
+        }
     }
 }
