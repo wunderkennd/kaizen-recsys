@@ -40,6 +40,11 @@ jobs:
       with:
         shared-key: ann-bench
 
+    # turbovec's dep tree (faer/cblas-sys) links OpenBLAS on Linux — same
+    # system dep the fast-blas job installs.
+    - name: Install system OpenBLAS
+      run: sudo apt-get update && sudo apt-get install -y libopenblas-dev
+
     - name: Run bench-off (N=${{ matrix.n_items }}, dim=128)
       env:
         ANN_BENCH_N_ITEMS: ${{ matrix.n_items }}
