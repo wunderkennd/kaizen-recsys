@@ -2126,6 +2126,122 @@ mod two_tower_py {
                 .save_to(Path::new(&path))
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))
         }
+
+        /// Returns everything the Python ONNX exporter needs to author the
+        /// user-tower graph (#85): every user-tower weight plus the
+        /// precomputed L2-normalized item catalog matrix, as row-major
+        /// little-endian f32 bytes with explicit shapes, and the id / feature
+        /// mappings. Mirrors `FeaseModel.export_payload`'s bytes+shape style.
+        ///
+        /// Returns:
+        ///     dict: A dictionary with the following keys:
+        ///         - "kind" (str): ``"two_tower"``.
+        ///         - "embedding_dim" (int): Tower output dimension ``d``.
+        ///         - "num_items" (int) / "num_users" (int): Catalog sizes.
+        ///           ``num_users`` counts the reserved cold-start row (index 0).
+        ///         - "has_cat" / "has_dense" (bool): Whether the user tower
+        ///           has categorical / dense feature branches.
+        ///         - "num_user_categories" (int): Categorical-embedding rows.
+        ///         - "user_dense_dim" (int): Dense feature vector width.
+        ///         - "id_embedding_bytes" + "id_embedding_shape":
+        ///           ``[num_users, d]``; row 0 is the learned cold-start prior.
+        ///         - "cat_embedding_bytes" + "cat_embedding_shape":
+        ///           ``[num_user_categories, d]`` (empty when not has_cat).
+        ///         - "dense_w_bytes" + "dense_w_shape" / "dense_b_bytes":
+        ///           ``[user_dense_dim, d]`` / ``[d]`` (empty when not has_dense).
+        ///         - "hidden_w_bytes" + "hidden_w_shape" / "hidden_b_bytes",
+        ///           "out_w_bytes" + "out_w_shape" / "out_b_bytes": the 2-layer
+        ///           MLP; weights are ``[d_in, d_out]`` (x @ W + b, no transpose).
+        ///         - "item_matrix_bytes" + "item_matrix_shape":
+        ///           ``[num_items, d]`` L2-normalized catalog matrix.
+        ///         - "item_index_to_guid" (list[str]).
+        ///         - "user_id_to_index" (dict[str, int]): Real user ids only —
+        ///           the index-0 cold-start sentinel is excluded.
+        ///         - "user_cat_feature_to_idx" / "user_dense_feature_to_idx"
+        ///           (dict[str, int]): Feature-name maps persisted at training
+        ///           time (#55).
+        #[pyo3(signature = ())]
+        fn export_payload<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+            use crate::onnx_export::f32s_le_bytes;
+
+            let w = self.model.export_weights();
+            let dim = w.embedding_dim;
+
+            let d = PyDict::new(py);
+            d.set_item("kind", "two_tower")?;
+            d.set_item("embedding_dim", dim)?;
+            d.set_item("num_items", w.num_items)?;
+            d.set_item("num_users", w.num_users)?;
+            d.set_item("has_cat", w.has_cat)?;
+            d.set_item("has_dense", w.has_dense)?;
+            d.set_item("num_user_categories", w.num_user_categories)?;
+            d.set_item("user_dense_dim", w.user_dense_dim)?;
+
+            d.set_item(
+                "id_embedding_bytes",
+                PyBytes::new(py, &f32s_le_bytes(&w.id_embedding)),
+            )?;
+            d.set_item("id_embedding_shape", (w.num_users, dim))?;
+            d.set_item(
+                "cat_embedding_bytes",
+                PyBytes::new(py, &f32s_le_bytes(&w.cat_embedding)),
+            )?;
+            d.set_item(
+                "cat_embedding_shape",
+                (if w.has_cat { w.num_user_categories } else { 0 }, dim),
+            )?;
+            d.set_item(
+                "dense_w_bytes",
+                PyBytes::new(py, &f32s_le_bytes(&w.dense_w)),
+            )?;
+            d.set_item(
+                "dense_w_shape",
+                (if w.has_dense { w.user_dense_dim } else { 0 }, dim),
+            )?;
+            d.set_item(
+                "dense_b_bytes",
+                PyBytes::new(py, &f32s_le_bytes(&w.dense_b)),
+            )?;
+            d.set_item(
+                "hidden_w_bytes",
+                PyBytes::new(py, &f32s_le_bytes(&w.hidden_w)),
+            )?;
+            d.set_item("hidden_w_shape", (dim, dim))?;
+            d.set_item(
+                "hidden_b_bytes",
+                PyBytes::new(py, &f32s_le_bytes(&w.hidden_b)),
+            )?;
+            d.set_item("out_w_bytes", PyBytes::new(py, &f32s_le_bytes(&w.out_w)))?;
+            d.set_item("out_w_shape", (dim, dim))?;
+            d.set_item("out_b_bytes", PyBytes::new(py, &f32s_le_bytes(&w.out_b)))?;
+            d.set_item(
+                "item_matrix_bytes",
+                PyBytes::new(py, &f32s_le_bytes(&w.item_matrix)),
+            )?;
+            d.set_item("item_matrix_shape", (w.num_items, dim))?;
+
+            d.set_item("item_index_to_guid", w.idx_to_item.as_slice())?;
+            let users = PyDict::new(py);
+            for (i, guid) in w.idx_to_user.iter().enumerate() {
+                if i != crate::data::triples::COLD_START_USER_IDX {
+                    users.set_item(guid, i)?;
+                }
+            }
+            d.set_item("user_id_to_index", users)?;
+
+            let cat_map = PyDict::new(py);
+            for (name, idx) in w.user_cat_feature_to_idx.iter() {
+                cat_map.set_item(name, *idx)?;
+            }
+            d.set_item("user_cat_feature_to_idx", cat_map)?;
+            let dense_map = PyDict::new(py);
+            for (name, idx) in w.user_dense_feature_to_idx.iter() {
+                dense_map.set_item(name, *idx)?;
+            }
+            d.set_item("user_dense_feature_to_idx", dense_map)?;
+
+            Ok(d)
+        }
     }
 
     /// Train a Two-Tower model from a long-format interactions file plus

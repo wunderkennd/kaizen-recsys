@@ -138,6 +138,14 @@ src/data_validation.rs — GaussianAnomalyDetector for pre-training data quality
   `vocab.json` sidecar, and an optional MLflow pyfunc model. See
   `docs/superpowers/specs/2026-06-01-onnx-export-design.md`. Regenerate the Rust
   ort parity fixtures with `kzn_recsys.onnx_export._write_rust_fixture(model, "tests/fixtures")`.
+  `export_onnx` also accepts a trained `TwoTowerModel` (#85): the graph is the
+  user tower (id/cat embedding Gather → dense Gemm → 2-layer MLP → L2
+  normalize) → MatMul against the baked item catalog matrix → the same
+  penalty/mask/TopK tail; inputs are `user_idx` (0 = cold-start row) plus
+  optional `cat_ids`/`cat_mask`/`dense`, and the baked repeat-penalty default
+  is neutral (ρ = 0). Quantization / MLflow / Tier C repeat-affinity are
+  EASE-only. Two-Tower ort fixtures regenerate via
+  `kzn_recsys.onnx_export._write_rust_fixture_two_tower(model, "tests/fixtures")`.
 
 ## Key Concepts
 
