@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kzn_recsys_spark"
+version = "0.1.0"
+description = "Pure-Python/PySpark EASE implementation (kzn_recsys.spark), no native extension"
+requires-python = ">=3.8"
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "pyspark>=3.4",
+]
+
+[tool.setuptools]
+# Ship the native-optional package init + the pure-Python spark subpackage.
+# Subpackages must be listed explicitly, so onnx_export is not included.
+# The top package's loose native-only modules (train/inference/fease_train/
+# fease_wrapper/schemas) ship as dead weight but are inert on the spark path —
+# they only import polars/_native if a caller imports them directly, which the
+# documented `from kzn_recsys.spark import ...` flow never does.
+# ponytail: not worth restructuring the package to physically drop them.
+packages = ["kzn_recsys", "kzn_recsys.spark"]
+package-dir = {"" = "../.."}

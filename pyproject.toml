@@ -24,6 +24,17 @@ onnx = [
     "mlflow>=2.12",
     "sympy>=1.12",  # required by onnxruntime.quantization (int8 path)
 ]
+spark = [
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "pyspark>=3.4",
+]
+
+[tool.pytest.ini_options]
+markers = [
+    "spark: test requires a SparkSession (slow; needs pyspark)",
+    "parity: test cross-checks the PySpark impl against the native kzn_recsys._native wheel",
+]
 
 [tool.maturin]
 module-name = "kzn_recsys._native"
