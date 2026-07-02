@@ -605,3 +605,41 @@ def test_mlflow_per_row_override_beats_table(trained_model, tmp_path, interactio
     )
     g0 = out[out["item_guid"] == "G0"].set_index("user_row")["score"]
     assert g0[0] > g0[1]  # override ρ=0 beats the learned (positive) penalty
+
+
+def test_mlflow_integer_user_ids_survive_pandas_float_coercion(trained_model, tmp_path):
+    """Devin finding on #87: a mixed batch with a missing user_id coerces the
+    pandas column to float64 (123 -> 123.0); the lookup must still hit the
+    Polars-written "123" table key instead of silently falling back."""
+    import mlflow.pyfunc
+
+    from kzn_recsys.onnx_export import export_onnx
+
+    inter_path = tmp_path / "int_uid_interactions.parquet"
+    pl.DataFrame(
+        {
+            "user_id": [123] * 4 + [456] * 3,
+            "item_id": ["G0"] * 4 + ["G0", "G1", "G2"],
+            "value": [1.0] * 7,
+        }
+    ).write_parquet(inter_path)
+
+    res = export_onnx(
+        trained_model,
+        tmp_path,
+        repeat_penalty_default=0.0,
+        interactions=inter_path,
+        repeat_affinity_scale=5.0,
+        mlflow=True,
+    )
+    table = json.loads(res.vocab_path.read_text())["repeat_policy"]["per_user_table"]
+    assert "123" in table  # Polars cast writes integer keys as plain strings
+
+    loaded = mlflow.pyfunc.load_model(str(res.mlflow_path))
+    base = {"interactions": {"G0": 5.0}, "features": {}, "exclude": [], "top_k": 4}
+    # Row without user_id forces the column to float64 → 123 becomes 123.0.
+    out = loaded.predict(pd.DataFrame([{**base, "user_id": 123}, {**base}]))
+    g0 = out[out["item_guid"] == "G0"].set_index("user_row")["score"]
+    # Row 0 must get the learned penalty (score = raw - rho_123), not the
+    # default rho=0 that row 1 (no user_id) correctly falls back to.
+    assert g0[1] - g0[0] == pytest.approx(table["123"], abs=1e-4)

@@ -78,6 +78,11 @@ class FeaseOnnxPyfunc(mlflow.pyfunc.PythonModel):
             rp = float(row["repeat_penalty"])
         else:
             uid = row.get("user_id")
+            # In a mixed batch pandas coerces an int user_id column with gaps
+            # to float64 (123 → 123.0); table keys are the original integer
+            # strings, so integral floats normalize back before lookup.
+            if isinstance(uid, float) and uid.is_integer():
+                uid = int(uid)
             rp = float(self._per_user_rp.get(str(uid), self._default_rp)) if _present(uid) else float(self._default_rp)
         k = int(row["top_k"]) if _present(row.get("top_k")) else self._default_k
 
