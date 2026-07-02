@@ -1,7 +1,16 @@
 """Shared fixtures for PySpark EASE tests."""
+import importlib.util
 import os
 import subprocess
 import pytest
+
+# Skip the whole spark suite (at collection time) when its optional deps are
+# absent — the test modules import numpy at module top, which errors during
+# collection before any fixture-level importorskip can fire. This keeps
+# `pytest tests/` green in the native-only CI / any env without the [spark]
+# extra installed. Install with `pip install -e '.[spark]'` to run them.
+if any(importlib.util.find_spec(m) is None for m in ("numpy", "scipy", "pyspark")):
+    collect_ignore_glob = ["test_*.py"]
 
 
 def _ensure_compatible_java_home():
