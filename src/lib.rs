@@ -29,9 +29,6 @@ pub(crate) mod onnx_export;
 mod py;
 mod serialization;
 mod serving;
-// dead_code: the PyO3 surface that registers these classes and calls
-// predict_raw lands in #71's follow-up PR (theme B); remove the allow there.
-#[allow(dead_code)]
 mod transform;
 pub mod tuning;
 mod weighting;
@@ -141,6 +138,102 @@ impl FeaseModel {
         }
 
         Ok(py_results)
+    }
+
+    /// Predicts recommendations from raw, untransformed user features
+    /// (zero-drift online inference, #71).
+    ///
+    /// Raw features are routed through the model's embedded
+    /// `FeatureTransformationSchema` (see `set_transformation_schema`), so the
+    /// exact train-time feature engineering runs natively at serve time.
+    /// Without a schema, numeric (or numeric-string) values pass through
+    /// as already-engineered features.
+    ///
+    /// Args:
+    ///     interactions (dict[str, float]): item_guid -> interaction value.
+    ///     raw_features (dict[str, str | bool | int | float]):
+    ///         raw feature values, e.g. {"plan": "Premium", "tenure_days": 45}.
+    ///     top_k (int): number of recommendations to return.
+    ///
+    /// Returns:
+    ///     list[tuple[str, float]]: (item_guid, score), sorted descending,
+    ///     excluding items the user already interacted with.
+    fn predict_raw<'py>(
+        &self,
+        py: Python<'py>,
+        interactions: &Bound<'_, PyDict>,
+        raw_features: &Bound<'_, PyDict>,
+        top_k: usize,
+    ) -> PyResult<Bound<'py, PyList>> {
+        // 1. interactions: item_guid -> f64
+        let mut rust_interactions = std::collections::HashMap::new();
+        for (key, val) in interactions.iter() {
+            let item_guid: String = key.extract()?;
+            let value: f64 = val.extract()?;
+            rust_interactions.insert(item_guid, value);
+        }
+
+        // 2. raw features: polymorphic Python values -> serde_json::Value.
+        //    bool is checked before i64 (Python bool subclasses int).
+        let mut rust_raw_features = std::collections::HashMap::new();
+        for (key, val) in raw_features.iter() {
+            let k: String = key.extract()?;
+            let value = if let Ok(b) = val.extract::<bool>() {
+                serde_json::Value::Bool(b)
+            } else if let Ok(i) = val.extract::<i64>() {
+                serde_json::Value::Number(serde_json::Number::from(i))
+            } else if let Ok(f) = val.extract::<f64>() {
+                serde_json::Number::from_f64(f)
+                    .map(serde_json::Value::Number)
+                    .unwrap_or(serde_json::Value::Null)
+            } else if let Ok(s) = val.extract::<String>() {
+                serde_json::Value::String(s)
+            } else {
+                serde_json::Value::Null
+            };
+            rust_raw_features.insert(k, value);
+        }
+
+        // 3. Score natively, then rank exactly like predict().
+        let scores =
+            self.model
+                .predict_raw(&rust_interactions, &rust_raw_features, self.model.beta);
+
+        let interacted: HashSet<usize> = rust_interactions
+            .keys()
+            .filter_map(|guid| self.model.mappings.item_to_idx.get(guid).copied())
+            .collect();
+        let mut results_with_idx: Vec<(usize, f64)> = scores
+            .into_iter()
+            .enumerate()
+            .filter(|(idx, _score)| !interacted.contains(idx))
+            .collect();
+        results_with_idx.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        let py_results = PyList::empty(py);
+        for (idx, score) in results_with_idx.into_iter().take(top_k) {
+            if let Some(guid) = self.model.mappings.idx_to_item.get(idx) {
+                py_results.append((PyString::new(py, guid), PyFloat::new(py, score)))?;
+            }
+        }
+        Ok(py_results)
+    }
+
+    /// Attaches (or clears) the declarative feature-transformation schema
+    /// used by `predict_raw`. Persisted by `save()` (format v3); restored by
+    /// `load_model()`.
+    #[pyo3(signature = (schema))]
+    fn set_transformation_schema(
+        &mut self,
+        schema: Option<transform::FeatureTransformationSchema>,
+    ) {
+        self.model.transformation_schema = schema;
+    }
+
+    /// The embedded feature-transformation schema, if any.
+    #[getter]
+    fn transformation_schema(&self) -> Option<transform::FeatureTransformationSchema> {
+        self.model.transformation_schema.clone()
     }
 
     /// Predicts recommendation scores for multiple users at once (batch mode).
@@ -2144,6 +2237,8 @@ fn _native(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(random_search_two_tower, m)?)?;
     m.add_class::<FeaseModel>()?;
     m.add_class::<ModelRegistry>()?;
+    m.add_class::<transform::NumericalBucketConfig>()?;
+    m.add_class::<transform::FeatureTransformationSchema>()?;
 
     #[cfg(feature = "ml-models")]
     {

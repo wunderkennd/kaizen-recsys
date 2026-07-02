@@ -2,7 +2,9 @@
 
 from kzn_recsys._native import (
     FeaseModel,
+    FeatureTransformationSchema,
     ModelRegistry,
+    NumericalBucketConfig,
     build_and_train,
     coverage,
     grid_search_ease,
@@ -51,7 +53,9 @@ except ImportError:
 
 __all__ = [
     "FeaseModel",
+    "FeatureTransformationSchema",
     "ModelRegistry",
+    "NumericalBucketConfig",
     "build_and_train",
     "coverage",
     "grid_search",

@@ -46,9 +46,7 @@ pub struct RustFeaseModel {
     pub weighting_config: Option<WeightingConfig>,
     /// Declarative raw-feature transformation for `predict_raw` (#71 theme A).
     /// Runtime-only until format V3 persists it (theme B); loading a V1/V2
-    /// file leaves it `None`. dead_code: read by `predict_raw`, whose PyO3
-    /// caller lands in #71's follow-up PR — remove the allow there.
-    #[allow(dead_code)]
+    /// file leaves it `None`.
     pub transformation_schema: Option<crate::transform::FeatureTransformationSchema>,
 }
 
@@ -396,9 +394,6 @@ impl RustFeaseModel {
     /// tolerance of the serving layer.
     ///
     /// [`transformation_schema`]: RustFeaseModel::transformation_schema
-    ///
-    /// dead_code: the PyO3 binding lands in #71's follow-up PR.
-    #[allow(dead_code)]
     pub fn predict_raw(
         &self,
         interactions: &std::collections::HashMap<String, f64>,
