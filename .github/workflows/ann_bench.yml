@@ -52,6 +52,12 @@ jobs:
     - name: Install system OpenBLAS
       run: sudo apt-get update && sudo apt-get install -y libopenblas-dev
 
+    # Serving-path recall gate (#83): the ann-gated unit/integration tests
+    # (ANN retrieval vs dense parity, backend floors) run here because no
+    # other CI job compiles the `ann` feature.
+    - name: Run ann-gated tests (recall gate)
+      run: cargo test --release --features "ann ml-models" ann
+
     - name: Run bench-off (N=${{ matrix.n_items }}, dim=128)
       env:
         ANN_BENCH_N_ITEMS: ${{ matrix.n_items }}
