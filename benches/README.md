@@ -56,11 +56,58 @@ config, not a fork — and turbovec's pre-1.0 maturity risk is mitigated by the
 seam (swappable to usearch without touching callers).
 
 ### Caveats / follow-ups
-- Measured at 3000 items. The recall gap (a property of quantization) transfers;
-  the absolute latency/memory *ratios* may shift at 1M+ items where ANN earns its
-  keep. A scale bench on CI Linux is tracked as a follow-up issue.
 - turbovec requires `dim % 8 == 0` and uses positional ids (vs usearch's
   arbitrary dims + explicit u64 keys) — see each backend's module docs.
+
+## Scale results (#82 · CI Linux · dim=128, K=10, synthetic clusters, ~1k items/cluster)
+
+Run on ubuntu-latest via `.github/workflows/ann_bench.yml` (2026-07-02).
+Embeddings are synthesized clusters (`ANN_BENCH_MODE=synthetic`) — training a
+real Two-Tower at these sizes is impractical on hosted CI; the recall
+*decision* was made on trained embeddings above, these runs firm up the
+latency / memory / build-time ratios at the scale where ANN earns its keep.
+**RSS Δ** is the resident-set delta measured across the index build — the
+apples-to-apples memory column (the "index (MB)" column mixes usearch's
+measured `memory_usage()` with turbovec's analytic packed-code estimate,
+which flatters turbovec ~10×).
+
+**N = 100k (100 clusters):**
+
+| backend  | recall@10 | p50 (µs) | p99 (µs) | index (MB) | RSS Δ (MB) | build (s) |
+|----------|-----------|----------|----------|------------|------------|-----------|
+| exact    | 1.000     | 18,632   | 18,915   | 48.8       | 52.7       | 0.05      |
+| usearch  | 0.983     | 68       | 188      | 81.3       | 70.4       | 13.7      |
+| turbovec | 0.824     | 942      | 974      | 6.5        | 66.8       | 0.41      |
+
+**N = 1M (1000 clusters):**
+
+| backend  | recall@10 | p50 (µs) | p99 (µs) | index (MB) | RSS Δ (MB) | build (s) |
+|----------|-----------|----------|----------|------------|------------|-----------|
+| exact    | 1.000     | 209,333  | 218,123  | 488        | 526        | 0.48      |
+| usearch  | 0.904     | 155      | 420      | 763        | 678        | 236       |
+| turbovec | 0.833     | 9,445    | 9,641    | 64.9       | 265        | 2.9       |
+
+### What the scale runs changed about the picture
+
+- **The turbovec-default decision stands**, but with corrected magnitudes: the
+  real memory advantage is **~2.6× RSS at 1M** (265 vs 678 MB), not the ~155×
+  the analytic estimate suggested at 3k items. Build time is where turbovec
+  dominates: **2.9 s vs 236 s at 1M** (80×) — which is also why index
+  persistence (#77) was closed as not-justified for the default backend.
+- **usearch's role sharpens to "the latency/recall alternative"**: 60× lower
+  query latency than turbovec at 1M (155 µs vs 9.4 ms p50) and recall
+  0.90–0.98 on realistic geometry, at the cost of the largest memory
+  footprint and a minutes-scale build.
+- **Geometry matters more than scale for HNSW recall**: with the original 12
+  fixed clusters at 1M (~83k near-duplicates per cluster), usearch recall
+  collapsed to 0.568 while turbovec held 0.727. With ~1k items/cluster it
+  recovered to 0.904. turbovec's brute-force-over-quantized-codes recall is
+  geometry-insensitive by construction (0.72–0.85 across every run). The
+  usearch 0.80 recall floor therefore asserts only in `trained` mode; scale
+  runs report instead of failing.
+- turbovec p50 grows linearly with N (it scans all codes): 0.94 ms @ 100k →
+  9.4 ms @ 1M. Still 22× faster than exact f32 scoring, but latency-sensitive
+  1M+ catalogs should weigh usearch despite the memory/build cost.
 
 ## Components
 
