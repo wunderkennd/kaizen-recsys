@@ -158,6 +158,7 @@ impl FeaseModel {
     /// Returns:
     ///     list[tuple[str, float]]: (item_guid, score), sorted descending,
     ///     excluding items the user already interacted with.
+    #[pyo3(signature = (interactions, raw_features, top_k=100))]
     fn predict_raw<'py>(
         &self,
         py: Python<'py>,
