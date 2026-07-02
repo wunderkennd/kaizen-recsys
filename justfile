@@ -111,7 +111,7 @@ release VERSION:
     echo
     echo "Tag pushed. Watch the build with: just release-watch"
     echo "Release page (populated when build succeeds):"
-    echo "  https://github.com/wunderkennd/fease/releases/tag/{{VERSION}}"
+    echo "  https://github.com/wunderkennd/kaizen-recsys/releases/tag/{{VERSION}}"
 
 # Watch the most recent release.yml run (useful right after `just release`).
 release-watch:

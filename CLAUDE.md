@@ -67,6 +67,8 @@ docker build . -t fease-builder
 
 **Important:** This project has `[workspace]` in its Cargo.toml to prevent cargo from inheriting the parent directory's workspace. The `.venv` uses Python 3.14; always use `.venv/bin/python` or `.venv/bin/maturin` for consistent builds.
 
+**Clones predating the `fease` → `kaizen-recsys` rename:** venv console-script shebangs bake the old absolute path and fail with `bad interpreter` — recreate the venv (`uv venv`, then reinstall) rather than patching shebangs, and always invoke tools as `.venv/bin/python -m pytest` (module form survives renames). Update the remote with `git remote set-url origin https://github.com/wunderkennd/kaizen-recsys.git` (the redirect from the old name works but is stale).
+
 ## Architecture
 
 ### Rust-Python Bridge (PyO3)
