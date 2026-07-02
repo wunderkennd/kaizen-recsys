@@ -72,7 +72,7 @@ pyproject.toml                # MODIFY: [spark] extra + pytest markers
 - Create: `tests/spark/conftest.py`
 - Create: `tests/spark/__init__.py` (empty)
 
-- [ ] **Step 1: Add the `spark` extra and pytest markers to `pyproject.toml`**
+- **Step 1: Add the `spark` extra and pytest markers to `pyproject.toml`**
 
 Add a `spark` extra under `[project.optional-dependencies]` and a pytest config block. Final state of the two sections:
 
@@ -98,11 +98,11 @@ markers = [
 ]
 ```
 
-- [ ] **Step 2: Create the empty test package marker**
+- **Step 2: Create the empty test package marker**
 
 Create `tests/spark/__init__.py` with no content (makes `tests/spark` importable).
 
-- [ ] **Step 3: Create the Spark session fixture**
+- **Step 3: Create the Spark session fixture**
 
 Create `tests/spark/conftest.py`:
 
@@ -129,17 +129,17 @@ def spark():
     session.stop()
 ```
 
-- [ ] **Step 4: Install the extra into the dev venv**
+- **Step 4: Install the extra into the dev venv**
 
 Run: `.venv/bin/python -m pip install -e '.[spark]'`
 Expected: installs numpy, scipy, pyspark without error. (The `-e` editable install also makes `kzn_recsys.spark` importable as it is created.)
 
-- [ ] **Step 5: Verify pytest discovers the markers**
+- **Step 5: Verify pytest discovers the markers**
 
 Run: `.venv/bin/python -m pytest tests/spark/ --markers | grep -E "spark|parity"`
 Expected: both `@pytest.mark.spark` and `@pytest.mark.parity` are listed.
 
-- [ ] **Step 6: Commit**
+- **Step 6: Commit**
 
 ```bash
 git add pyproject.toml tests/spark/__init__.py tests/spark/conftest.py
@@ -159,7 +159,7 @@ The parity spine. After Phase 1 you can train EASE on Spark data (single-node co
 - Create: `kzn_recsys/spark/ease_core.py`
 - Test: `tests/spark/test_ease_core.py`
 
-- [ ] **Step 1: Write the failing test**
+- **Step 1: Write the failing test**
 
 Create `tests/spark/test_ease_core.py`:
 
@@ -183,12 +183,12 @@ def test_ease_params_explicit():
     assert (p.alpha, p.beta, p.lambda_, p.meta_weight) == (2.0, 0.5, 100.0, 1.0)
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- **Step 2: Run test to verify it fails**
 
 Run: `.venv/bin/python -m pytest tests/spark/test_ease_core.py -v`
 Expected: FAIL — `ModuleNotFoundError: No module named 'kzn_recsys.spark'`.
 
-- [ ] **Step 3: Create the package init and params**
+- **Step 3: Create the package init and params**
 
 Create `kzn_recsys/spark/__init__.py`:
 
@@ -221,12 +221,12 @@ class EaseParams:
     meta_weight: float = 0.0  # diagonal metadata weighting; 0 => treated as 1.0
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- **Step 4: Run test to verify it passes**
 
 Run: `.venv/bin/python -m pytest tests/spark/test_ease_core.py -v`
 Expected: PASS (2 passed).
 
-- [ ] **Step 5: Commit**
+- **Step 5: Commit**
 
 ```bash
 git add kzn_recsys/spark/__init__.py kzn_recsys/spark/ease_core.py tests/spark/test_ease_core.py
@@ -239,7 +239,7 @@ git commit -m "feat(spark): EaseParams dataclass"
 - Modify: `kzn_recsys/spark/ease_core.py`
 - Test: `tests/spark/test_ease_core.py`
 
-- [ ] **Step 1: Write the failing test**
+- **Step 1: Write the failing test**
 
 Append to `tests/spark/test_ease_core.py`:
 
@@ -285,12 +285,12 @@ def test_train_matches_direct_formula():
     assert np.allclose(S, B, atol=1e-9)
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- **Step 2: Run test to verify it fails**
 
 Run: `.venv/bin/python -m pytest tests/spark/test_ease_core.py -k train -v`
 Expected: FAIL — `ImportError: cannot import name 'train_ease'`.
 
-- [ ] **Step 3: Implement `train_ease`**
+- **Step 3: Implement `train_ease`**
 
 Append to `kzn_recsys/spark/ease_core.py`:
 
@@ -347,12 +347,12 @@ def train_ease(X, U, T, params: EaseParams) -> np.ndarray:
     return np.asfortranarray(S)
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- **Step 4: Run test to verify it passes**
 
 Run: `.venv/bin/python -m pytest tests/spark/test_ease_core.py -v`
 Expected: PASS (4 passed).
 
-- [ ] **Step 5: Commit**
+- **Step 5: Commit**
 
 ```bash
 git add kzn_recsys/spark/ease_core.py tests/spark/test_ease_core.py
@@ -365,7 +365,7 @@ git commit -m "feat(spark): EASE training (Gram blocks + closed-form S)"
 - Modify: `kzn_recsys/spark/ease_core.py`
 - Test: `tests/spark/test_ease_core.py`
 
-- [ ] **Step 1: Write the failing test**
+- **Step 1: Write the failing test**
 
 Append to `tests/spark/test_ease_core.py`:
 
@@ -414,12 +414,12 @@ def test_prune_sparse_zeros_small_entries():
     assert S[1, 0] == 0.5
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- **Step 2: Run test to verify it fails**
 
 Run: `.venv/bin/python -m pytest tests/spark/test_ease_core.py -k "predict or prune" -v`
 Expected: FAIL — `ImportError: cannot import name 'predict_scores'`.
 
-- [ ] **Step 3: Implement the three functions**
+- **Step 3: Implement the three functions**
 
 Append to `kzn_recsys/spark/ease_core.py`:
 
@@ -464,12 +464,12 @@ def prune_sparse(S, threshold) -> None:
     S[np.abs(S) < threshold] = 0.0
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- **Step 4: Run test to verify it passes**
 
 Run: `.venv/bin/python -m pytest tests/spark/test_ease_core.py -v`
 Expected: PASS (8 passed).
 
-- [ ] **Step 5: Commit**
+- **Step 5: Commit**
 
 ```bash
 git add kzn_recsys/spark/ease_core.py tests/spark/test_ease_core.py
@@ -482,7 +482,7 @@ git commit -m "feat(spark): EASE predict, predict-similar, prune"
 - Create: `kzn_recsys/spark/feas_codec.py`
 - Test: `tests/spark/test_feas_codec.py`
 
-- [ ] **Step 1: Write the failing test**
+- **Step 1: Write the failing test**
 
 Create `tests/spark/test_feas_codec.py`:
 
@@ -543,12 +543,12 @@ def test_vec_string_and_pairs_roundtrip():
     assert fc._read_vec_pair_string_usize(buf) == [("a", 0), ("bb", 1)]
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- **Step 2: Run test to verify it fails**
 
 Run: `.venv/bin/python -m pytest tests/spark/test_feas_codec.py -v`
 Expected: FAIL — `ModuleNotFoundError` / missing attributes.
 
-- [ ] **Step 3: Implement the primitives**
+- **Step 3: Implement the primitives**
 
 Create `kzn_recsys/spark/feas_codec.py`:
 
@@ -634,12 +634,12 @@ def _read_vec_pair_string_usize(buf) -> list:
     return [(_read_string(buf), _read_u64(buf)) for _ in range(n)]
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- **Step 4: Run test to verify it passes**
 
 Run: `.venv/bin/python -m pytest tests/spark/test_feas_codec.py -v`
 Expected: PASS (6 passed).
 
-- [ ] **Step 5: Commit**
+- **Step 5: Commit**
 
 ```bash
 git add kzn_recsys/spark/feas_codec.py tests/spark/test_feas_codec.py
@@ -656,7 +656,7 @@ The struct field order mirrors `SerializedModel` (`serialization.rs:80-108`) exa
 `version, s_nrows, s_ncols, s_data, num_items, num_user_features, num_item_features, alpha, beta, lambda_, meta_weight, user_to_idx, idx_to_user, item_to_idx, idx_to_item, user_feature_to_idx, idx_to_user_feature, item_feature_to_idx, idx_to_item_feature, [weighting_config (v2 only)]`.
 `WeightingConfig` field order (`weighting.rs:14-37`): `event_weights: Option<HashMap<String,f64>>, decay_rate: f64, ips_alpha: f64, sparsity_threshold: f64`.
 
-- [ ] **Step 1: Write the failing test**
+- **Step 1: Write the failing test**
 
 Append to `tests/spark/test_feas_codec.py`:
 
@@ -738,12 +738,12 @@ def test_v1_has_no_weighting_config(tmp_path):
     assert back.weighting_config is None
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- **Step 2: Run test to verify it fails**
 
 Run: `.venv/bin/python -m pytest tests/spark/test_feas_codec.py -k "roundtrip or magic or weighting or byte or v1" -v`
 Expected: FAIL — `cannot import name 'FeaseArtifact'`.
 
-- [ ] **Step 3: Implement the artifact, codec, and HashMap helpers**
+- **Step 3: Implement the artifact, codec, and HashMap helpers**
 
 Append to `kzn_recsys/spark/feas_codec.py`:
 
@@ -917,12 +917,12 @@ def read_feas(path: str) -> FeaseArtifact:
     )
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- **Step 4: Run test to verify it passes**
 
 Run: `.venv/bin/python -m pytest tests/spark/test_feas_codec.py -v`
 Expected: PASS (11 passed).
 
-- [ ] **Step 5: Commit**
+- **Step 5: Commit**
 
 ```bash
 git add kzn_recsys/spark/feas_codec.py tests/spark/test_feas_codec.py
@@ -937,7 +937,7 @@ git commit -m "feat(spark): FEAS artifact read/write (v1 + v2)"
 
 Mappings are built by **sorted distinct** order (deterministic, self-consistent). This differs from Rust's first-seen order, which is fine per parity fact 2.
 
-- [ ] **Step 1: Write the failing test**
+- **Step 1: Write the failing test**
 
 Create `tests/spark/test_dataframes.py`:
 
@@ -985,12 +985,12 @@ def test_build_csr_shapes(spark):
     assert X[m.user_to_idx["u2"], m.item_to_idx["i2"]] == 2.0
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- **Step 2: Run test to verify it fails**
 
 Run: `.venv/bin/python -m pytest tests/spark/test_dataframes.py -v`
 Expected: FAIL — `ModuleNotFoundError` / missing names.
 
-- [ ] **Step 3: Implement mappings + CSR build**
+- **Step 3: Implement mappings + CSR build**
 
 Create `kzn_recsys/spark/dataframes.py`:
 
@@ -1089,12 +1089,12 @@ def build_csr_inputs(interactions_df, user_features_df, item_features_df, mappin
 
 (`apply_weighting` is added in Task 7; `build_csr_inputs` calls it only when `weighting` is not None, so tests here pass with `weighting=None`.)
 
-- [ ] **Step 4: Run test to verify it passes**
+- **Step 4: Run test to verify it passes**
 
 Run: `.venv/bin/python -m pytest tests/spark/test_dataframes.py -v`
 Expected: PASS (2 passed). (Slow: first run boots Spark.)
 
-- [ ] **Step 5: Commit**
+- **Step 5: Commit**
 
 ```bash
 git add kzn_recsys/spark/dataframes.py tests/spark/test_dataframes.py
@@ -1107,7 +1107,7 @@ git commit -m "feat(spark): DataFrame -> mappings + CSR inputs"
 - Modify: `kzn_recsys/spark/dataframes.py`
 - Test: `tests/spark/test_dataframes.py`
 
-- [ ] **Step 1: Write the failing test**
+- **Step 1: Write the failing test**
 
 Append to `tests/spark/test_dataframes.py`:
 
@@ -1145,12 +1145,12 @@ def test_temporal_decay(spark):
     assert abs(out["i2"] - 10.0 * np.exp(-1.0)) < 1e-6
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- **Step 2: Run test to verify it fails**
 
 Run: `.venv/bin/python -m pytest tests/spark/test_dataframes.py -k "event_weights or temporal" -v`
 Expected: FAIL — `cannot import name 'apply_weighting'`.
 
-- [ ] **Step 3: Implement `apply_weighting`**
+- **Step 3: Implement `apply_weighting`**
 
 Append to `kzn_recsys/spark/dataframes.py`:
 
@@ -1200,12 +1200,12 @@ def apply_weighting(interactions_df, weighting, mappings):
     return df
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- **Step 4: Run test to verify it passes**
 
 Run: `.venv/bin/python -m pytest tests/spark/test_dataframes.py -v`
 Expected: PASS (4 passed).
 
-- [ ] **Step 5: Commit**
+- **Step 5: Commit**
 
 ```bash
 git add kzn_recsys/spark/dataframes.py tests/spark/test_dataframes.py
@@ -1218,7 +1218,7 @@ git commit -m "feat(spark): advanced weighting transforms (event/decay/IPS)"
 - Create: `kzn_recsys/spark/gram.py`
 - Test: covered via `test_model.py` in Task 9 (gram_collect is a thin wrapper; its correctness is exercised end-to-end).
 
-- [ ] **Step 1: Implement `gram_collect`**
+- **Step 1: Implement `gram_collect`**
 
 Create `kzn_recsys/spark/gram.py`:
 
@@ -1245,12 +1245,12 @@ def gram_collect(interactions_df, user_features_df, item_features_df, mappings, 
     return _core.train_ease(X, U, T, params)
 ```
 
-- [ ] **Step 2: Verify it imports**
+- **Step 2: Verify it imports**
 
 Run: `.venv/bin/python -c "from kzn_recsys.spark.gram import gram_collect; print('ok')"`
 Expected: prints `ok`.
 
-- [ ] **Step 3: Commit**
+- **Step 3: Commit**
 
 ```bash
 git add kzn_recsys/spark/gram.py
@@ -1264,7 +1264,7 @@ git commit -m "feat(spark): gram collect-to-driver strategy"
 - Modify: `kzn_recsys/spark/__init__.py` (export public names)
 - Test: `tests/spark/test_model.py`
 
-- [ ] **Step 1: Write the failing test**
+- **Step 1: Write the failing test**
 
 Create `tests/spark/test_model.py`:
 
@@ -1310,12 +1310,12 @@ def test_save_load_roundtrip_predicts_identically(spark, tmp_path):
     assert before == after
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- **Step 2: Run test to verify it fails**
 
 Run: `.venv/bin/python -m pytest tests/spark/test_model.py -v`
 Expected: FAIL — `cannot import name 'build_and_train'`.
 
-- [ ] **Step 3: Implement the facade**
+- **Step 3: Implement the facade**
 
 Create `kzn_recsys/spark/model.py`:
 
@@ -1427,7 +1427,7 @@ def load_model(path: str) -> SparkEaseModel:
                           num_item_features=art.num_item_features)
 ```
 
-- [ ] **Step 4: Export the public names**
+- **Step 4: Export the public names**
 
 Append to `kzn_recsys/spark/__init__.py`:
 
@@ -1445,12 +1445,12 @@ __all__ = [
 ]
 ```
 
-- [ ] **Step 5: Run test to verify it passes**
+- **Step 5: Run test to verify it passes**
 
 Run: `.venv/bin/python -m pytest tests/spark/test_model.py -v`
 Expected: PASS (2 passed).
 
-- [ ] **Step 6: Commit**
+- **Step 6: Commit**
 
 ```bash
 git add kzn_recsys/spark/model.py kzn_recsys/spark/__init__.py tests/spark/test_model.py
@@ -1464,7 +1464,7 @@ git commit -m "feat(spark): SparkEaseModel facade, build_and_train, save/load"
 
 This is the cross-check that the PySpark scores match the Rust core within `1e-5`, and that FEAS files round-trip both directions. It is skipped automatically wherever `kzn_recsys._native` is absent.
 
-- [ ] **Step 1: Write the parity test**
+- **Step 1: Write the parity test**
 
 Create `tests/spark/test_parity.py`:
 
@@ -1566,17 +1566,17 @@ def test_pyspark_saved_model_loads_in_native(spark, tmp_path):
             assert abs(py_recs[item_id] - native_recs[item_id]) < 1e-5
 ```
 
-- [ ] **Step 2: Verify the native predict contract before running**
+- **Step 2: Verify the native predict contract before running**
 
 Run: `.venv/bin/maturin develop && .venv/bin/python -c "import kzn_recsys; help(kzn_recsys.FeaseModel.predict)"`
 Confirm two things: (a) the argument shape is `predict(interactions_dict, features_dict, top_k=...)` — adjust the parity calls if it differs; (b) whether native `predict` filters already-interacted items. The parity tests are written to tolerate native *not* filtering (Spark's recs must be a subset of native's). If native *does* filter, the subset assertions still hold.
 
-- [ ] **Step 3: Run the parity suite**
+- **Step 3: Run the parity suite**
 
 Run: `.venv/bin/python -m pytest tests/spark/test_parity.py -v`
 Expected: PASS (3 passed).
 
-- [ ] **Step 4: Commit**
+- **Step 4: Commit**
 
 ```bash
 git add tests/spark/test_parity.py
@@ -1596,7 +1596,7 @@ Removes the driver-memory ceiling on interaction count: the four `ZᵀZ` blocks 
 - Modify: `kzn_recsys/spark/ease_core.py` (factor the solve out of `train_ease`)
 - Test: `tests/spark/test_gram_distributed.py`
 
-- [ ] **Step 1: Factor the solve out of `train_ease` (refactor, no behavior change)**
+- **Step 1: Factor the solve out of `train_ease` (refactor, no behavior change)**
 
 In `kzn_recsys/spark/ease_core.py`, extract the post-Gram math into `solve_from_gram` and have `train_ease` call it. Replace the body of `train_ease` from the `# P = inv...` line onward with a call:
 
@@ -1626,7 +1626,7 @@ Then `train_ease` ends with:
 Run: `.venv/bin/python -m pytest tests/spark/test_ease_core.py -v`
 Expected: PASS (8 passed) — refactor preserves behavior.
 
-- [ ] **Step 2: Write the failing distributed-Gram test**
+- **Step 2: Write the failing distributed-Gram test**
 
 Create `tests/spark/test_gram_distributed.py`:
 
@@ -1664,12 +1664,12 @@ def test_distributed_matches_collect(spark):
     assert np.allclose(S_collect, S_dist, atol=1e-9)
 ```
 
-- [ ] **Step 3: Run test to verify it fails**
+- **Step 3: Run test to verify it fails**
 
 Run: `.venv/bin/python -m pytest tests/spark/test_gram_distributed.py -v`
 Expected: FAIL — `cannot import name 'gram_distributed'`.
 
-- [ ] **Step 4: Implement `gram_distributed`**
+- **Step 4: Implement `gram_distributed`**
 
 Append to `kzn_recsys/spark/gram.py`:
 
@@ -1772,12 +1772,12 @@ def gram_distributed(interactions_df, user_features_df, item_features_df,
     return solve_from_gram(G, params.lambda_)
 ```
 
-- [ ] **Step 5: Run test to verify it passes**
+- **Step 5: Run test to verify it passes**
 
 Run: `.venv/bin/python -m pytest tests/spark/test_gram_distributed.py -v`
 Expected: PASS (1 passed).
 
-- [ ] **Step 6: Wire a strategy switch into `build_and_train`**
+- **Step 6: Wire a strategy switch into `build_and_train`**
 
 In `kzn_recsys/spark/model.py`, change `build_and_train` to accept `strategy="collect"` and dispatch:
 
@@ -1802,7 +1802,7 @@ def build_and_train(interactions_df, user_features_df, item_features_df,
 Run: `.venv/bin/python -m pytest tests/spark/test_model.py tests/spark/test_gram_distributed.py -v`
 Expected: PASS (all). The default `strategy="collect"` keeps Task 9 tests green.
 
-- [ ] **Step 7: Commit**
+- **Step 7: Commit**
 
 ```bash
 git add kzn_recsys/spark/gram.py kzn_recsys/spark/ease_core.py kzn_recsys/spark/model.py tests/spark/test_gram_distributed.py
@@ -1819,7 +1819,7 @@ git commit -m "feat(spark): distributed Gram strategy + build_and_train strategy
 - Create: `kzn_recsys/spark/metrics.py`
 - Test: `tests/spark/test_metrics.py`
 
-- [ ] **Step 1: Write the failing test**
+- **Step 1: Write the failing test**
 
 Create `tests/spark/test_metrics.py`:
 
@@ -1863,12 +1863,12 @@ def test_hit_rate():
     assert hit_rate_at_k([10, 20, 30, 40], {40}, 2) == 0.0
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- **Step 2: Run test to verify it fails**
 
 Run: `.venv/bin/python -m pytest tests/spark/test_metrics.py -v`
 Expected: FAIL — `ModuleNotFoundError`.
 
-- [ ] **Step 3: Implement the metrics**
+- **Step 3: Implement the metrics**
 
 Create `kzn_recsys/spark/metrics.py`:
 
@@ -1930,12 +1930,12 @@ def hit_rate_at_k(recommended, relevant, k) -> float:
     return 1.0 if any(item in relevant for item in recommended[:k]) else 0.0
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- **Step 4: Run test to verify it passes**
 
 Run: `.venv/bin/python -m pytest tests/spark/test_metrics.py -v`
 Expected: PASS (6 passed).
 
-- [ ] **Step 5: Commit**
+- **Step 5: Commit**
 
 ```bash
 git add kzn_recsys/spark/metrics.py tests/spark/test_metrics.py
@@ -1950,7 +1950,7 @@ git commit -m "feat(spark): ranking metrics port"
 
 Per parity fact 5, these are deterministic given a Python seed but **not** row-identical to the Rust splits. Semantics mirror `evaluation.rs`.
 
-- [ ] **Step 1: Write the failing test**
+- **Step 1: Write the failing test**
 
 Create `tests/spark/test_splits.py`:
 
@@ -2002,12 +2002,12 @@ def test_leave_k_out(spark):
     assert test_by_user.get("u2") == 1
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- **Step 2: Run test to verify it fails**
 
 Run: `.venv/bin/python -m pytest tests/spark/test_splits.py -v`
 Expected: FAIL — `ModuleNotFoundError`.
 
-- [ ] **Step 3: Implement the splits**
+- **Step 3: Implement the splits**
 
 Create `kzn_recsys/spark/splits.py`:
 
@@ -2088,12 +2088,12 @@ def leave_k_out_split(interactions_df, k: int, seed: int):
     return train_df, test_df
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- **Step 4: Run test to verify it passes**
 
 Run: `.venv/bin/python -m pytest tests/spark/test_splits.py -v`
 Expected: PASS (3 passed).
 
-- [ ] **Step 5: Commit**
+- **Step 5: Commit**
 
 ```bash
 git add kzn_recsys/spark/splits.py tests/spark/test_splits.py
@@ -2106,7 +2106,7 @@ git commit -m "feat(spark): random/temporal/leave-k-out splits"
 - Modify: `kzn_recsys/spark/model.py`
 - Test: `tests/spark/test_model.py`
 
-- [ ] **Step 1: Write the failing test**
+- **Step 1: Write the failing test**
 
 Append to `tests/spark/test_model.py`:
 
@@ -2135,12 +2135,12 @@ def test_evaluate_returns_metric_report(spark):
     assert report["num_users"] >= 1
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- **Step 2: Run test to verify it fails**
 
 Run: `.venv/bin/python -m pytest tests/spark/test_model.py -k evaluate -v`
 Expected: FAIL — `AttributeError: 'SparkEaseModel' object has no attribute 'evaluate'`.
 
-- [ ] **Step 3: Implement `evaluate`**
+- **Step 3: Implement `evaluate`**
 
 Add to `SparkEaseModel` in `kzn_recsys/spark/model.py` (and add `from . import metrics as _metrics` at the top):
 
@@ -2214,12 +2214,12 @@ Add to `SparkEaseModel` in `kzn_recsys/spark/model.py` (and add `from . import m
         }
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- **Step 4: Run test to verify it passes**
 
 Run: `.venv/bin/python -m pytest tests/spark/test_model.py -v`
 Expected: PASS (all model tests).
 
-- [ ] **Step 5: Commit**
+- **Step 5: Commit**
 
 ```bash
 git add kzn_recsys/spark/model.py tests/spark/test_model.py
@@ -2239,7 +2239,7 @@ git commit -m "feat(spark): evaluation harness on SparkEaseModel"
 
 Optimization target is NDCG@k. Folds are over users (each user's interactions partitioned into k folds). For each fold, train on the other folds, evaluate on the held-out fold.
 
-- [ ] **Step 1: Write the failing test**
+- **Step 1: Write the failing test**
 
 Create `tests/spark/test_tuning.py`:
 
@@ -2285,12 +2285,12 @@ def test_random_search_respects_n_iter(spark):
     assert len(result["trials"]) == 3
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- **Step 2: Run test to verify it fails**
 
 Run: `.venv/bin/python -m pytest tests/spark/test_tuning.py -v`
 Expected: FAIL — `cannot import name 'grid_search'`.
 
-- [ ] **Step 3: Implement tuning**
+- **Step 3: Implement tuning**
 
 Create `kzn_recsys/spark/tuning.py`:
 
@@ -2384,7 +2384,7 @@ def random_search(interactions_df, user_features_df, item_features_df,
                        param_sets, k_folds, eval_k, seed)
 ```
 
-- [ ] **Step 4: Export the search functions**
+- **Step 4: Export the search functions**
 
 Update `kzn_recsys/spark/__init__.py` to add the imports and `__all__` entries:
 
@@ -2394,12 +2394,12 @@ from kzn_recsys.spark.tuning import grid_search, random_search
 
 And extend `__all__` with `"grid_search"` and `"random_search"`.
 
-- [ ] **Step 5: Run test to verify it passes**
+- **Step 5: Run test to verify it passes**
 
 Run: `.venv/bin/python -m pytest tests/spark/test_tuning.py -v`
 Expected: PASS (2 passed).
 
-- [ ] **Step 6: Commit**
+- **Step 6: Commit**
 
 ```bash
 git add kzn_recsys/spark/tuning.py kzn_recsys/spark/__init__.py tests/spark/test_tuning.py
@@ -2418,7 +2418,7 @@ git commit -m "feat(spark): grid/random search with user k-fold CV"
 
 The current top-level `from kzn_recsys._native import (...)` is unconditional (`__init__.py:3`). In a restricted environment without the compiled extension, `import kzn_recsys` would raise. Wrap it in the same `try/except` pattern already used for `_HAS_ML_MODELS` / `_HAS_ONNX`, exposing `_HAS_NATIVE`.
 
-- [ ] **Step 1: Write the failing test**
+- **Step 1: Write the failing test**
 
 Create `tests/spark/test_optional_native.py`:
 
@@ -2437,12 +2437,12 @@ def test_has_native_flag_exists():
     assert isinstance(kzn_recsys._HAS_NATIVE, bool)
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- **Step 2: Run test to verify it fails**
 
 Run: `.venv/bin/python -m pytest tests/spark/test_optional_native.py -v`
 Expected: FAIL — `AttributeError: module 'kzn_recsys' has no attribute '_HAS_NATIVE'`.
 
-- [ ] **Step 3: Wrap the native import block**
+- **Step 3: Wrap the native import block**
 
 In `kzn_recsys/__init__.py`, replace the unconditional block at lines 3-28 (the `from kzn_recsys._native import (...)` and the `from kzn_recsys.fease_wrapper import (...)`) so the native portion is guarded. New top of file:
 
@@ -2479,18 +2479,18 @@ from kzn_recsys.schemas import EngagementSchema, MetadataSchema
 
 Move the `from kzn_recsys.fease_wrapper import (...)` import inside the `try` block as well (it depends on native split functions). Then guard the `__all__` additions: build `__all__` starting with always-available names (`EngagementSchema`, `MetadataSchema`), and extend with the native names only `if _HAS_NATIVE:`. Mirror the existing `if _HAS_ML_MODELS:` / `if _HAS_ONNX:` conditional-append structure already in the file (lines 79-101).
 
-- [ ] **Step 4: Run test to verify it passes**
+- **Step 4: Run test to verify it passes**
 
 Run: `.venv/bin/python -m pytest tests/spark/test_optional_native.py -v`
 Expected: PASS (2 passed).
 
-- [ ] **Step 5: Verify the native path still works**
+- **Step 5: Verify the native path still works**
 
 Run: `.venv/bin/maturin develop && .venv/bin/python -c "import kzn_recsys; print(kzn_recsys._HAS_NATIVE, kzn_recsys.FeaseModel)"`
 Expected: prints `True <class 'builtins.FeaseModel'>` and existing `tests/test_model.py` still passes:
 `.venv/bin/python -m pytest tests/test_model.py -q`
 
-- [ ] **Step 6: Commit**
+- **Step 6: Commit**
 
 ```bash
 git add kzn_recsys/__init__.py tests/spark/test_optional_native.py
@@ -2505,7 +2505,7 @@ git commit -m "feat: import kzn_recsys without the native extension (_HAS_NATIVE
 
 The primary `pyproject.toml` uses the maturin backend, which always compiles a native wheel. To ship a `py3-none-any` wheel for restricted environments, build a separate pure-Python distribution from the same sources. This task documents and configures that auxiliary build; it does not replace the maturin wheel.
 
-- [ ] **Step 1: Create the auxiliary pure-Python pyproject**
+- **Step 1: Create the auxiliary pure-Python pyproject**
 
 Create `packaging/pure-python/pyproject.toml`:
 
@@ -2534,7 +2534,7 @@ package-dir = {"" = "../.."}
 "kzn_recsys" = ["schemas.py", "fease_wrapper.py"]
 ```
 
-- [ ] **Step 2: Document the build**
+- **Step 2: Document the build**
 
 Create `packaging/pure-python/README.md`:
 
@@ -2566,7 +2566,7 @@ native) and `kzn_recsys_spark` (pure-Python). They share the `kzn_recsys`
 import namespace; do not install both into the same environment.
 ```
 
-- [ ] **Step 3: Build and verify the wheel**
+- **Step 3: Build and verify the wheel**
 
 Run:
 ```bash
@@ -2575,7 +2575,7 @@ cd packaging/pure-python && ../../.venv/bin/python -m build --wheel
 ```
 Expected: produces `dist/kzn_recsys_spark-0.1.0-py3-none-any.whl`. Confirm the filename ends in `py3-none-any.whl` (platform-independent).
 
-- [ ] **Step 4: Commit**
+- **Step 4: Commit**
 
 ```bash
 git add packaging/pure-python/pyproject.toml packaging/pure-python/README.md
@@ -2586,17 +2586,17 @@ git commit -m "build(spark): auxiliary pure-Python wheel for restricted environm
 
 ## Final verification
 
-- [ ] **Run the full Spark suite (native present)**
+- **Run the full Spark suite (native present)**
 
 Run: `.venv/bin/maturin develop && .venv/bin/python -m pytest tests/spark/ -v`
 Expected: all tests pass, including the `parity` tests.
 
-- [ ] **Run the Spark-free units only (simulating no wheel)**
+- **Run the Spark-free units only (simulating no wheel)**
 
 Run: `.venv/bin/python -m pytest tests/spark/test_ease_core.py tests/spark/test_feas_codec.py tests/spark/test_metrics.py -v`
 Expected: all pass without importing `_native` or booting Spark.
 
-- [ ] **Confirm existing native tests are unaffected**
+- **Confirm existing native tests are unaffected**
 
 Run: `.venv/bin/python -m pytest tests/test_model.py -q`
 Expected: pre-existing EASE tests still pass.

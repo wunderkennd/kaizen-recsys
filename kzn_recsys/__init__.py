@@ -31,7 +31,11 @@ try:  # The compiled Rust extension is absent in pure-Python (e.g. Spark) instal
 except ImportError:
     _HAS_NATIVE = False
 
-from kzn_recsys.schemas import EngagementSchema, MetadataSchema
+try:  # schemas.py needs pydantic + polars, absent in pure-Python (Spark) installs.
+    from kzn_recsys.schemas import EngagementSchema, MetadataSchema
+    _HAS_SCHEMAS = True
+except ImportError:
+    _HAS_SCHEMAS = False
 
 # SASRec and Two-Tower are only present when the extension is built with
 # the `ml-models` Cargo feature (default-off; EASE-only wheels omit them
@@ -54,10 +58,10 @@ try:  # pragma: no cover - import guard, exercised by build matrix
 except ImportError:
     _HAS_ML_MODELS = False
 
-__all__ = [
-    "EngagementSchema",
-    "MetadataSchema",
-]
+__all__ = []
+
+if _HAS_SCHEMAS:
+    __all__ += ["EngagementSchema", "MetadataSchema"]
 
 if _HAS_NATIVE:
     __all__ += [
