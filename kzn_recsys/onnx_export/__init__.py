@@ -90,9 +90,18 @@ def export_onnx(
     top_k_default: int = 100,
     dtype: str = "fp32",
     repeat_penalty_default: str | float = "exclude",
+    interactions: str | Path | None = None,
+    repeat_affinity_scale: float = 1.0,
+    repeat_affinity_prior_strength: float = 10.0,
     mlflow: bool = False,
 ) -> ExportResult:
     """Export a trained EASE ``FeaseModel`` to ONNX + sidecar (+ optional MLflow).
+
+    Pass ``interactions`` (the long-format training interactions file) to
+    learn a per-user repeat-affinity table (Tier C, spec §10): a smoothed
+    ``user_guid → ρ`` estimate persisted in ``vocab.json`` and applied by the
+    MLflow wrapper when the caller doesn't override ``repeat_penalty``. See
+    ``_repeat_affinity.estimate_repeat_affinity`` for the estimator.
 
     See ``docs/superpowers/specs/2026-06-01-onnx-export-design.md``.
     """
@@ -109,6 +118,17 @@ def export_onnx(
         if repeat_penalty_default == "exclude"
         else float(repeat_penalty_default)
     )
+
+    per_user_table = None
+    if interactions is not None:
+        from ._repeat_affinity import estimate_repeat_affinity
+
+        per_user_table = estimate_repeat_affinity(
+            interactions,
+            payload.item_index_to_guid,
+            scale=repeat_affinity_scale,
+            prior_strength=repeat_affinity_prior_strength,
+        )
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -132,6 +152,7 @@ def export_onnx(
         top_k_default=top_k_default,
         dtype=dtype,
         repeat_penalty_default=rp_default,
+        per_user_table=per_user_table,
     )
 
     mlflow_path = None

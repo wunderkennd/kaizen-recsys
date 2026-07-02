@@ -462,3 +462,184 @@ def test_bad_dtype_raises(trained_model, tmp_path):
 
     with pytest.raises(ValueError, match="dtype"):
         export_onnx(trained_model, tmp_path, dtype="bf16")
+
+
+# ---------------------------------------------------------------------------
+# Tier C: learned per-user repeat-affinity table (issue #69, spec §10)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def interactions_with_repeats(tmp_path):
+    """Long-format interactions: u_rep repeats G0 (4 events, 3 repeats);
+    u_new touches 3 distinct items (3 events, 0 repeats)."""
+    path = tmp_path / "tier_c_interactions.parquet"
+    pl.DataFrame(
+        {
+            "user_id": ["u_rep"] * 4 + ["u_new"] * 3,
+            "item_id": ["G0"] * 4 + ["G0", "G1", "G2"],
+            "value": [1.0] * 7,
+        }
+    ).write_parquet(path)
+    return path
+
+
+def test_repeat_affinity_estimator_smoothing(interactions_with_repeats):
+    from kzn_recsys.onnx_export._repeat_affinity import estimate_repeat_affinity
+
+    table = estimate_repeat_affinity(
+        interactions_with_repeats, ["G0", "G1", "G2", "G3"], scale=1.0, prior_strength=10.0
+    )
+    # global repeat rate = 3/7; empirical-Bayes: p_u = (r + 10*3/7) / (n + 10)
+    p_global = 3.0 / 7.0
+    exp_rep = 1.0 - (3 + 10 * p_global) / (4 + 10)
+    exp_new = 1.0 - (0 + 10 * p_global) / (3 + 10)
+    assert table["u_rep"] == pytest.approx(exp_rep, abs=1e-9)
+    assert table["u_new"] == pytest.approx(exp_new, abs=1e-9)
+    # The habitual repeater gets the smaller penalty.
+    assert table["u_rep"] < table["u_new"]
+
+
+def test_repeat_affinity_estimator_validations(tmp_path, interactions_with_repeats):
+    from kzn_recsys.onnx_export._repeat_affinity import estimate_repeat_affinity
+
+    # Missing required column.
+    bad = tmp_path / "bad.parquet"
+    pl.DataFrame({"user_id": ["u0"], "value": [1.0]}).write_parquet(bad)
+    with pytest.raises(ValueError, match="item_id"):
+        estimate_repeat_affinity(bad, ["G0"])
+
+    # Pre-aggregated (no repeated pairs) → warns that the table carries no signal.
+    agg = tmp_path / "agg.parquet"
+    pl.DataFrame(
+        {"user_id": ["u0", "u0"], "item_id": ["G0", "G1"], "value": [3.0, 2.0]}
+    ).write_parquet(agg)
+    with pytest.warns(UserWarning, match="no repeated"):
+        estimate_repeat_affinity(agg, ["G0", "G1"])
+
+    # Items disjoint from the model vocab → wrong-dataset warning.
+    with pytest.warns(UserWarning, match="item vocab"):
+        estimate_repeat_affinity(interactions_with_repeats, ["H0", "H1"])
+
+
+def test_vocab_per_user_table_flag(trained_model, tmp_path, interactions_with_repeats):
+    from kzn_recsys.onnx_export import export_onnx
+
+    # Without interactions: flag stays false, no table key.
+    res = export_onnx(trained_model, tmp_path / "plain")
+    policy = json.loads(res.vocab_path.read_text())["repeat_policy"]
+    assert policy["per_user_table_present"] is False
+    assert "per_user_table" not in policy
+
+    # With interactions: flag flips, table keyed by user guid.
+    res = export_onnx(
+        trained_model,
+        tmp_path / "tierc",
+        interactions=interactions_with_repeats,
+        repeat_affinity_scale=5.0,
+    )
+    policy = json.loads(res.vocab_path.read_text())["repeat_policy"]
+    assert policy["per_user_table_present"] is True
+    assert set(policy["per_user_table"]) == {"u_rep", "u_new"}
+    assert policy["per_user_table"]["u_rep"] < policy["per_user_table"]["u_new"]
+
+
+def test_mlflow_learned_rho_applied_by_user(trained_model, tmp_path, interactions_with_repeats):
+    import mlflow.pyfunc
+
+    from kzn_recsys.onnx_export import export_onnx
+
+    # Neutral default (ρ=0) so learned penalties are the only difference and
+    # unknown users are a clean control.
+    res = export_onnx(
+        trained_model,
+        tmp_path,
+        repeat_penalty_default=0.0,
+        interactions=interactions_with_repeats,
+        repeat_affinity_scale=5.0,
+        mlflow=True,
+    )
+    table = json.loads(res.vocab_path.read_text())["repeat_policy"]["per_user_table"]
+    loaded = mlflow.pyfunc.load_model(str(res.mlflow_path))
+
+    base = {"interactions": {"G0": 5.0}, "features": {}, "exclude": [], "top_k": 4}
+    out = loaded.predict(
+        pd.DataFrame(
+            [
+                {**base, "user_id": "u_rep"},
+                {**base, "user_id": "u_new"},
+                {**base, "user_id": "u_ghost"},  # unknown → default ρ=0
+            ]
+        )
+    )
+    g0 = out[out["item_guid"] == "G0"].set_index("user_row")["score"]
+    # Same raw score; adjusted = raw − ρ·seen, so the score gaps equal the ρ gaps.
+    assert g0[0] - g0[1] == pytest.approx(table["u_new"] - table["u_rep"], abs=1e-4)
+    assert g0[2] - g0[0] == pytest.approx(table["u_rep"], abs=1e-4)
+    # Habitual repeater outranks the non-repeater on the seen item.
+    assert g0[0] > g0[1]
+
+
+def test_mlflow_per_row_override_beats_table(trained_model, tmp_path, interactions_with_repeats):
+    import mlflow.pyfunc
+
+    from kzn_recsys.onnx_export import export_onnx
+
+    res = export_onnx(
+        trained_model,
+        tmp_path,
+        repeat_penalty_default=0.0,
+        interactions=interactions_with_repeats,
+        repeat_affinity_scale=5.0,
+        mlflow=True,
+    )
+    loaded = mlflow.pyfunc.load_model(str(res.mlflow_path))
+    base = {"interactions": {"G0": 5.0}, "features": {}, "exclude": [], "top_k": 4}
+    out = loaded.predict(
+        pd.DataFrame(
+            [
+                {**base, "user_id": "u_rep", "repeat_penalty": 0.0},  # override wins
+                {**base, "user_id": "u_rep"},  # table applies
+            ]
+        )
+    )
+    g0 = out[out["item_guid"] == "G0"].set_index("user_row")["score"]
+    assert g0[0] > g0[1]  # override ρ=0 beats the learned (positive) penalty
+
+
+def test_mlflow_integer_user_ids_survive_pandas_float_coercion(trained_model, tmp_path):
+    """Devin finding on #87: a mixed batch with a missing user_id coerces the
+    pandas column to float64 (123 -> 123.0); the lookup must still hit the
+    Polars-written "123" table key instead of silently falling back."""
+    import mlflow.pyfunc
+
+    from kzn_recsys.onnx_export import export_onnx
+
+    inter_path = tmp_path / "int_uid_interactions.parquet"
+    pl.DataFrame(
+        {
+            "user_id": [123] * 4 + [456] * 3,
+            "item_id": ["G0"] * 4 + ["G0", "G1", "G2"],
+            "value": [1.0] * 7,
+        }
+    ).write_parquet(inter_path)
+
+    res = export_onnx(
+        trained_model,
+        tmp_path,
+        repeat_penalty_default=0.0,
+        interactions=inter_path,
+        repeat_affinity_scale=5.0,
+        mlflow=True,
+    )
+    table = json.loads(res.vocab_path.read_text())["repeat_policy"]["per_user_table"]
+    assert "123" in table  # Polars cast writes integer keys as plain strings
+
+    loaded = mlflow.pyfunc.load_model(str(res.mlflow_path))
+    base = {"interactions": {"G0": 5.0}, "features": {}, "exclude": [], "top_k": 4}
+    # Row without user_id forces the column to float64 → 123 becomes 123.0.
+    out = loaded.predict(pd.DataFrame([{**base, "user_id": 123}, {**base}]))
+    g0 = out[out["item_guid"] == "G0"].set_index("user_row")["score"]
+    # Row 0 must get the learned penalty (score = raw - rho_123), not the
+    # default rho=0 that row 1 (no user_id) correctly falls back to.
+    assert g0[1] - g0[0] == pytest.approx(table["123"], abs=1e-4)
