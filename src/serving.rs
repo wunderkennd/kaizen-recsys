@@ -425,7 +425,7 @@ pub fn filter_sort_top_k<T: PartialOrd + Copy>(
 /// The fallback branch is byte-identical to scoring directly, so models
 /// without an index — today, all of them — are unchanged. `exclude` is the
 /// set of item indices to drop (e.g. already-interacted items).
-fn retrieve_or_dense(
+pub(crate) fn retrieve_or_dense(
     model: &dyn RecModel,
     input: ModelInput<'_>,
     exclude: &[usize],
@@ -515,6 +515,7 @@ mod tests {
             meta_weight: 0.0,
             mappings: dummy_mappings(),
             weighting_config: None,
+            transformation_schema: None,
         }
     }
 

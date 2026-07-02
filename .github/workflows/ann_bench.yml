@@ -1,0 +1,70 @@
+# ANN backend bench-off at scale (ADR-0004 Phase 2 follow-up, issue #82).
+#
+# Runs the `#[ignore]`d ann_backend_comparison test at catalog sizes where
+# ANN earns its keep (100k / 1M items, dim 128). Lives on CI Linux because
+# the crate is a PyO3 cdylib: locally on macOS only `cargo test` links, and
+# release-mode runs at these sizes are impractical on a laptop anyway.
+#
+# Embeddings are synthesized clusters (ANN_BENCH_MODE=synthetic) — training
+# a real Two-Tower at 1M items is infeasible on hosted runners; the recall
+# decision was made on real trained embeddings at 3k items (#76), this job
+# firms up the latency/memory ratios at scale.
+
+name: ANN scale bench
+
+on:
+  pull_request:
+    paths:
+      - 'src/ann/**'
+      - '.github/workflows/ann_bench.yml'
+  workflow_dispatch:
+
+jobs:
+  ann-scale-bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ~1k items per cluster at both scales — realistic neighborhood
+          # structure (a fixed 12 clusters at 1M means ~83k near-duplicates
+          # per cluster, pathological for graph indexes).
+          - n_items: 100000
+            clusters: 100
+          - n_items: 1000000
+            clusters: 1000
+
+    steps:
+    - name: Check out code
+      uses: actions/checkout@v6
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Cache Rust dependencies
+      uses: Swatinem/rust-cache@v2
+      with:
+        shared-key: ann-bench
+
+    # turbovec's dep tree (faer/cblas-sys) links OpenBLAS on Linux — same
+    # system dep the fast-blas job installs.
+    - name: Install system OpenBLAS
+      run: sudo apt-get update && sudo apt-get install -y libopenblas-dev
+
+    # Serving-path recall gate (#83): the ann-gated unit/integration tests
+    # (ANN retrieval vs dense parity, backend floors) run here because no
+    # other CI job compiles the `ann` feature.
+    - name: Run ann-gated tests (recall gate)
+      run: cargo test --release --features "ann ml-models" ann
+
+    - name: Run bench-off (N=${{ matrix.n_items }}, dim=128)
+      env:
+        ANN_BENCH_N_ITEMS: ${{ matrix.n_items }}
+        ANN_BENCH_DIM: 128
+        ANN_BENCH_K: 10
+        ANN_BENCH_MODE: synthetic
+        ANN_BENCH_CLUSTERS: ${{ matrix.clusters }}
+      run: |
+        cargo test --release --features "ann ml-models" \
+          -- --ignored ann_backend_comparison --nocapture

@@ -67,6 +67,8 @@ docker build . -t fease-builder
 
 **Important:** This project has `[workspace]` in its Cargo.toml to prevent cargo from inheriting the parent directory's workspace. The `.venv` uses Python 3.14; always use `.venv/bin/python` or `.venv/bin/maturin` for consistent builds.
 
+**Clones predating the `fease` → `kaizen-recsys` rename:** venv console-script shebangs bake the old absolute path and fail with `bad interpreter` — recreate the venv (`uv venv`, then reinstall) rather than patching shebangs, and always invoke tools as `.venv/bin/python -m pytest` (module form survives renames). Update the remote with `git remote set-url origin https://github.com/wunderkennd/kaizen-recsys.git` (the redirect from the old name works but is stale).
+
 ## Architecture
 
 ### Rust-Python Bridge (PyO3)
@@ -108,7 +110,8 @@ src/data_validation.rs — GaussianAnomalyDetector for pre-training data quality
 - **`models/ease.rs`**: `EaseAdapter` / `EaseAdapterRef` — implement `RecModel` over `RustFeaseModel` with no algorithmic change.
 - **`models/sasrec.rs`**: `SasRecConfig`, `SasRecTrainingConfig`, `train_sasrec()`, `TrainedSasRec` (transformer; `burn` backend). Magic-bytes-framed save/load.
 - **`models/two_tower.rs`**: `TwoTowerConfig`, `TrainParams`, `train()`, `TrainedTwoTower`. Reserved cold-start row trained via `id_dropout`. Magic-bytes-framed save/load.
-- **`model.rs`**: Pure Rust `RustFeaseModel`. EASE training, prediction, MLT similarity, validation, sparsity pruning.
+- **`model.rs`**: Pure Rust `RustFeaseModel`. EASE training, prediction (including `predict_raw` over raw features via the embedded transformation schema), MLT similarity, validation, sparsity pruning.
+- **`transform.rs`**: `FeatureTransformationSchema` + `NumericalBucketConfig` — declarative raw-feature → engineered-key transformation embedded in the model for zero-drift online inference (`FeaseModel.predict_raw`, persisted in FEAS v3).
 - **`data/sequences.rs`**: Build chronologically-ordered left-padded item sequences for SASRec from a long-format interactions file with a `days_ago` column.
 - **`data/triples.rs`**: Load `(user_idx, item_idx)` positive pairs (`TripleData`) and `FeatureTable` (categorical + dense per entity) for Two-Tower. Reserves a cold-start user row at index 0.
 - **`data_pipeline.rs`**: Long-format Parquet/CSV → sparse CSR matrices + string↔index mappings (EASE path). Hooks for weighting transforms.
@@ -116,13 +119,13 @@ src/data_validation.rs — GaussianAnomalyDetector for pre-training data quality
 - **`evaluation.rs`**: `random_split()`, `temporal_split()`, `leave_k_out_split()` for data splitting; `evaluate_model()` harness generic over `&dyn RecModel`. Per-user input construction routes through the `EvalAdapter` trait (`EaseEvalAdapter` → `Sparse`; `SasRecEvalAdapter` → chronologically-sorted `Sequence`, requires `days_ago` in the train file; `TwoTowerEvalAdapter` → `TowerUser`). `evaluate_with_adapter()` is the lower-level entrypoint used by tuning's per-fold scorer (#51).
 - **`tuning.rs`**: `SearchSpace` and `FoldEvaluator<P>` traits; `grid_search_with` / `random_search_with` runners generic over `P`. EASE keeps `grid_search()` / `random_search()` (`P = HyperParams`) for callers; per-model entrypoints layer on top. Parallelized via rayon (ADR-0002).
 - **`metrics.rs`**: Pure functions: `precision_at_k`, `recall_at_k`, `ndcg_at_k`, `mean_average_precision`, `coverage`, `hit_rate_at_k`.
-- **`serialization.rs`**: Binary save/load with `FEAS` magic bytes for EASE (format v2 persists `WeightingConfig`, v1 backward-compatible migration); top-level `load_model()` sniffs the magic bytes and dispatches to EASE / SASRec / Two-Tower loaders.
+- **`serialization.rs`**: Binary save/load with `FEAS` magic bytes for EASE (format v3 persists `WeightingConfig` + optional `FeatureTransformationSchema`; v1/v2 files migrate on load via version-field dispatch); top-level `load_model()` sniffs the magic bytes and dispatches to EASE / SASRec / Two-Tower loaders.
 - **`serving.rs`**: `ModelRegistry` for multi-territory model routing — stores `Box<dyn RecModel>`. `register()` keeps the EASE adapter shortcut; `register_model()` accepts any `RecModel`. String-id-native per-model predict methods (`predict_top_k_ease`, `predict_top_k_sasrec`, `predict_top_k_two_tower`) mirror the standalone model classes' input shapes; the legacy index-based `predict_top_k` is preserved (#56). `predict_batch()` / `predict_batch_top_k()` parallelized via rayon.
 - **`data_validation.rs`**: `GaussianAnomalyDetector` — confidence interval checks for data quality.
 
 ### Python Layer (`kzn_recsys/`)
 
-- `__init__.py` — Exports when the native extension is present (`_HAS_NATIVE`, i.e. any wheel except the pure-Python `kzn_recsys_spark` one): `FeaseModel`, `ModelRegistry`, `build_and_train`, `load_model`, `validate_data`, split functions, `grid_search` / `grid_search_ease` / `random_search` / `random_search_ease`, metrics. Exports when pydantic + polars are installed (`_HAS_SCHEMAS`): `EngagementSchema`, `MetadataSchema`. The pure-Python install exposes the recommender via the `kzn_recsys.spark` subpackage instead. Conditional on the extension being built with `--features ml-models` (gated by `_HAS_ML_MODELS`): `SASRecModel`, `build_and_train_sasrec`, `load_sasrec_model`, `grid_search_sasrec`, `random_search_sasrec`, `TwoTowerModel`, `build_and_train_two_tower`, `load_two_tower_model`, `grid_search_two_tower`, `random_search_two_tower`.
+- `__init__.py` — Exports when the native extension is present (`_HAS_NATIVE`, i.e. any wheel except the pure-Python `kzn_recsys_spark` one): `FeaseModel`, `ModelRegistry`, `FeatureTransformationSchema`, `NumericalBucketConfig`, `build_and_train`, `load_model`, `validate_data`, split functions, `grid_search` / `grid_search_ease` / `random_search` / `random_search_ease`, metrics. Exports when pydantic + polars are installed (`_HAS_SCHEMAS`): `EngagementSchema`, `MetadataSchema`. The pure-Python install exposes the recommender via the `kzn_recsys.spark` subpackage instead. Conditional on the extension being built with `--features ml-models` (gated by `_HAS_ML_MODELS`): `SASRecModel`, `build_and_train_sasrec`, `load_sasrec_model`, `grid_search_sasrec`, `random_search_sasrec`, `TwoTowerModel`, `build_and_train_two_tower`, `load_two_tower_model`, `grid_search_two_tower`, `random_search_two_tower`.
 - `schemas.py` — Pydantic models for column validation
 - `fease_wrapper.py` — Thin validation wrapper around `build_and_train()` with optional advanced weighting params
 - `train.py` — CLI training script (`--interactions`, `--user-features`, `--item-features`, `--output`)
@@ -135,6 +138,14 @@ src/data_validation.rs — GaussianAnomalyDetector for pre-training data quality
   `vocab.json` sidecar, and an optional MLflow pyfunc model. See
   `docs/superpowers/specs/2026-06-01-onnx-export-design.md`. Regenerate the Rust
   ort parity fixtures with `kzn_recsys.onnx_export._write_rust_fixture(model, "tests/fixtures")`.
+  `export_onnx` also accepts a trained `TwoTowerModel` (#85): the graph is the
+  user tower (id/cat embedding Gather → dense Gemm → 2-layer MLP → L2
+  normalize) → MatMul against the baked item catalog matrix → the same
+  penalty/mask/TopK tail; inputs are `user_idx` (0 = cold-start row) plus
+  optional `cat_ids`/`cat_mask`/`dense`, and the baked repeat-penalty default
+  is neutral (ρ = 0). Quantization / MLflow / Tier C repeat-affinity are
+  EASE-only. Two-Tower ort fixtures regenerate via
+  `kzn_recsys.onnx_export._write_rust_fixture_two_tower(model, "tests/fixtures")`.
 
 ## Key Concepts
 

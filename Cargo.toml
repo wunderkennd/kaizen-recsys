@@ -50,6 +50,12 @@ burn-ndarray = { version = "0.21", optional = true }
 # and the PyPI wheels never see it.
 nalgebra-lapack = { version = "0.27", optional = true, default-features = false }
 
+# Optional — approximate-nearest-neighbor retrieval backends for the Two-Tower serving
+# path (ADR-0004 Phase 2). Only pulled in with the `ann` feature. Absent from the default
+# dependency graph — a standard `cargo build` and the PyPI wheels never see them.
+usearch = { version = "2.25", optional = true }
+turbovec = { version = "0.9", optional = true }
+
 # Per-platform BLAS/LAPACK backend auto-selection for the `fast-blas` feature.
 # These target tables add a backend feature to the SAME optional
 # `nalgebra-lapack` dep declared above; they only take effect once `fast-blas`
@@ -89,6 +95,11 @@ ml-models = ["dep:burn", "dep:burn-ndarray"]
 # the matching nalgebra-lapack feature instead.
 fast-blas = ["dep:nalgebra-lapack"]
 
+# Approximate-nearest-neighbor retrieval backends for the Two-Tower serving
+# path (ADR-0004 Phase 2). Default off; composes with ml-models. Pulls in
+# whichever ANN crate(s) are being benched/used.
+ann = ["dep:usearch", "dep:turbovec"]
+
 [dev-dependencies]
 # ONNX Runtime bindings — used ONLY by the in-crate ONNX parity test
 # (src/onnx_export.rs #[cfg(test)]). Not in the default or wheel dependency
@@ -96,3 +107,12 @@ fast-blas = ["dep:nalgebra-lapack"]
 # no system install.
 ort = { version = "=2.0.0-rc.12", default-features = false, features = ["download-binaries", "tls-native", "ndarray", "std"] }
 ndarray = "0.17"
+# Benchmark harness for the ANN retrieval-index evaluation (issue #76 /
+# ADR-0004 Phase 2). Drives latency measurement for the exact baseline and,
+# later, the ANN backends. The bench itself is library-agnostic scaffolding:
+# usearch / TurboVec plug in once the backend decision is made.
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "ann_retrieval"
+harness = false

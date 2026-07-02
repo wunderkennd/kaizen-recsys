@@ -3,7 +3,9 @@
 try:  # The compiled Rust extension is absent in pure-Python (e.g. Spark) installs.
     from kzn_recsys._native import (
         FeaseModel,
+        FeatureTransformationSchema,
         ModelRegistry,
+        NumericalBucketConfig,
         build_and_train,
         coverage,
         grid_search_ease,
@@ -66,6 +68,8 @@ if _HAS_SCHEMAS:
 if _HAS_NATIVE:
     __all__ += [
         "FeaseModel",
+        "FeatureTransformationSchema",
+        "NumericalBucketConfig",
         "ModelRegistry",
         "build_and_train",
         "coverage",

@@ -44,6 +44,10 @@ pub struct RustFeaseModel {
     /// Mappings to convert between string IDs and numeric indices
     pub mappings: Mappings,
     pub weighting_config: Option<WeightingConfig>,
+    /// Declarative raw-feature transformation for `predict_raw` (#71 theme A).
+    /// Runtime-only until format V3 persists it (theme B); loading a V1/V2
+    /// file leaves it `None`.
+    pub transformation_schema: Option<crate::transform::FeatureTransformationSchema>,
 }
 
 impl RustFeaseModel {
@@ -72,6 +76,7 @@ impl RustFeaseModel {
             meta_weight,
             mappings,
             weighting_config: None,
+            transformation_schema: None,
         }
     }
 
@@ -378,6 +383,59 @@ impl RustFeaseModel {
         p_items.iter().cloned().collect()
     }
 
+    /// Predicts scores for a user from string interaction keys and *raw*
+    /// polymorphic user features (zero-drift online inference, #71 theme A).
+    ///
+    /// Raw features are routed through the embedded [`transformation_schema`]
+    /// when present, so the exact train-time engineering runs at serve time.
+    /// Without a schema, features are used as-is when their values are
+    /// numeric (or numeric strings) — i.e. the caller already engineered them.
+    /// Unknown item GUIDs and feature keys are skipped, matching the string-id
+    /// tolerance of the serving layer.
+    ///
+    /// [`transformation_schema`]: RustFeaseModel::transformation_schema
+    pub fn predict_raw(
+        &self,
+        interactions: &std::collections::HashMap<String, f64>,
+        raw_user_features: &std::collections::HashMap<String, serde_json::Value>,
+        beta: f64,
+    ) -> Vec<f64> {
+        // 1. Transform raw user features via the embedded schema if available.
+        let transformed_features = if let Some(ref schema) = self.transformation_schema {
+            crate::transform::transform_features(raw_user_features, schema)
+        } else {
+            let mut fm = std::collections::HashMap::new();
+            for (k, v) in raw_user_features {
+                if let Some(f) = v.as_f64() {
+                    fm.insert(k.clone(), f);
+                } else if let Some(f) = v.as_str().and_then(|s| s.parse::<f64>().ok()) {
+                    fm.insert(k.clone(), f);
+                }
+            }
+            fm
+        };
+
+        // 2. String keys → internal indices (unknowns skipped).
+        let user_interactions: Vec<(usize, f64)> = interactions
+            .iter()
+            .filter_map(|(guid, &value)| {
+                self.mappings.item_to_idx.get(guid).map(|&idx| (idx, value))
+            })
+            .collect();
+        let user_features: Vec<(usize, f64)> = transformed_features
+            .iter()
+            .filter_map(|(name, &value)| {
+                self.mappings
+                    .user_feature_to_idx
+                    .get(name)
+                    .map(|&idx| (idx, value))
+            })
+            .collect();
+
+        // 3. Delegate to the index-based prediction engine.
+        self.predict(&user_interactions, &user_features, beta)
+    }
+
     /// Predicts similar items for a given item (More-Like-This / MLT).
     ///
     /// Uses the item-item block of the S matrix to find the most similar items
@@ -638,6 +696,7 @@ mod tests {
             meta_weight: 0.0,
             mappings: dummy_mappings(),
             weighting_config: None,
+            transformation_schema: None,
         };
 
         // --- 1. Warm User: interacts with Item 0, has Feature 1 ---
@@ -661,6 +720,62 @@ mod tests {
         assert!((scores_cold[1] - 0.0).abs() < 1e-6); // Item 1
         assert!((scores_cold[2] - 1.0).abs() < 1e-6); // Item 2 (recommended)
         assert!((scores_cold[3] - 0.0).abs() < 1e-6); // Item 3
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_predict_raw_routes_through_schema() -> Result<()> {
+        use crate::transform::FeatureTransformationSchema;
+        use std::collections::HashMap;
+
+        let n_items = 4;
+        let n_user_features = 3;
+        let total_dim = n_items + n_user_features;
+
+        // Same hand-built S as the warm/cold test: feature 0 ↔ item 2.
+        let mut s_mat = DMatrix::<f64>::zeros(total_dim, total_dim);
+        s_mat[(2, 4)] = 1.0;
+        s_mat[(4, 2)] = 1.0;
+
+        let mut mappings = dummy_mappings();
+        mappings.item_to_idx = (0..n_items).map(|i| (format!("item_{i}"), i)).collect();
+        mappings.user_feature_to_idx = [("plan_Premium".to_string(), 0)].into_iter().collect();
+
+        let mut schema = FeatureTransformationSchema::new();
+        schema.add_categorical("plan".to_string(), "plan".to_string());
+
+        let model = RustFeaseModel {
+            s_matrix: s_mat,
+            num_items: n_items,
+            num_user_features: n_user_features,
+            num_item_features: 0,
+            alpha: 1.0,
+            beta: 1.0,
+            lambda_: 100.0,
+            meta_weight: 0.0,
+            mappings,
+            weighting_config: None,
+            transformation_schema: Some(schema),
+        };
+
+        // Raw "plan": "Premium" must reach feature 0 via the schema and score
+        // item 2; the unknown item GUID is skipped, not an error.
+        let mut raw = HashMap::new();
+        raw.insert("plan".to_string(), serde_json::json!("Premium"));
+        let mut interactions = HashMap::new();
+        interactions.insert("item_nope".to_string(), 1.0);
+        let scores = model.predict_raw(&interactions, &raw, 1.0);
+        assert_eq!(scores.len(), n_items);
+        assert!((scores[2] - 1.0).abs() < 1e-6);
+
+        // Without a schema, already-engineered numeric features pass through.
+        let mut model_no_schema = model.clone();
+        model_no_schema.transformation_schema = None;
+        let mut engineered = HashMap::new();
+        engineered.insert("plan_Premium".to_string(), serde_json::json!(1.0));
+        let scores = model_no_schema.predict_raw(&HashMap::new(), &engineered, 1.0);
+        assert!((scores[2] - 1.0).abs() < 1e-6);
 
         Ok(())
     }
@@ -693,6 +808,7 @@ mod tests {
             meta_weight: 0.0,
             mappings: dummy_mappings(),
             weighting_config: None,
+            transformation_schema: None,
         };
 
         // Similar to Item 0
@@ -776,6 +892,7 @@ mod tests {
             meta_weight: 0.0,
             mappings: dummy_mappings(),
             weighting_config: None,
+            transformation_schema: None,
         };
 
         let report = model.validate();
@@ -796,6 +913,7 @@ mod tests {
             meta_weight: 0.0,
             mappings: dummy_mappings(),
             weighting_config: None,
+            transformation_schema: None,
         };
 
         let report = model.validate();

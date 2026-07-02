@@ -18,7 +18,11 @@ _U64 = struct.Struct("<Q")
 _F64 = struct.Struct("<d")
 
 _MAGIC = b"FEAS"
-_FORMAT_VERSION = 2
+_FORMAT_VERSION = 2  # version Spark authors (EASE core; no native transform schema)
+# Versions the reader accepts. v3 adds a trailing transformation_schema used only
+# by native predict_raw; Spark reads the shared EASE core and carries v3's trailing
+# bytes verbatim (see FeaseArtifact.transformation_schema_raw).
+_SUPPORTED_VERSIONS = (1, 2, 3)
 
 
 def _read_exact(buf, n: int) -> bytes:
@@ -128,6 +132,11 @@ class FeaseArtifact:
     item_feature_to_idx: list
     idx_to_item_feature: list
     weighting_config: Optional[WeightingConfig] = None
+    # FEAS v3 appends `transformation_schema: Option<FeatureTransformationSchema>`
+    # (native predict_raw only — irrelevant to Spark EASE scoring). We carry the
+    # trailing bytes verbatim so a loaded v3 model re-saves byte-for-byte without
+    # having to parse the schema. Empty for v1/v2.
+    transformation_schema_raw: bytes = b""
 
 
 def _write_map_string_f64(buf, m: dict) -> None:
@@ -207,6 +216,8 @@ def write_feas(artifact: FeaseArtifact, path: str) -> None:
     _write_vec_string(buf, a.idx_to_item_feature)
     if a.version >= 2:
         _write_weighting(buf, a.weighting_config)
+    # v3+ trailing transformation_schema, carried verbatim (b"" for v1/v2).
+    buf.write(a.transformation_schema_raw)
     with open(path, "wb") as fh:
         fh.write(_MAGIC)
         fh.write(buf.getvalue())
@@ -219,7 +230,7 @@ def read_feas(path: str) -> FeaseArtifact:
         raise ValueError(f"not a FEAS file: magic={blob[:4]!r}")
     buf = io.BytesIO(blob[4:])
     version = _read_u32(buf)
-    if version not in (1, _FORMAT_VERSION):
+    if version not in _SUPPORTED_VERSIONS:
         raise ValueError(f"unsupported FEAS version: {version}")
     s_nrows = _read_u64(buf)
     s_ncols = _read_u64(buf)
@@ -240,6 +251,7 @@ def read_feas(path: str) -> FeaseArtifact:
     item_feature_to_idx = _read_vec_pair_string_usize(buf)
     idx_to_item_feature = _read_vec_string(buf)
     weighting_config = _read_weighting(buf) if version >= 2 else None
+    transformation_schema_raw = buf.read()  # v3+ trailing bytes, carried verbatim
 
     s_data = np.reshape(np.asarray(s_flat, dtype=np.float64),
                         (s_nrows, s_ncols), order="F")
@@ -252,4 +264,5 @@ def read_feas(path: str) -> FeaseArtifact:
         user_feature_to_idx=user_feature_to_idx, idx_to_user_feature=idx_to_user_feature,
         item_feature_to_idx=item_feature_to_idx, idx_to_item_feature=idx_to_item_feature,
         weighting_config=weighting_config,
+        transformation_schema_raw=transformation_schema_raw,
     )

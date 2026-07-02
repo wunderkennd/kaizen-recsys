@@ -23,6 +23,20 @@ pub fn s_items_row_major_le_bytes(model: &RustFeaseModel) -> (Vec<u8>, usize, us
     (bytes, rows, cols)
 }
 
+/// Little-endian `f32` encoding of an already-row-major host slice. Used by
+/// the Two-Tower `export_payload` (#85), whose weights come off burn tensors
+/// as row-major `Vec<f32>`; the Python side decodes with
+/// `np.frombuffer(bytes, dtype="<f4")`. Gated on `ml-models` because its
+/// only caller (the Two-Tower pymethod) is — dead code otherwise.
+#[cfg(feature = "ml-models")]
+pub fn f32s_le_bytes(vals: &[f32]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(vals.len() * 4);
+    for v in vals {
+        bytes.extend_from_slice(&v.to_le_bytes());
+    }
+    bytes
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -67,6 +81,7 @@ mod tests {
             meta_weight: 0.0,
             mappings: dummy_mappings(),
             weighting_config: None,
+            transformation_schema: None,
         };
 
         let (bytes, rows, cols) = s_items_row_major_le_bytes(&model);
@@ -149,6 +164,101 @@ mod tests {
         assert_eq!(raw_flat.len(), exp.len(), "raw_scores length mismatch");
         for (a, b) in raw_flat.iter().zip(exp.iter()) {
             assert!((a - b).abs() < 1e-4, "ort raw_scores mismatch: {a} vs {b}");
+        }
+    }
+
+    /// Two-Tower fixture parity (#85). Like the EASE test above, this needs
+    /// no model code — only the committed fixture files — so it runs under
+    /// every feature combination. Regenerate via
+    /// `kzn_recsys.onnx_export._write_rust_fixture_two_tower`.
+    #[test]
+    fn ort_two_tower_fixture_matches_expected_raw_scores() {
+        use ort::session::Session;
+        use ort::value::TensorRef;
+        use std::fs;
+
+        let onnx = std::path::Path::new("tests/fixtures/two_tower_fixture.onnx");
+        assert!(
+            onnx.exists(),
+            "tests/fixtures/two_tower_fixture.onnx missing — regenerate via kzn_recsys.onnx_export._write_rust_fixture_two_tower"
+        );
+
+        let inputs: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string("tests/fixtures/two_tower_inputs.json")
+                .expect("tests/fixtures/two_tower_inputs.json missing — regenerate via kzn_recsys.onnx_export._write_rust_fixture_two_tower"))
+                .unwrap();
+        let expected: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string("tests/fixtures/two_tower_expected.json")
+                .expect("tests/fixtures/two_tower_expected.json missing — regenerate via kzn_recsys.onnx_export._write_rust_fixture_two_tower"))
+                .unwrap();
+
+        let user_idx: Vec<i64> = inputs["user_idx"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_i64().unwrap())
+            .collect();
+        let cat_ids: Vec<i64> = inputs["cat_ids"][0]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_i64().unwrap())
+            .collect();
+        let cat_mask: Vec<f32> = inputs["cat_mask"][0]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_f64().unwrap() as f32)
+            .collect();
+        let dense: Vec<f32> = inputs["dense"][0]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_f64().unwrap() as f32)
+            .collect();
+        let exp: Vec<f32> = expected["raw_scores"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_f64().unwrap() as f32)
+            .collect();
+
+        let m = exp.len();
+        let c = cat_ids.len();
+        let d = dense.len();
+
+        let mut session = Session::builder().unwrap().commit_from_file(onnx).unwrap();
+
+        let user_idx = ndarray::Array1::<i64>::from_vec(user_idx);
+        let cat_ids = ndarray::Array2::from_shape_vec((1, c), cat_ids).unwrap();
+        let cat_mask = ndarray::Array2::from_shape_vec((1, c), cat_mask).unwrap();
+        let dense = ndarray::Array2::from_shape_vec((1, d), dense).unwrap();
+        let mask = ndarray::Array2::<f32>::ones((1, m));
+        let seen = ndarray::Array2::<f32>::zeros((1, m));
+        let repeat_penalty = ndarray::Array2::<f32>::zeros((1, 1));
+        let k_arr = ndarray::Array1::<i64>::from_vec(vec![m as i64]);
+
+        let outputs = session
+            .run(ort::inputs! {
+                "user_idx" => TensorRef::from_array_view(user_idx.view()).unwrap(),
+                "cat_ids" => TensorRef::from_array_view(cat_ids.view()).unwrap(),
+                "cat_mask" => TensorRef::from_array_view(cat_mask.view()).unwrap(),
+                "dense" => TensorRef::from_array_view(dense.view()).unwrap(),
+                "mask" => TensorRef::from_array_view(mask.view()).unwrap(),
+                "seen" => TensorRef::from_array_view(seen.view()).unwrap(),
+                "repeat_penalty" => TensorRef::from_array_view(repeat_penalty.view()).unwrap(),
+                "k" => TensorRef::from_array_view(k_arr.view()).unwrap(),
+            })
+            .unwrap();
+
+        let raw = outputs["raw_scores"].try_extract_array::<f32>().unwrap();
+        let raw_flat: Vec<f32> = raw.iter().copied().collect();
+        assert_eq!(raw_flat.len(), exp.len(), "raw_scores length mismatch");
+        for (a, b) in raw_flat.iter().zip(exp.iter()) {
+            assert!(
+                (a - b).abs() < 1e-4,
+                "ort two-tower raw_scores mismatch: {a} vs {b}"
+            );
         }
     }
 }

@@ -6,6 +6,7 @@
 
 use crate::data_pipeline::Mappings;
 use crate::model::RustFeaseModel;
+use crate::transform::FeatureTransformationSchema;
 use crate::weighting::WeightingConfig;
 use anyhow::{Context, Result};
 use nalgebra::DMatrix;
@@ -15,7 +16,7 @@ use std::path::Path;
 
 /// Current version of the serialization format.
 /// Increment when making breaking changes to `SerializedModel`.
-const FORMAT_VERSION: u32 = 2;
+const FORMAT_VERSION: u32 = 3;
 
 /// Magic bytes to identify FEASE model files.
 const MAGIC: &[u8; 4] = b"FEAS";
@@ -46,7 +47,7 @@ struct SerializedModelV1 {
 }
 
 impl SerializedModelV1 {
-    fn into_v2(self) -> SerializedModel {
+    fn into_current(self) -> SerializedModel {
         SerializedModel {
             version: self.version,
             s_nrows: self.s_nrows,
@@ -68,6 +69,61 @@ impl SerializedModelV1 {
             item_feature_to_idx: self.item_feature_to_idx,
             idx_to_item_feature: self.idx_to_item_feature,
             weighting_config: None,
+            transformation_schema: None,
+        }
+    }
+}
+
+/// V2 serialization format (without transformation_schema).
+/// Used for backward-compatible loading of models saved before v3.
+#[derive(Serialize, Deserialize)]
+struct SerializedModelV2 {
+    version: u32,
+    s_nrows: usize,
+    s_ncols: usize,
+    s_data: Vec<f64>,
+    num_items: usize,
+    num_user_features: usize,
+    num_item_features: usize,
+    alpha: f64,
+    beta: f64,
+    lambda_: f64,
+    meta_weight: f64,
+    user_to_idx: Vec<(String, usize)>,
+    idx_to_user: Vec<String>,
+    item_to_idx: Vec<(String, usize)>,
+    idx_to_item: Vec<String>,
+    user_feature_to_idx: Vec<(String, usize)>,
+    idx_to_user_feature: Vec<String>,
+    item_feature_to_idx: Vec<(String, usize)>,
+    idx_to_item_feature: Vec<String>,
+    weighting_config: Option<WeightingConfig>,
+}
+
+impl SerializedModelV2 {
+    fn into_current(self) -> SerializedModel {
+        SerializedModel {
+            version: self.version,
+            s_nrows: self.s_nrows,
+            s_ncols: self.s_ncols,
+            s_data: self.s_data,
+            num_items: self.num_items,
+            num_user_features: self.num_user_features,
+            num_item_features: self.num_item_features,
+            alpha: self.alpha,
+            beta: self.beta,
+            lambda_: self.lambda_,
+            meta_weight: self.meta_weight,
+            user_to_idx: self.user_to_idx,
+            idx_to_user: self.idx_to_user,
+            item_to_idx: self.item_to_idx,
+            idx_to_item: self.idx_to_item,
+            user_feature_to_idx: self.user_feature_to_idx,
+            idx_to_user_feature: self.idx_to_user_feature,
+            item_feature_to_idx: self.item_feature_to_idx,
+            idx_to_item_feature: self.idx_to_item_feature,
+            weighting_config: self.weighting_config,
+            transformation_schema: None,
         }
     }
 }
@@ -105,6 +161,8 @@ struct SerializedModel {
     idx_to_item_feature: Vec<String>,
     /// Weighting configuration used during training (added in v2).
     weighting_config: Option<WeightingConfig>,
+    /// Declarative raw-feature transformation for predict_raw (added in v3).
+    transformation_schema: Option<FeatureTransformationSchema>,
 }
 
 impl SerializedModel {
@@ -150,18 +208,11 @@ impl SerializedModel {
                 .collect(),
             idx_to_item_feature: model.mappings.idx_to_item_feature.clone(),
             weighting_config: model.weighting_config.clone(),
+            transformation_schema: model.transformation_schema.clone(),
         }
     }
 
     fn into_model(self) -> Result<RustFeaseModel> {
-        if self.version != FORMAT_VERSION && self.version != 1 {
-            anyhow::bail!(
-                "Unsupported model format version: {} (expected {} or 1)",
-                self.version,
-                FORMAT_VERSION
-            );
-        }
-
         let expected_len = self.s_nrows * self.s_ncols;
         if self.s_data.len() != expected_len {
             anyhow::bail!(
@@ -199,12 +250,6 @@ impl SerializedModel {
             idx_to_item_feature: self.idx_to_item_feature,
         };
 
-        let weighting_config = if self.version >= 2 {
-            self.weighting_config
-        } else {
-            None
-        };
-
         Ok(RustFeaseModel {
             s_matrix,
             num_items: self.num_items,
@@ -215,7 +260,8 @@ impl SerializedModel {
             lambda_: self.lambda_,
             meta_weight: self.meta_weight,
             mappings,
-            weighting_config,
+            weighting_config: self.weighting_config,
+            transformation_schema: self.transformation_schema,
         })
     }
 }
@@ -264,14 +310,33 @@ pub fn load_model(path: &Path) -> Result<RustFeaseModel> {
     }
 
     let payload = &data[MAGIC.len()..];
-    let serialized: SerializedModel = match bincode::deserialize::<SerializedModel>(payload) {
-        Ok(s) => s,
-        Err(_) => {
-            let v1: SerializedModelV1 = bincode::deserialize(payload)
-                .context("Failed to deserialize model data (tried v2 and v1 formats)")?;
-            log::info!("Loaded v1 model file, migrating to v2 format");
-            v1.into_v2()
+
+    // Version-field-driven dispatch: every format starts with a `version: u32`
+    // (bincode 1.x fixed-int little-endian), so peek it and route to the
+    // matching decoder explicitly. A deserialize-and-see try-chain would be
+    // fragile here: bincode ignores trailing bytes after a successful decode,
+    // so a corrupted newer-format file can silently misparse as an older one.
+    if payload.len() < 4 {
+        anyhow::bail!("Model payload truncated before the version field");
+    }
+    let version = u32::from_le_bytes(payload[..4].try_into().expect("checked length"));
+    let serialized: SerializedModel = match version {
+        1 => {
+            let v1: SerializedModelV1 =
+                bincode::deserialize(payload).context("Failed to deserialize v1 model data")?;
+            log::info!("Loaded v1 model file, migrating to current format");
+            v1.into_current()
         }
+        2 => {
+            let v2: SerializedModelV2 =
+                bincode::deserialize(payload).context("Failed to deserialize v2 model data")?;
+            log::info!("Loaded v2 model file, migrating to current format");
+            v2.into_current()
+        }
+        3 => bincode::deserialize(payload).context("Failed to deserialize v3 model data")?,
+        other => anyhow::bail!(
+            "Unsupported model format version: {other} (this build reads versions 1..={FORMAT_VERSION})"
+        ),
     };
 
     let model = serialized.into_model()?;
@@ -339,6 +404,7 @@ mod tests {
                 idx_to_item_feature: vec![],
             },
             weighting_config: None,
+            transformation_schema: None,
         }
     }
 
@@ -563,5 +629,185 @@ mod tests {
         assert!(loaded.weighting_config.is_none());
         assert_eq!(loaded.num_items, model.num_items);
         assert_eq!(loaded.num_user_features, model.num_user_features);
+    }
+
+    /// Bincode-encode a value with the FEAS magic prefix, exactly as
+    /// save_model does — used to synthesize old-format files.
+    fn write_framed<T: serde::Serialize>(value: &T, path: &Path) {
+        let encoded = bincode::serialize(value).expect("serialize");
+        let mut data = Vec::with_capacity(MAGIC.len() + encoded.len());
+        data.extend_from_slice(MAGIC);
+        data.extend(encoded);
+        fs::write(path, &data).expect("write");
+    }
+
+    fn make_v2_struct(model: &RustFeaseModel) -> SerializedModelV2 {
+        SerializedModelV2 {
+            version: 2,
+            s_nrows: model.s_matrix.nrows(),
+            s_ncols: model.s_matrix.ncols(),
+            s_data: model.s_matrix.as_slice().to_vec(),
+            num_items: model.num_items,
+            num_user_features: model.num_user_features,
+            num_item_features: model.num_item_features,
+            alpha: model.alpha,
+            beta: model.beta,
+            lambda_: model.lambda_,
+            meta_weight: model.meta_weight,
+            user_to_idx: model
+                .mappings
+                .user_to_idx
+                .iter()
+                .map(|(k, v)| (k.clone(), *v))
+                .collect(),
+            idx_to_user: model.mappings.idx_to_user.clone(),
+            item_to_idx: model
+                .mappings
+                .item_to_idx
+                .iter()
+                .map(|(k, v)| (k.clone(), *v))
+                .collect(),
+            idx_to_item: model.mappings.idx_to_item.clone(),
+            user_feature_to_idx: model
+                .mappings
+                .user_feature_to_idx
+                .iter()
+                .map(|(k, v)| (k.clone(), *v))
+                .collect(),
+            idx_to_user_feature: model.mappings.idx_to_user_feature.clone(),
+            item_feature_to_idx: model
+                .mappings
+                .item_feature_to_idx
+                .iter()
+                .map(|(k, v)| (k.clone(), *v))
+                .collect(),
+            idx_to_item_feature: model.mappings.idx_to_item_feature.clone(),
+            weighting_config: model.weighting_config.clone(),
+        }
+    }
+
+    #[test]
+    fn test_v2_migration_loads_with_weighting_and_none_schema() {
+        // PR #62 finding 4: the V2 -> current migration path had no test.
+        let mut model = make_test_model();
+        let mut event_weights = std::collections::HashMap::new();
+        event_weights.insert("click".to_string(), 2.0);
+        model.weighting_config = Some(WeightingConfig {
+            event_weights: Some(event_weights),
+            decay_rate: 0.02,
+            ips_alpha: 0.3,
+            sparsity_threshold: 1e-5,
+        });
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("test_v2_migration.fease");
+        write_framed(&make_v2_struct(&model), &path);
+
+        let loaded = load_model(&path).expect("Failed to load v2 model");
+        let wc = loaded
+            .weighting_config
+            .expect("weighting survives migration");
+        assert!((wc.decay_rate - 0.02).abs() < 1e-12);
+        assert_eq!(
+            wc.event_weights.expect("event weights").get("click"),
+            Some(&2.0)
+        );
+        assert!(loaded.transformation_schema.is_none());
+    }
+
+    #[test]
+    fn test_v3_schema_roundtrip() {
+        use crate::transform::{FeatureTransformationSchema, NumericalBucketConfig};
+
+        let mut model = make_test_model();
+        let mut schema = FeatureTransformationSchema::new();
+        schema.add_categorical("plan".to_string(), "plan".to_string());
+        schema.add_numerical(
+            "tenure_days".to_string(),
+            NumericalBucketConfig::try_new(
+                "tenure".to_string(),
+                vec![7.0, 30.0],
+                vec!["new".to_string(), "active".to_string(), "loyal".to_string()],
+            )
+            .unwrap(),
+        );
+        model.transformation_schema = Some(schema.clone());
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("test_v3_schema.fease");
+        save_model(&model, &path).expect("save");
+        let loaded = load_model(&path).expect("load");
+
+        assert_eq!(loaded.transformation_schema, Some(schema));
+    }
+
+    #[test]
+    fn test_unknown_version_fails_loudly() {
+        // Version-field dispatch (PR #62 finding 5): a future/garbage version
+        // must error with the version number, not misparse as an old format.
+        let model = make_test_model();
+        let mut v2 = make_v2_struct(&model);
+        v2.version = 99;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("test_unknown_version.fease");
+        write_framed(&v2, &path);
+
+        let err = load_model(&path).unwrap_err().to_string();
+        assert!(
+            err.contains("Unsupported model format version: 99"),
+            "{err}"
+        );
+    }
+
+    /// Regenerates the committed V1/V2 fixture files. Run manually when the
+    /// fixture model needs to change (then commit the outputs):
+    /// cargo test --release regenerate_serialization_fixtures -- --ignored
+    #[test]
+    #[ignore = "writes tests/fixtures/model_v{1,2}.fease; run manually"]
+    fn regenerate_serialization_fixtures() {
+        let model = make_test_model();
+        let dir = Path::new("tests/fixtures");
+        fs::create_dir_all(dir).expect("fixtures dir");
+
+        let v2 = make_v2_struct(&model);
+        let v1 = SerializedModelV1 {
+            version: 1,
+            s_nrows: v2.s_nrows,
+            s_ncols: v2.s_ncols,
+            s_data: v2.s_data.clone(),
+            num_items: v2.num_items,
+            num_user_features: v2.num_user_features,
+            num_item_features: v2.num_item_features,
+            alpha: v2.alpha,
+            beta: v2.beta,
+            lambda_: v2.lambda_,
+            meta_weight: v2.meta_weight,
+            user_to_idx: v2.user_to_idx.clone(),
+            idx_to_user: v2.idx_to_user.clone(),
+            item_to_idx: v2.item_to_idx.clone(),
+            idx_to_item: v2.idx_to_item.clone(),
+            user_feature_to_idx: v2.user_feature_to_idx.clone(),
+            idx_to_user_feature: v2.idx_to_user_feature.clone(),
+            item_feature_to_idx: v2.item_feature_to_idx.clone(),
+            idx_to_item_feature: v2.idx_to_item_feature.clone(),
+        };
+        write_framed(&v1, &dir.join("model_v1.fease"));
+        write_framed(&v2, &dir.join("model_v2.fease"));
+    }
+
+    #[test]
+    fn test_committed_v1_v2_fixtures_still_load() {
+        // Byte-level backward compatibility: files written by earlier builds
+        // (committed fixtures) must keep loading even if the V1/V2 struct
+        // definitions in this file drift. See regenerate_serialization_fixtures.
+        for (name, version) in [("model_v1.fease", 1u32), ("model_v2.fease", 2u32)] {
+            let path = Path::new("tests/fixtures").join(name);
+            let loaded =
+                load_model(&path).unwrap_or_else(|e| panic!("fixture {name} failed to load: {e}"));
+            assert_eq!(loaded.num_items, 3, "{name}");
+            assert!(loaded.transformation_schema.is_none(), "{name}");
+            let _ = version;
+        }
     }
 }

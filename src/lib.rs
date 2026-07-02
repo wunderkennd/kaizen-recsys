@@ -16,6 +16,8 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::time::Instant;
 
+#[cfg(feature = "ann")]
+mod ann;
 mod data;
 mod data_pipeline;
 mod data_validation;
@@ -24,8 +26,10 @@ pub mod metrics;
 mod model;
 mod models;
 pub(crate) mod onnx_export;
+mod py;
 mod serialization;
 mod serving;
+mod transform;
 pub mod tuning;
 mod weighting;
 
@@ -134,6 +138,103 @@ impl FeaseModel {
         }
 
         Ok(py_results)
+    }
+
+    /// Predicts recommendations from raw, untransformed user features
+    /// (zero-drift online inference, #71).
+    ///
+    /// Raw features are routed through the model's embedded
+    /// `FeatureTransformationSchema` (see `set_transformation_schema`), so the
+    /// exact train-time feature engineering runs natively at serve time.
+    /// Without a schema, numeric (or numeric-string) values pass through
+    /// as already-engineered features.
+    ///
+    /// Args:
+    ///     interactions (dict[str, float]): item_guid -> interaction value.
+    ///     raw_features (dict[str, str | bool | int | float]):
+    ///         raw feature values, e.g. {"plan": "Premium", "tenure_days": 45}.
+    ///     top_k (int): number of recommendations to return.
+    ///
+    /// Returns:
+    ///     list[tuple[str, float]]: (item_guid, score), sorted descending,
+    ///     excluding items the user already interacted with.
+    #[pyo3(signature = (interactions, raw_features, top_k=100))]
+    fn predict_raw<'py>(
+        &self,
+        py: Python<'py>,
+        interactions: &Bound<'_, PyDict>,
+        raw_features: &Bound<'_, PyDict>,
+        top_k: usize,
+    ) -> PyResult<Bound<'py, PyList>> {
+        // 1. interactions: item_guid -> f64
+        let mut rust_interactions = std::collections::HashMap::new();
+        for (key, val) in interactions.iter() {
+            let item_guid: String = key.extract()?;
+            let value: f64 = val.extract()?;
+            rust_interactions.insert(item_guid, value);
+        }
+
+        // 2. raw features: polymorphic Python values -> serde_json::Value.
+        //    bool is checked before i64 (Python bool subclasses int).
+        let mut rust_raw_features = std::collections::HashMap::new();
+        for (key, val) in raw_features.iter() {
+            let k: String = key.extract()?;
+            let value = if let Ok(b) = val.extract::<bool>() {
+                serde_json::Value::Bool(b)
+            } else if let Ok(i) = val.extract::<i64>() {
+                serde_json::Value::Number(serde_json::Number::from(i))
+            } else if let Ok(f) = val.extract::<f64>() {
+                serde_json::Number::from_f64(f)
+                    .map(serde_json::Value::Number)
+                    .unwrap_or(serde_json::Value::Null)
+            } else if let Ok(s) = val.extract::<String>() {
+                serde_json::Value::String(s)
+            } else {
+                serde_json::Value::Null
+            };
+            rust_raw_features.insert(k, value);
+        }
+
+        // 3. Score natively, then rank exactly like predict().
+        let scores =
+            self.model
+                .predict_raw(&rust_interactions, &rust_raw_features, self.model.beta);
+
+        let interacted: HashSet<usize> = rust_interactions
+            .keys()
+            .filter_map(|guid| self.model.mappings.item_to_idx.get(guid).copied())
+            .collect();
+        let mut results_with_idx: Vec<(usize, f64)> = scores
+            .into_iter()
+            .enumerate()
+            .filter(|(idx, _score)| !interacted.contains(idx))
+            .collect();
+        results_with_idx.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        let py_results = PyList::empty(py);
+        for (idx, score) in results_with_idx.into_iter().take(top_k) {
+            if let Some(guid) = self.model.mappings.idx_to_item.get(idx) {
+                py_results.append((PyString::new(py, guid), PyFloat::new(py, score)))?;
+            }
+        }
+        Ok(py_results)
+    }
+
+    /// Attaches (or clears) the declarative feature-transformation schema
+    /// used by `predict_raw`. Persisted by `save()` (format v3); restored by
+    /// `load_model()`.
+    #[pyo3(signature = (schema))]
+    fn set_transformation_schema(
+        &mut self,
+        schema: Option<transform::FeatureTransformationSchema>,
+    ) {
+        self.model.transformation_schema = schema;
+    }
+
+    /// The embedded feature-transformation schema, if any.
+    #[getter]
+    fn transformation_schema(&self) -> Option<transform::FeatureTransformationSchema> {
+        self.model.transformation_schema.clone()
     }
 
     /// Predicts recommendation scores for multiple users at once (batch mode).
@@ -459,179 +560,6 @@ fn load_model(path: String) -> PyResult<FeaseModel> {
         num_item_features: model.num_item_features,
         model,
     })
-}
-
-/// Runs data quality checks against historical baselines.
-///
-/// Uses the GaussianAnomalyDetector pattern from the Python EASE QA pipeline:
-/// computes confidence intervals from historical data and checks if current
-/// values fall within the expected range.
-///
-/// Args:
-///     historical_users (list[float]): Historical distinct-user counts (e.g., per day).
-///     historical_items (list[float]): Historical distinct-item counts.
-///     historical_interactions (list[float]): Historical total-interaction counts.
-///     current_users (float): Current run's distinct user count.
-///     current_items (float): Current run's distinct item count.
-///     current_interactions (float): Current run's total interaction count.
-///     config (dict, optional): Override default std multipliers. Keys:
-///         - "distinct_users_multiplier" (float, default 5.0)
-///         - "distinct_items_multiplier" (float, default 5.0)
-///         - "interactions_multiplier" (float, default 5.0)
-///
-/// Returns:
-///     tuple[bool, list[str]]:
-///         (all_passed, messages) where messages describe each check result.
-#[pyfunction(signature = (
-    historical_users,
-    historical_items,
-    historical_interactions,
-    current_users,
-    current_items,
-    current_interactions,
-    config = None
-))]
-#[allow(clippy::too_many_arguments)]
-fn validate_data<'py>(
-    py: Python<'py>,
-    historical_users: Vec<f64>,
-    historical_items: Vec<f64>,
-    historical_interactions: Vec<f64>,
-    current_users: f64,
-    current_items: f64,
-    current_interactions: f64,
-    config: Option<&Bound<'_, PyDict>>,
-) -> PyResult<(bool, Bound<'py, PyList>)> {
-    let mut validation_config = data_validation::DataValidationConfig::default();
-
-    if let Some(cfg) = config {
-        if let Some(val) = cfg.get_item("distinct_users_multiplier")? {
-            validation_config.distinct_users_multiplier = val.extract()?;
-        }
-        if let Some(val) = cfg.get_item("distinct_items_multiplier")? {
-            validation_config.distinct_items_multiplier = val.extract()?;
-        }
-        if let Some(val) = cfg.get_item("interactions_multiplier")? {
-            validation_config.interactions_multiplier = val.extract()?;
-        }
-    }
-
-    let report = data_validation::validate_data_counts(
-        &historical_users,
-        &historical_items,
-        &historical_interactions,
-        current_users,
-        current_items,
-        current_interactions,
-        &validation_config,
-    );
-
-    let messages: Vec<String> = report.results.iter().map(|r| r.to_string()).collect();
-    let py_messages = PyList::new(py, &messages)?;
-
-    Ok((report.all_passed(), py_messages))
-}
-
-/// Splits interaction data randomly per user into train and test sets.
-///
-/// Args:
-///     interactions_path (str): Path to interactions Parquet/CSV file.
-///     train_output (str): Output path for the train split.
-///     test_output (str): Output path for the test split.
-///     test_ratio (float): Fraction of each user's interactions to hold out (0.0-1.0).
-///     seed (int): Random seed for reproducibility.
-///
-/// Returns:
-///     tuple[int, int, int, int]: (train_interactions, test_interactions, train_users, test_users)
-#[pyfunction]
-#[pyo3(signature = (interactions_path, train_output, test_output, test_ratio=0.2, seed=42))]
-fn random_split(
-    interactions_path: &str,
-    train_output: &str,
-    test_output: &str,
-    test_ratio: f64,
-    seed: u64,
-) -> PyResult<(usize, usize, usize, usize)> {
-    let stats = evaluation::random_split(
-        interactions_path,
-        train_output,
-        test_output,
-        test_ratio,
-        seed,
-    )
-    .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
-    Ok((
-        stats.train_interactions,
-        stats.test_interactions,
-        stats.train_users,
-        stats.test_users,
-    ))
-}
-
-/// Splits interaction data by time: recent interactions (days_ago <= cutoff) go to test.
-///
-/// Args:
-///     interactions_path (str): Path to interactions Parquet/CSV file (must have `days_ago` column).
-///     train_output (str): Output path for the train split.
-///     test_output (str): Output path for the test split.
-///     days_ago_cutoff (float): Interactions with days_ago <= this go to test.
-///
-/// Returns:
-///     tuple[int, int, int, int]: (train_interactions, test_interactions, train_users, test_users)
-#[pyfunction]
-#[pyo3(signature = (interactions_path, train_output, test_output, days_ago_cutoff))]
-fn temporal_split(
-    interactions_path: &str,
-    train_output: &str,
-    test_output: &str,
-    days_ago_cutoff: f64,
-) -> PyResult<(usize, usize, usize, usize)> {
-    let stats = evaluation::temporal_split(
-        interactions_path,
-        train_output,
-        test_output,
-        days_ago_cutoff,
-    )
-    .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
-    Ok((
-        stats.train_interactions,
-        stats.test_interactions,
-        stats.train_users,
-        stats.test_users,
-    ))
-}
-
-/// Leave-K-Out split: holds out exactly k random interactions per user for test.
-///
-/// Users with fewer than k+1 interactions go entirely to train.
-///
-/// Args:
-///     interactions_path (str): Path to interactions Parquet/CSV file.
-///     train_output (str): Output path for the train split.
-///     test_output (str): Output path for the test split.
-///     k (int): Number of interactions to hold out per user.
-///     seed (int): Random seed for reproducibility.
-///
-/// Returns:
-///     tuple[int, int, int, int]: (train_interactions, test_interactions, train_users, test_users)
-#[pyfunction]
-#[pyo3(signature = (interactions_path, train_output, test_output, k=1, seed=42))]
-fn leave_k_out_split(
-    interactions_path: &str,
-    train_output: &str,
-    test_output: &str,
-    k: usize,
-    seed: u64,
-) -> PyResult<(usize, usize, usize, usize)> {
-    let stats =
-        evaluation::leave_k_out_split(interactions_path, train_output, test_output, k, seed)
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
-    Ok((
-        stats.train_interactions,
-        stats.test_interactions,
-        stats.train_users,
-        stats.test_users,
-    ))
 }
 
 /// A Python-callable function to build and train the model from file paths.
@@ -1093,50 +1021,6 @@ fn pydict_to_str_f64(d: &Bound<'_, PyDict>) -> PyResult<ahash::AHashMap<String, 
         map.insert(key, val);
     }
     Ok(map)
-}
-
-// --- Ranking Evaluation Metrics (PyO3 wrappers) ---
-
-/// Precision@K: fraction of top-K recommendations that are relevant.
-#[pyfunction]
-#[pyo3(signature = (recommended, relevant, k))]
-fn precision_at_k(recommended: Vec<usize>, relevant: HashSet<usize>, k: usize) -> f64 {
-    metrics::precision_at_k(&recommended, &relevant, k)
-}
-
-/// Recall@K: fraction of relevant items captured in the top-K recommendations.
-#[pyfunction]
-#[pyo3(signature = (recommended, relevant, k))]
-fn recall_at_k(recommended: Vec<usize>, relevant: HashSet<usize>, k: usize) -> f64 {
-    metrics::recall_at_k(&recommended, &relevant, k)
-}
-
-/// NDCG@K: Normalized Discounted Cumulative Gain at K (binary relevance).
-#[pyfunction]
-#[pyo3(signature = (recommended, relevant, k))]
-fn ndcg_at_k(recommended: Vec<usize>, relevant: HashSet<usize>, k: usize) -> f64 {
-    metrics::ndcg_at_k(&recommended, &relevant, k)
-}
-
-/// Mean Average Precision over the full recommendation list.
-#[pyfunction]
-#[pyo3(signature = (recommended, relevant))]
-fn mean_average_precision(recommended: Vec<usize>, relevant: HashSet<usize>) -> f64 {
-    metrics::mean_average_precision(&recommended, &relevant)
-}
-
-/// Coverage: fraction of the item catalog recommended across all users.
-#[pyfunction]
-#[pyo3(signature = (all_recommendations, num_total_items))]
-fn coverage(all_recommendations: Vec<Vec<usize>>, num_total_items: usize) -> f64 {
-    metrics::coverage(&all_recommendations, num_total_items)
-}
-
-/// Hit Rate@K: 1.0 if any item in top-K is relevant, else 0.0.
-#[pyfunction]
-#[pyo3(signature = (recommended, relevant, k))]
-fn hit_rate_at_k(recommended: Vec<usize>, relevant: HashSet<usize>, k: usize) -> f64 {
-    metrics::hit_rate_at_k(&recommended, &relevant, k)
 }
 
 /// Grid search over hyperparameters with k-fold cross-validation.
@@ -2063,6 +1947,28 @@ mod two_tower_py {
 
     #[pymethods]
     impl TwoTowerModel {
+        /// Attach an ANN index over the item embeddings so top-K retrieval
+        /// is sublinear instead of a full-catalog score (ADR-0004, #83).
+        ///
+        /// Only available when the extension is built with the `ann` Cargo
+        /// feature. Backends: "turbovec" (default per the #76 bench-off),
+        /// "usearch" (exact-recall alternative), "exact" (control).
+        /// Rebuild after every train/load; the index is not persisted (#77).
+        #[cfg(feature = "ann")]
+        #[pyo3(signature = (backend="turbovec"))]
+        fn enable_ann_retrieval(&mut self, backend: &str) -> PyResult<()> {
+            self.model
+                .enable_ann_retrieval(backend)
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))
+        }
+
+        /// Whether an ANN index is currently attached (`ann` feature only).
+        #[cfg(feature = "ann")]
+        #[getter]
+        fn ann_enabled(&self) -> bool {
+            self.model.ann_enabled()
+        }
+
         /// Score recommendations for `user_id`.
         ///
         /// Warm users (id seen in training) use their learned id-row
@@ -2115,21 +2021,25 @@ mod two_tower_py {
                 (Vec::new(), Vec::new())
             };
 
-            let scores = self
-                .model
-                .predict_scores(ModelInput::TowerUser {
+            // Same routing as the registry serving path: through the ANN
+            // index when one is attached (enable_ann_retrieval), dense
+            // full-catalog scoring otherwise — so enabling ANN on the
+            // model accelerates this method too, not just registry serving.
+            let ranked = crate::serving::retrieve_or_dense(
+                &self.model,
+                ModelInput::TowerUser {
                     user_idx,
                     cat_features: &cat_features,
                     dense_features: &dense_features,
-                })
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
-
-            let mut ranked: Vec<(usize, f32)> = scores.into_iter().enumerate().collect();
-            ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                },
+                &[],
+                top_k,
+            )
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
 
             let out = PyList::empty(py);
             let map = self.model.item_mapping();
-            for (idx, score) in ranked.into_iter().take(top_k) {
+            for (idx, score) in ranked {
                 if let Some(guid) = map.idx_to_item.get(idx) {
                     out.append((PyString::new(py, guid), PyFloat::new(py, score as f64)))?;
                 }
@@ -2215,6 +2125,122 @@ mod two_tower_py {
             self.model
                 .save_to(Path::new(&path))
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))
+        }
+
+        /// Returns everything the Python ONNX exporter needs to author the
+        /// user-tower graph (#85): every user-tower weight plus the
+        /// precomputed L2-normalized item catalog matrix, as row-major
+        /// little-endian f32 bytes with explicit shapes, and the id / feature
+        /// mappings. Mirrors `FeaseModel.export_payload`'s bytes+shape style.
+        ///
+        /// Returns:
+        ///     dict: A dictionary with the following keys:
+        ///         - "kind" (str): ``"two_tower"``.
+        ///         - "embedding_dim" (int): Tower output dimension ``d``.
+        ///         - "num_items" (int) / "num_users" (int): Catalog sizes.
+        ///           ``num_users`` counts the reserved cold-start row (index 0).
+        ///         - "has_cat" / "has_dense" (bool): Whether the user tower
+        ///           has categorical / dense feature branches.
+        ///         - "num_user_categories" (int): Categorical-embedding rows.
+        ///         - "user_dense_dim" (int): Dense feature vector width.
+        ///         - "id_embedding_bytes" + "id_embedding_shape":
+        ///           ``[num_users, d]``; row 0 is the learned cold-start prior.
+        ///         - "cat_embedding_bytes" + "cat_embedding_shape":
+        ///           ``[num_user_categories, d]`` (empty when not has_cat).
+        ///         - "dense_w_bytes" + "dense_w_shape" / "dense_b_bytes":
+        ///           ``[user_dense_dim, d]`` / ``[d]`` (empty when not has_dense).
+        ///         - "hidden_w_bytes" + "hidden_w_shape" / "hidden_b_bytes",
+        ///           "out_w_bytes" + "out_w_shape" / "out_b_bytes": the 2-layer
+        ///           MLP; weights are ``[d_in, d_out]`` (x @ W + b, no transpose).
+        ///         - "item_matrix_bytes" + "item_matrix_shape":
+        ///           ``[num_items, d]`` L2-normalized catalog matrix.
+        ///         - "item_index_to_guid" (list[str]).
+        ///         - "user_id_to_index" (dict[str, int]): Real user ids only —
+        ///           the index-0 cold-start sentinel is excluded.
+        ///         - "user_cat_feature_to_idx" / "user_dense_feature_to_idx"
+        ///           (dict[str, int]): Feature-name maps persisted at training
+        ///           time (#55).
+        #[pyo3(signature = ())]
+        fn export_payload<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+            use crate::onnx_export::f32s_le_bytes;
+
+            let w = self.model.export_weights();
+            let dim = w.embedding_dim;
+
+            let d = PyDict::new(py);
+            d.set_item("kind", "two_tower")?;
+            d.set_item("embedding_dim", dim)?;
+            d.set_item("num_items", w.num_items)?;
+            d.set_item("num_users", w.num_users)?;
+            d.set_item("has_cat", w.has_cat)?;
+            d.set_item("has_dense", w.has_dense)?;
+            d.set_item("num_user_categories", w.num_user_categories)?;
+            d.set_item("user_dense_dim", w.user_dense_dim)?;
+
+            d.set_item(
+                "id_embedding_bytes",
+                PyBytes::new(py, &f32s_le_bytes(&w.id_embedding)),
+            )?;
+            d.set_item("id_embedding_shape", (w.num_users, dim))?;
+            d.set_item(
+                "cat_embedding_bytes",
+                PyBytes::new(py, &f32s_le_bytes(&w.cat_embedding)),
+            )?;
+            d.set_item(
+                "cat_embedding_shape",
+                (if w.has_cat { w.num_user_categories } else { 0 }, dim),
+            )?;
+            d.set_item(
+                "dense_w_bytes",
+                PyBytes::new(py, &f32s_le_bytes(&w.dense_w)),
+            )?;
+            d.set_item(
+                "dense_w_shape",
+                (if w.has_dense { w.user_dense_dim } else { 0 }, dim),
+            )?;
+            d.set_item(
+                "dense_b_bytes",
+                PyBytes::new(py, &f32s_le_bytes(&w.dense_b)),
+            )?;
+            d.set_item(
+                "hidden_w_bytes",
+                PyBytes::new(py, &f32s_le_bytes(&w.hidden_w)),
+            )?;
+            d.set_item("hidden_w_shape", (dim, dim))?;
+            d.set_item(
+                "hidden_b_bytes",
+                PyBytes::new(py, &f32s_le_bytes(&w.hidden_b)),
+            )?;
+            d.set_item("out_w_bytes", PyBytes::new(py, &f32s_le_bytes(&w.out_w)))?;
+            d.set_item("out_w_shape", (dim, dim))?;
+            d.set_item("out_b_bytes", PyBytes::new(py, &f32s_le_bytes(&w.out_b)))?;
+            d.set_item(
+                "item_matrix_bytes",
+                PyBytes::new(py, &f32s_le_bytes(&w.item_matrix)),
+            )?;
+            d.set_item("item_matrix_shape", (w.num_items, dim))?;
+
+            d.set_item("item_index_to_guid", w.idx_to_item.as_slice())?;
+            let users = PyDict::new(py);
+            for (i, guid) in w.idx_to_user.iter().enumerate() {
+                if i != crate::data::triples::COLD_START_USER_IDX {
+                    users.set_item(guid, i)?;
+                }
+            }
+            d.set_item("user_id_to_index", users)?;
+
+            let cat_map = PyDict::new(py);
+            for (name, idx) in w.user_cat_feature_to_idx.iter() {
+                cat_map.set_item(name, *idx)?;
+            }
+            d.set_item("user_cat_feature_to_idx", cat_map)?;
+            let dense_map = PyDict::new(py);
+            for (name, idx) in w.user_dense_feature_to_idx.iter() {
+                dense_map.set_item(name, *idx)?;
+            }
+            d.set_item("user_dense_feature_to_idx", dense_map)?;
+
+            Ok(d)
         }
     }
 
@@ -2334,16 +2360,16 @@ mod two_tower_py {
 fn _native(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(build_and_train, m)?)?;
     m.add_function(wrap_pyfunction!(load_model, m)?)?;
-    m.add_function(wrap_pyfunction!(validate_data, m)?)?;
-    m.add_function(wrap_pyfunction!(precision_at_k, m)?)?;
-    m.add_function(wrap_pyfunction!(recall_at_k, m)?)?;
-    m.add_function(wrap_pyfunction!(ndcg_at_k, m)?)?;
-    m.add_function(wrap_pyfunction!(mean_average_precision, m)?)?;
-    m.add_function(wrap_pyfunction!(coverage, m)?)?;
-    m.add_function(wrap_pyfunction!(hit_rate_at_k, m)?)?;
-    m.add_function(wrap_pyfunction!(random_split, m)?)?;
-    m.add_function(wrap_pyfunction!(temporal_split, m)?)?;
-    m.add_function(wrap_pyfunction!(leave_k_out_split, m)?)?;
+    m.add_function(wrap_pyfunction!(py::eval::validate_data, m)?)?;
+    m.add_function(wrap_pyfunction!(py::metrics::precision_at_k, m)?)?;
+    m.add_function(wrap_pyfunction!(py::metrics::recall_at_k, m)?)?;
+    m.add_function(wrap_pyfunction!(py::metrics::ndcg_at_k, m)?)?;
+    m.add_function(wrap_pyfunction!(py::metrics::mean_average_precision, m)?)?;
+    m.add_function(wrap_pyfunction!(py::metrics::coverage, m)?)?;
+    m.add_function(wrap_pyfunction!(py::metrics::hit_rate_at_k, m)?)?;
+    m.add_function(wrap_pyfunction!(py::eval::random_split, m)?)?;
+    m.add_function(wrap_pyfunction!(py::eval::temporal_split, m)?)?;
+    m.add_function(wrap_pyfunction!(py::eval::leave_k_out_split, m)?)?;
     m.add_function(wrap_pyfunction!(grid_search_py, m)?)?;
     m.add_function(wrap_pyfunction!(random_search_py, m)?)?;
     m.add_function(wrap_pyfunction!(grid_search_ease, m)?)?;
@@ -2354,6 +2380,8 @@ fn _native(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(random_search_two_tower, m)?)?;
     m.add_class::<FeaseModel>()?;
     m.add_class::<ModelRegistry>()?;
+    m.add_class::<transform::NumericalBucketConfig>()?;
+    m.add_class::<transform::FeatureTransformationSchema>()?;
 
     #[cfg(feature = "ml-models")]
     {
