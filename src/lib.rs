@@ -1947,6 +1947,28 @@ mod two_tower_py {
 
     #[pymethods]
     impl TwoTowerModel {
+        /// Attach an ANN index over the item embeddings so top-K retrieval
+        /// is sublinear instead of a full-catalog score (ADR-0004, #83).
+        ///
+        /// Only available when the extension is built with the `ann` Cargo
+        /// feature. Backends: "turbovec" (default per the #76 bench-off),
+        /// "usearch" (exact-recall alternative), "exact" (control).
+        /// Rebuild after every train/load; the index is not persisted (#77).
+        #[cfg(feature = "ann")]
+        #[pyo3(signature = (backend="turbovec"))]
+        fn enable_ann_retrieval(&mut self, backend: &str) -> PyResult<()> {
+            self.model
+                .enable_ann_retrieval(backend)
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))
+        }
+
+        /// Whether an ANN index is currently attached (`ann` feature only).
+        #[cfg(feature = "ann")]
+        #[getter]
+        fn ann_enabled(&self) -> bool {
+            self.model.ann_enabled()
+        }
+
         /// Score recommendations for `user_id`.
         ///
         /// Warm users (id seen in training) use their learned id-row
@@ -1999,21 +2021,25 @@ mod two_tower_py {
                 (Vec::new(), Vec::new())
             };
 
-            let scores = self
-                .model
-                .predict_scores(ModelInput::TowerUser {
+            // Same routing as the registry serving path: through the ANN
+            // index when one is attached (enable_ann_retrieval), dense
+            // full-catalog scoring otherwise — so enabling ANN on the
+            // model accelerates this method too, not just registry serving.
+            let ranked = crate::serving::retrieve_or_dense(
+                &self.model,
+                ModelInput::TowerUser {
                     user_idx,
                     cat_features: &cat_features,
                     dense_features: &dense_features,
-                })
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
-
-            let mut ranked: Vec<(usize, f32)> = scores.into_iter().enumerate().collect();
-            ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                },
+                &[],
+                top_k,
+            )
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
 
             let out = PyList::empty(py);
             let map = self.model.item_mapping();
-            for (idx, score) in ranked.into_iter().take(top_k) {
+            for (idx, score) in ranked {
                 if let Some(guid) = map.idx_to_item.get(idx) {
                     out.append((PyString::new(py, guid), PyFloat::new(py, score as f64)))?;
                 }
