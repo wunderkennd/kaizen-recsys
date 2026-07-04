@@ -41,7 +41,10 @@ def test_end_to_end_pipeline(spark, tmp_path):
     warm_inter = {r["item_id"]: r["value"]
                   for r in interactions.filter(interactions.user_id == warm_uid).collect()}
     recs = loaded.predict(warm_inter, {}, top_k=5)
-    assert len(recs) <= 5
+    assert 0 < len(recs) <= 5
+    catalog = {r["item_id"] for r in items.select("item_id").distinct().collect()}
+    assert all(item_id in catalog for item_id, _ in recs)
     # cold-start: no interactions, persona feature only
     cold = loaded.predict({}, {"persona=0": 1.0}, top_k=5)
-    assert isinstance(cold, list)
+    assert 0 < len(cold) <= 5
+    assert all(item_id in catalog for item_id, _ in cold)
