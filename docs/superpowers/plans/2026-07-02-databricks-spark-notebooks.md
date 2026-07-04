@@ -32,7 +32,7 @@
 - Consumes: a live `SparkSession` (from the test fixture / notebook).
 - Produces: `make_synthetic(spark, *, n_users=200, n_items=60, n_personas=4, avg_interactions=15, seed=42) -> tuple[DataFrame, DataFrame, DataFrame]` returning `(interactions_df, user_features_df, item_features_df)` in the exact long-format contracts above. `interactions.value` is `1.0` for every generated (user, item) pair; `user_features` carries `persona={0..n_personas-1}` one-hot rows (`feature_name=f"persona={p}"`, `value=1.0`); `item_features` carries `genre=...` one-hot rows.
 
-- [ ] **Step 1: Write the failing test**
+- **Step 1: Write the failing test**
 
 ```python
 # tests/spark/test_databricks.py
@@ -69,12 +69,12 @@ def test_make_synthetic_schema_and_determinism(spark):
     assert rows1 == rows2
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- **Step 2: Run test to verify it fails**
 
 Run: `.venv/bin/python -m pytest tests/spark/test_databricks.py::test_make_synthetic_schema_and_determinism -v`
 Expected: FAIL with `ModuleNotFoundError` / `cannot import name 'make_synthetic'`.
 
-- [ ] **Step 3: Write minimal implementation**
+- **Step 3: Write minimal implementation**
 
 ```python
 # kzn_recsys/spark/databricks.py
@@ -147,12 +147,12 @@ def make_synthetic(spark: SparkSession, *, n_users: int = 200, n_items: int = 60
     return interactions, users, items
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- **Step 4: Run test to verify it passes**
 
 Run: `.venv/bin/python -m pytest tests/spark/test_databricks.py::test_make_synthetic_schema_and_determinism -v`
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- **Step 5: Commit**
 
 ```bash
 git add kzn_recsys/spark/databricks.py tests/spark/test_databricks.py
@@ -171,7 +171,7 @@ git commit -m "feat(spark): synthetic data generator for Databricks notebooks"
 - Consumes: raw `engagement_df` and `metadata_df` Spark DataFrames.
 - Produces: `feature_engineering(engagement_df, metadata_df, *, user_col="user_id", item_col="item_id", value_col="value", event_type_col=None, days_ago_col=None, user_feature_cols=(), item_feature_cols=(), item_key_col="item_id") -> tuple[DataFrame, DataFrame, DataFrame]` returning the three long-format tables. Categorical feature columns are one-hot-encoded as `feature_name=f"{col}={value}"`, `value=1.0`. When neither `event_type_col` nor `days_ago_col` is given, interactions are summed per `(user_id, item_id)`; when either is given, rows pass through with the optional columns preserved (weighting consumes per-event rows).
 
-- [ ] **Step 1: Write the failing test**
+- **Step 1: Write the failing test**
 
 ```python
 # add to tests/spark/test_databricks.py
@@ -235,12 +235,12 @@ def test_feature_engineering_preserves_optional_columns(spark):
     assert inter.count() == 2
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- **Step 2: Run test to verify it fails**
 
 Run: `.venv/bin/python -m pytest tests/spark/test_databricks.py -k feature_engineering -v`
 Expected: FAIL with `cannot import name 'feature_engineering'`.
 
-- [ ] **Step 3: Write minimal implementation**
+- **Step 3: Write minimal implementation**
 
 ```python
 # add to kzn_recsys/spark/databricks.py
@@ -302,12 +302,12 @@ def feature_engineering(engagement_df: DataFrame, metadata_df: DataFrame, *,
     return interactions, user_features, item_features
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- **Step 4: Run test to verify it passes**
 
 Run: `.venv/bin/python -m pytest tests/spark/test_databricks.py -k feature_engineering -v`
 Expected: PASS (both tests).
 
-- [ ] **Step 5: Commit**
+- **Step 5: Commit**
 
 ```bash
 git add kzn_recsys/spark/databricks.py tests/spark/test_databricks.py
@@ -326,7 +326,7 @@ git commit -m "feat(spark): raw->long feature engineering for Databricks noteboo
 - Consumes: `make_synthetic`, `feature_engineering` (Tasks 1–2); `build_and_train`, `load_model`, `random_split`, `temporal_split`, `grid_search` (existing `kzn_recsys.spark`).
 - Produces: `from kzn_recsys.spark import make_synthetic, feature_engineering` works. This test is the proof-of-pipeline the four notebooks orchestrate; if it passes, the notebook logic path is sound.
 
-- [ ] **Step 1: Write the failing test**
+- **Step 1: Write the failing test**
 
 ```python
 # tests/spark/test_databricks_e2e.py
@@ -379,12 +379,12 @@ def test_end_to_end_pipeline(spark, tmp_path):
     assert isinstance(cold, list)
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- **Step 2: Run test to verify it fails**
 
 Run: `.venv/bin/python -m pytest tests/spark/test_databricks_e2e.py -v`
 Expected: FAIL with `cannot import name 'make_synthetic' from 'kzn_recsys.spark'`.
 
-- [ ] **Step 3: Add the exports**
+- **Step 3: Add the exports**
 
 In `kzn_recsys/spark/__init__.py`, add the import and `__all__` entries:
 
@@ -400,17 +400,17 @@ And add to `__all__` (alongside the existing names):
     "feature_engineering",
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- **Step 4: Run test to verify it passes**
 
 Run: `.venv/bin/python -m pytest tests/spark/test_databricks_e2e.py -v`
 Expected: PASS.
 
-- [ ] **Step 5: Run the full spark suite (no regressions)**
+- **Step 5: Run the full spark suite (no regressions)**
 
 Run: `.venv/bin/python -m pytest tests/spark -q`
 Expected: PASS (previous suite + the new tests).
 
-- [ ] **Step 6: Commit**
+- **Step 6: Commit**
 
 ```bash
 git add kzn_recsys/spark/__init__.py tests/spark/test_databricks_e2e.py
@@ -431,7 +431,7 @@ git commit -m "feat(spark): export Databricks helpers; end-to-end pipeline test"
 - Consumes: the pure-Python wheel built from `packaging/pure-python`.
 - Produces: a deployable bundle named `kzn_recsys_spark` exposing a Job `kzn_recsys_spark_job` with four notebook tasks (`ingest → train → evaluate → predict`) and the variables the notebooks read as widgets. Task 5–8 notebooks live at `databricks/src/NN_*.py`.
 
-- [ ] **Step 1: Write `databricks/databricks.yml`**
+- **Step 1: Write `databricks/databricks.yml`**
 
 ```yaml
 bundle:
@@ -469,7 +469,7 @@ targets:
     mode: production
 ```
 
-- [ ] **Step 2: Write `databricks/resources/kzn_recsys_spark_job.yml`**
+- **Step 2: Write `databricks/resources/kzn_recsys_spark_job.yml`**
 
 ```yaml
 resources:
@@ -542,7 +542,7 @@ resources:
             - whl: ${artifacts.spark_wheel.files[0].local_path}
 ```
 
-- [ ] **Step 3: Write `databricks/.gitignore`**
+- **Step 3: Write `databricks/.gitignore`**
 
 ```
 .databricks/
@@ -551,7 +551,7 @@ build/
 dist/
 ```
 
-- [ ] **Step 4: Write `databricks/README.md`**
+- **Step 4: Write `databricks/README.md`**
 
 ````markdown
 # kzn_recsys Spark EASE — Databricks Asset Bundle
@@ -594,14 +594,14 @@ Outputs: Delta tables `kzn_interactions` / `kzn_user_features` /
 MLflow run with params + metrics.
 ````
 
-- [ ] **Step 5: Validate the bundle config (best-effort)**
+- **Step 5: Validate the bundle config (best-effort)**
 
 Run: `cd databricks && databricks bundle validate -t dev`
 Expected: `Validation OK!` (schema + variable references resolve). If the
 `databricks` CLI is not installed in this environment, skip with a note —
 this step is a config lint, not a code test, and does not block the notebooks.
 
-- [ ] **Step 6: Commit**
+- **Step 6: Commit**
 
 ```bash
 git add databricks/databricks.yml databricks/resources/kzn_recsys_spark_job.yml databricks/README.md databricks/.gitignore
@@ -619,7 +619,7 @@ git commit -m "build(spark): Databricks Asset Bundle scaffold (job + wheel artif
 - Consumes: widgets `catalog`, `schema`, `data_mode`, `n_users`, `n_items`, `seed`, `raw_engagement_table`, `raw_metadata_table`; `make_synthetic`, `feature_engineering` from `kzn_recsys.spark`.
 - Produces: Delta tables `{catalog}.{schema}.kzn_interactions` / `kzn_user_features` / `kzn_item_features`; sets `taskValues` `interactions_table`, `user_features_table`, `item_features_table`.
 
-- [ ] **Step 1: Write the notebook (Databricks source format)**
+- **Step 1: Write the notebook (Databricks source format)**
 
 ```python
 # Databricks notebook source
@@ -686,7 +686,7 @@ dbutils.jobs.taskValues.set("user_features_table", f"{catalog}.{schema}.kzn_user
 dbutils.jobs.taskValues.set("item_features_table", f"{catalog}.{schema}.kzn_item_features")
 ```
 
-- [ ] **Step 2: Verify the ingest logic locally (proxy for the notebook)**
+- **Step 2: Verify the ingest logic locally (proxy for the notebook)**
 
 The notebook's data logic is `make_synthetic` / `feature_engineering`, already
 covered by `tests/spark/test_databricks.py`. Confirm they still pass:
@@ -694,7 +694,7 @@ covered by `tests/spark/test_databricks.py`. Confirm they still pass:
 Run: `.venv/bin/python -m pytest tests/spark/test_databricks.py -q`
 Expected: PASS.
 
-- [ ] **Step 3: Commit**
+- **Step 3: Commit**
 
 ```bash
 git add databricks/src/01_ingest_and_features.py
@@ -712,7 +712,7 @@ git commit -m "feat(spark): Databricks notebook 01 — ingest & feature engineer
 - Consumes: taskValues `interactions_table` / `user_features_table` / `item_features_table` (from Task 5); widgets `catalog`, `schema`, `volume`, `strategy`, `do_tune`, `k`, `seed`; `build_and_train`, `grid_search` from `kzn_recsys.spark`; MLflow.
 - Produces: FEAS artifact at `/Volumes/{catalog}/{schema}/{volume}/model.feas`; MLflow run with params + artifact; sets taskValues `model_path`, `mlflow_run_id`, `best_lambda`.
 
-- [ ] **Step 1: Write the notebook**
+- **Step 1: Write the notebook**
 
 ```python
 # Databricks notebook source
@@ -792,7 +792,7 @@ dbutils.jobs.taskValues.set("mlflow_run_id", run_id)
 dbutils.jobs.taskValues.set("best_lambda", best_lambda)
 ```
 
-- [ ] **Step 2: Verify the train/tune logic locally (proxy)**
+- **Step 2: Verify the train/tune logic locally (proxy)**
 
 `build_and_train` (both strategies) + `grid_search` + `save` are covered by
 `tests/spark/test_databricks_e2e.py`. Confirm:
@@ -800,7 +800,7 @@ dbutils.jobs.taskValues.set("best_lambda", best_lambda)
 Run: `.venv/bin/python -m pytest tests/spark/test_databricks_e2e.py -q`
 Expected: PASS.
 
-- [ ] **Step 3: Commit**
+- **Step 3: Commit**
 
 ```bash
 git add databricks/src/02_train_and_tune.py
@@ -818,7 +818,7 @@ git commit -m "feat(spark): Databricks notebook 02 — train & tune with MLflow"
 - Consumes: taskValues `best_lambda`, `mlflow_run_id`, table names; widgets `catalog`, `schema`, `k`, `ndcg_gate`, `seed`; `build_and_train`, `temporal_split`, `random_split` from `kzn_recsys.spark`; MLflow.
 - Produces: metrics logged to the Task-6 MLflow run; raises `AssertionError` (fails the task) when NDCG@k < `ndcg_gate`.
 
-- [ ] **Step 1: Write the notebook**
+- **Step 1: Write the notebook**
 
 ```python
 # Databricks notebook source
@@ -884,7 +884,7 @@ assert row["ndcg"] >= ndcg_gate, (
 print(f"quality gate passed: NDCG@{k}={row['ndcg']:.4f} >= {ndcg_gate}")
 ```
 
-- [ ] **Step 2: Verify the evaluate logic locally (proxy)**
+- **Step 2: Verify the evaluate logic locally (proxy)**
 
 `build_and_train` + split + `evaluate` are covered by
 `tests/spark/test_databricks_e2e.py`. Confirm:
@@ -892,7 +892,7 @@ print(f"quality gate passed: NDCG@{k}={row['ndcg']:.4f} >= {ndcg_gate}")
 Run: `.venv/bin/python -m pytest tests/spark/test_databricks_e2e.py -q`
 Expected: PASS.
 
-- [ ] **Step 3: Commit**
+- **Step 3: Commit**
 
 ```bash
 git add databricks/src/03_evaluate.py
@@ -910,7 +910,7 @@ git commit -m "feat(spark): Databricks notebook 03 — evaluate with MLflow + qu
 - Consumes: taskValues `model_path` (from Task 6); widgets `catalog`, `schema`, `volume`, `k`; `load_model` from `kzn_recsys.spark`.
 - Produces: Delta table `{catalog}.{schema}.kzn_predictions` (`user_id`, `rank`, `item_id`, `score`, `run_id`).
 
-- [ ] **Step 1: Write the notebook**
+- **Step 1: Write the notebook**
 
 ```python
 # Databricks notebook source
@@ -969,7 +969,7 @@ print(f"wrote {sink}: {preds.count()} recommendations")
 display(preds.orderBy("user_id", "rank").limit(20))
 ```
 
-- [ ] **Step 2: Verify the predict logic locally (proxy)**
+- **Step 2: Verify the predict logic locally (proxy)**
 
 `load_model` + `predict` (warm + cold-start) are covered by
 `tests/spark/test_databricks_e2e.py`. Confirm:
@@ -977,14 +977,14 @@ display(preds.orderBy("user_id", "rank").limit(20))
 Run: `.venv/bin/python -m pytest tests/spark/test_databricks_e2e.py -q`
 Expected: PASS.
 
-- [ ] **Step 3: Full suite + bundle validate (final)**
+- **Step 3: Full suite + bundle validate (final)**
 
 Run: `.venv/bin/python -m pytest tests/spark -q`
 Expected: PASS.
 Run (best-effort): `cd databricks && databricks bundle validate -t dev`
 Expected: `Validation OK!` (skip with a note if the CLI is unavailable).
 
-- [ ] **Step 4: Commit**
+- **Step 4: Commit**
 
 ```bash
 git add databricks/src/04_predict_and_sink.py
