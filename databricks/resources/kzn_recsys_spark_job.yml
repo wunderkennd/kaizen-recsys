@@ -24,7 +24,7 @@ resources:
               raw_engagement_table: ${var.raw_engagement_table}
               raw_metadata_table: ${var.raw_metadata_table}
           libraries:
-            - whl: ${artifacts.spark_wheel.files[0].local_path}
+            - whl: ../../packaging/pure-python/dist/*.whl
         - task_key: train
           depends_on: [{ task_key: ingest }]
           job_cluster_key: spark_ease
@@ -39,7 +39,7 @@ resources:
               k: ${var.k}
               seed: ${var.seed}
           libraries:
-            - whl: ${artifacts.spark_wheel.files[0].local_path}
+            - whl: ../../packaging/pure-python/dist/*.whl
         - task_key: evaluate
           depends_on: [{ task_key: train }]
           job_cluster_key: spark_ease
@@ -53,7 +53,7 @@ resources:
               ndcg_gate: ${var.ndcg_gate}
               seed: ${var.seed}
           libraries:
-            - whl: ${artifacts.spark_wheel.files[0].local_path}
+            - whl: ../../packaging/pure-python/dist/*.whl
         - task_key: predict
           depends_on: [{ task_key: evaluate }]
           job_cluster_key: spark_ease
@@ -65,4 +65,4 @@ resources:
               volume: ${var.volume}
               k: ${var.k}
           libraries:
-            - whl: ${artifacts.spark_wheel.files[0].local_path}
+            - whl: ../../packaging/pure-python/dist/*.whl
