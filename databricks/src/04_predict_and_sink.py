@@ -41,10 +41,10 @@ for r in users.select("user_id", "feature_name", "value").collect():
     feats.setdefault(r["user_id"], {})[r["feature_name"]] = float(r["value"])
 
 rows = []
-for uid, inter in hist.items():
+for uid in sorted(set(hist) | set(feats)):
+    inter = hist.get(uid, {})
     for rank, (item_id, score) in enumerate(model.predict(inter, feats.get(uid, {}), top_k=k), 1):
-        rows.append(Row(user_id=uid, rank=rank, item_id=item_id,
-                        score=float(score), run_id=run_id))
+        rows.append(Row(user_id=uid, rank=rank, item_id=item_id, score=float(score), run_id=run_id))
 
 # COMMAND ----------
 preds = spark.createDataFrame(rows)
