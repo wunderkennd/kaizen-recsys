@@ -65,6 +65,7 @@ def test_feature_engineering_maps_raw_to_long(spark):
     assert ("u1", "country=US") in ufeat
     assert ("u2", "country=JP") in ufeat
     assert users.filter(F.col("value") != 1.0).count() == 0
+    assert users.count() == 2
 
     # one-hot item features from metadata
     ifeat = {(r.item_id, r.feature_name) for r in items.collect()}
@@ -78,11 +79,14 @@ def test_feature_engineering_preserves_optional_columns(spark):
         ["user_id", "item_id", "value", "event_type", "days_ago"],
     )
     metadata = spark.createDataFrame([("m1", "action")], ["item_id", "genre"])
-    inter, _, _ = feature_engineering(
+    inter, users, _ = feature_engineering(
         engagement, metadata,
         event_type_col="event_type", days_ago_col="days_ago",
         item_feature_cols=["genre"],
     )
     # rows pass through (not summed) with the optional columns present
-    assert set(inter.columns) == {"user_id", "item_id", "value", "event_type", "days_ago"}
+    assert inter.columns == ["user_id", "item_id", "value", "event_type", "days_ago"]
     assert inter.count() == 2
+    # empty feature columns should return the correct schema
+    assert users.columns == ["user_id", "feature_name", "value"]
+    assert users.count() == 0
