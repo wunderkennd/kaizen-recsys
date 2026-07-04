@@ -10,12 +10,14 @@ dbutils.widgets.text("schema", "kzn_recsys")
 dbutils.widgets.text("k", "10")
 dbutils.widgets.text("ndcg_gate", "0.0")
 dbutils.widgets.text("seed", "42")
+dbutils.widgets.text("days_ago_cutoff", "7.0")
 
 catalog = dbutils.widgets.get("catalog")
 schema = dbutils.widgets.get("schema")
 k = int(dbutils.widgets.get("k"))
 ndcg_gate = float(dbutils.widgets.get("ndcg_gate"))
 seed = int(dbutils.widgets.get("seed"))
+days_ago_cutoff = float(dbutils.widgets.get("days_ago_cutoff"))
 
 def _tv(task, key, default):
     try:
@@ -35,7 +37,7 @@ from kzn_recsys.spark import build_and_train, random_split, temporal_split
 
 # temporal split needs days_ago; fall back to random if absent.
 if "days_ago" in interactions.columns:
-    train_df, test_df = temporal_split(interactions, days_ago_cutoff=7.0)
+    train_df, test_df = temporal_split(interactions, days_ago_cutoff=days_ago_cutoff)
 else:
     train_df, test_df = random_split(interactions, test_ratio=0.2, seed=seed)
 

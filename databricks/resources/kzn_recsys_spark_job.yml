@@ -52,6 +52,7 @@ resources:
               k: ${var.k}
               ndcg_gate: ${var.ndcg_gate}
               seed: ${var.seed}
+              days_ago_cutoff: ${var.days_ago_cutoff}
           libraries:
             - whl: ../../packaging/pure-python/dist/*.whl
         - task_key: predict

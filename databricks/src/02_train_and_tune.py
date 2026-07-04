@@ -44,7 +44,7 @@ import mlflow
 from kzn_recsys.spark import build_and_train, grid_search
 
 best_lambda = 150.0
-mlflow.set_experiment(f"/Shared/kzn_recsys_spark")
+mlflow.set_experiment("/Shared/kzn_recsys_spark")
 with mlflow.start_run() as run:
     if do_tune:
         res = grid_search(interactions, users, items,

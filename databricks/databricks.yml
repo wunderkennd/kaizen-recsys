@@ -13,6 +13,7 @@ variables:
   ndcg_gate:    { default: "0.0" }
   strategy:     { default: collect }     # collect | distributed
   do_tune:      { default: "false" }
+  days_ago_cutoff: { default: "7.0" }
   raw_engagement_table: { default: "" }  # used when data_mode=delta
   raw_metadata_table:   { default: "" }
 
