@@ -250,6 +250,65 @@ impl ModelRegistry {
         Ok(idx_scores_to_str(&ranked, mappings))
     }
 
+    /// String-id-native BERT4Rec top-K (#96). `history` is the user's
+    /// item-id list oldest first; `days_ago` (optional, parallel to
+    /// `history`) is converted to the model's relative-recency buckets
+    /// with the same rule the data path trains with. Without `days_ago`
+    /// every item is treated as "now" (bucket 0). Unknown item ids are
+    /// skipped. Ranking excludes items already in `history`, matching
+    /// `Bert4RecModel.predict`. Errors if the registered model for
+    /// `territory` isn't BERT4Rec.
+    #[cfg(feature = "ml-models")]
+    pub fn predict_top_k_bert4rec(
+        &self,
+        territory: &str,
+        history: &[String],
+        days_ago: Option<&[f64]>,
+        top_k: usize,
+    ) -> Result<Vec<(String, f32)>> {
+        let model = self.route(territory)?;
+        if model.kind() != ModelKind::Bert4Rec {
+            bail!(
+                "predict_top_k_bert4rec called on territory '{territory}', but the registered \
+                 model is {:?}. Use predict_top_k_{} instead.",
+                model.kind(),
+                kind_method_suffix(model.kind())
+            );
+        }
+        if let Some(d) = days_ago
+            && d.len() != history.len()
+        {
+            bail!(
+                "predict_top_k_bert4rec: days_ago has {} entries but history has {}",
+                d.len(),
+                history.len()
+            );
+        }
+        let mappings = model.item_mapping();
+        let mut history_idx: Vec<usize> = Vec::with_capacity(history.len());
+        let mut positions: Vec<usize> = Vec::with_capacity(history.len());
+        for (k, id) in history.iter().enumerate() {
+            if let Some(&idx) = mappings.item_to_idx.get(id) {
+                history_idx.push(idx);
+                positions.push(
+                    days_ago
+                        .map(|d| crate::data::days_ago_to_log2_bucket(d[k]))
+                        .unwrap_or(0),
+                );
+            }
+        }
+        let ranked = retrieve_or_dense(
+            model,
+            ModelInput::MaskedHistory {
+                history: &history_idx,
+                positions: &positions,
+            },
+            &history_idx,
+            top_k,
+        )?;
+        Ok(idx_scores_to_str(&ranked, mappings))
+    }
+
     /// String-id-native Two-Tower top-K (#56). Warm users use their
     /// learned id-row embedding; unknown users fall back to the
     /// reserved cold-start row. When `features` is non-empty, the
@@ -317,6 +376,7 @@ fn kind_method_suffix(kind: ModelKind) -> &'static str {
         ModelKind::Ease => "ease",
         ModelKind::SasRec => "sasrec",
         ModelKind::TwoTower => "two_tower",
+        ModelKind::Bert4Rec => "bert4rec",
     }
 }
 

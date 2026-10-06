@@ -44,6 +44,9 @@ fn rec_predict_scores(m: &RustFeaseModel, input: ModelInput<'_>) -> Result<Vec<f
         ModelInput::TowerUser { .. } => Err(anyhow!(
             "EASE does not support ModelInput::TowerUser; expected ModelInput::Sparse"
         )),
+        ModelInput::MaskedHistory { .. } => Err(anyhow!(
+            "EASE does not support ModelInput::MaskedHistory; expected ModelInput::Sparse"
+        )),
     }
 }
 

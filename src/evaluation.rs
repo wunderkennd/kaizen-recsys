@@ -446,6 +446,72 @@ impl<'m> EvalAdapter for TwoTowerEvalAdapter<'m> {
     }
 }
 
+/// BERT4Rec eval adapter (#96) — sorts each user's train items
+/// oldest-first by `days_ago` (the same rule as
+/// [`chronological_history_from_ctx`]) and converts each `days_ago` to
+/// its log₂ recency bucket (`crate::data::days_ago_to_log2_bucket`, the
+/// rule `data::masked_sequences` trains with; the model clamps to its
+/// own table size). Scores via [`ModelInput::MaskedHistory`]. Returns
+/// `Err` if the context has no `days_ago`: without it there are no
+/// positions to feed the model.
+pub struct Bert4RecEvalAdapter<'m> {
+    model: &'m dyn RecModel,
+}
+
+impl<'m> Bert4RecEvalAdapter<'m> {
+    pub fn new(model: &'m dyn RecModel) -> Self {
+        Self { model }
+    }
+}
+
+impl<'m> EvalAdapter for Bert4RecEvalAdapter<'m> {
+    fn model(&self) -> &dyn RecModel {
+        self.model
+    }
+
+    fn predict_user_scores(&self, ctx: &UserEvalContext<'_>) -> Result<Vec<f32>> {
+        let (history, positions) = masked_history_from_ctx(ctx)?;
+        self.model.predict_scores(ModelInput::MaskedHistory {
+            history: &history,
+            positions: &positions,
+        })
+    }
+}
+
+/// Order `ctx.train_items` oldest-first by `train_days_ago` and pair
+/// each with its log₂ recency bucket — the BERT4Rec counterpart of
+/// [`chronological_history_from_ctx`].
+pub(crate) fn masked_history_from_ctx(
+    ctx: &UserEvalContext<'_>,
+) -> Result<(Vec<usize>, Vec<usize>)> {
+    let days_ago = ctx.train_days_ago.ok_or_else(|| {
+        anyhow!(
+            "Bert4RecEvalAdapter requires a `days_ago` column in the train interactions \
+             file to order each user's history and derive recency buckets; it is absent. \
+             (Matches the same requirement in `data::masked_sequences`.)"
+        )
+    })?;
+    if days_ago.len() != ctx.train_items.len() {
+        return Err(anyhow!(
+            "internal error: days_ago.len() ({}) != train_items.len() ({})",
+            days_ago.len(),
+            ctx.train_items.len()
+        ));
+    }
+    let mut pairs: Vec<(f64, usize)> = days_ago
+        .iter()
+        .zip(ctx.train_items.iter())
+        .map(|(d, (idx, _))| (*d, *idx))
+        .collect();
+    pairs.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    let positions = pairs
+        .iter()
+        .map(|(d, _)| crate::data::days_ago_to_log2_bucket(*d))
+        .collect();
+    let history = pairs.into_iter().map(|(_, idx)| idx).collect();
+    Ok((history, positions))
+}
+
 /// Build the right [`EvalAdapter`] for `model.kind()`.
 pub fn adapter_for(model: &dyn RecModel) -> Box<dyn EvalAdapter + '_> {
     use crate::models::ModelKind;
@@ -453,6 +519,7 @@ pub fn adapter_for(model: &dyn RecModel) -> Box<dyn EvalAdapter + '_> {
         ModelKind::Ease => Box::new(EaseEvalAdapter::new(model)),
         ModelKind::SasRec => Box::new(SasRecEvalAdapter::new(model)),
         ModelKind::TwoTower => Box::new(TwoTowerEvalAdapter::new(model)),
+        ModelKind::Bert4Rec => Box::new(Bert4RecEvalAdapter::new(model)),
     }
 }
 
@@ -1250,6 +1317,44 @@ mod tests {
         // Oldest first: days_ago 7 (item 20, then 40 by stable tie),
         // then 3 (item 30), then 1 (item 10).
         assert_eq!(hist, vec![20, 40, 30, 10]);
+    }
+
+    // #96: BERT4Rec eval masked-history tests (pure; no burn needed)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn masked_history_errors_when_days_ago_absent() {
+        let items = [(0_usize, 1.0_f64), (1, 1.0)];
+        let ctx = UserEvalContext {
+            train_items: &items,
+            train_days_ago: None,
+            user_features: &[],
+            user_idx: Some(1),
+        };
+        let r = masked_history_from_ctx(&ctx);
+        assert!(
+            r.is_err(),
+            "expected Err when days_ago is absent, got {r:?}"
+        );
+        assert!(r.unwrap_err().to_string().contains("days_ago"));
+    }
+
+    #[test]
+    fn masked_history_sorts_oldest_first_and_buckets_days_ago() {
+        // Same ordering rule as SASRec (descending days_ago, stable
+        // ties) plus a parallel log2 recency bucket per item.
+        let items = [(10_usize, 1.0_f64), (20, 1.0), (30, 1.0), (40, 1.0)];
+        let days_ago = [1.0_f64, 365.0, 3.0, 365.0];
+        let ctx = UserEvalContext {
+            train_items: &items,
+            train_days_ago: Some(&days_ago),
+            user_features: &[],
+            user_idx: Some(1),
+        };
+        let (hist, pos) = masked_history_from_ctx(&ctx).expect("sort succeeds");
+        assert_eq!(hist, vec![20, 40, 30, 10]);
+        // 365 → 8, 365 → 8, 3 → 1, 1 → 0
+        assert_eq!(pos, vec![8, 8, 1, 0]);
     }
 
     #[cfg(feature = "ml-models")]

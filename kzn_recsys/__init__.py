@@ -39,17 +39,20 @@ try:  # schemas.py needs pydantic + polars, absent in pure-Python (Spark) instal
 except ImportError:
     _HAS_SCHEMAS = False
 
-# SASRec and Two-Tower are only present when the extension is built with
-# the `ml-models` Cargo feature (default-off; EASE-only wheels omit them
-# and burn).
+# SASRec, Two-Tower, and BERT4Rec are only present when the extension is
+# built with the `ml-models` Cargo feature (default-off; EASE-only wheels
+# omit them and burn).
 try:  # pragma: no cover - import guard, exercised by build matrix
     from kzn_recsys._native import (  # noqa: F401
+        Bert4RecModel,
         SASRecModel,
         TwoTowerModel,
+        build_and_train_bert4rec,
         build_and_train_sasrec,
         build_and_train_two_tower,
         grid_search_sasrec,
         grid_search_two_tower,
+        load_bert4rec_model,
         load_sasrec_model,
         load_two_tower_model,
         random_search_sasrec,
@@ -95,12 +98,15 @@ if _HAS_NATIVE:
 
 if _HAS_ML_MODELS:
     __all__ += [
+        "Bert4RecModel",
         "SASRecModel",
         "TwoTowerModel",
+        "build_and_train_bert4rec",
         "build_and_train_sasrec",
         "build_and_train_two_tower",
         "grid_search_sasrec",
         "grid_search_two_tower",
+        "load_bert4rec_model",
         "load_sasrec_model",
         "load_two_tower_model",
         "random_search_sasrec",

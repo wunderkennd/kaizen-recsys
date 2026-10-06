@@ -1,0 +1,69 @@
+resources:
+  jobs:
+    kzn_recsys_spark_job:
+      name: kzn_recsys_spark_job
+      job_clusters:
+        - job_cluster_key: spark_ease
+          new_cluster:
+            spark_version: 14.3.x-scala2.12
+            node_type_id: Standard_DS3_v2
+            num_workers: 1
+            data_security_mode: SINGLE_USER
+      tasks:
+        - task_key: ingest
+          job_cluster_key: spark_ease
+          notebook_task:
+            notebook_path: ../src/01_ingest_and_features.py
+            base_parameters:
+              catalog: ${var.catalog}
+              schema: ${var.schema}
+              data_mode: ${var.data_mode}
+              n_users: ${var.n_users}
+              n_items: ${var.n_items}
+              seed: ${var.seed}
+              raw_engagement_table: ${var.raw_engagement_table}
+              raw_metadata_table: ${var.raw_metadata_table}
+          libraries:
+            - whl: ../../packaging/pure-python/dist/*.whl
+        - task_key: train
+          depends_on: [{ task_key: ingest }]
+          job_cluster_key: spark_ease
+          notebook_task:
+            notebook_path: ../src/02_train_and_tune.py
+            base_parameters:
+              catalog: ${var.catalog}
+              schema: ${var.schema}
+              volume: ${var.volume}
+              strategy: ${var.strategy}
+              do_tune: ${var.do_tune}
+              k: ${var.k}
+              seed: ${var.seed}
+          libraries:
+            - whl: ../../packaging/pure-python/dist/*.whl
+        - task_key: evaluate
+          depends_on: [{ task_key: train }]
+          job_cluster_key: spark_ease
+          notebook_task:
+            notebook_path: ../src/03_evaluate.py
+            base_parameters:
+              catalog: ${var.catalog}
+              schema: ${var.schema}
+              volume: ${var.volume}
+              k: ${var.k}
+              ndcg_gate: ${var.ndcg_gate}
+              seed: ${var.seed}
+              days_ago_cutoff: ${var.days_ago_cutoff}
+          libraries:
+            - whl: ../../packaging/pure-python/dist/*.whl
+        - task_key: predict
+          depends_on: [{ task_key: evaluate }]
+          job_cluster_key: spark_ease
+          notebook_task:
+            notebook_path: ../src/04_predict_and_sink.py
+            base_parameters:
+              catalog: ${var.catalog}
+              schema: ${var.schema}
+              volume: ${var.volume}
+              k: ${var.k}
+          libraries:
+            - whl: ../../packaging/pure-python/dist/*.whl

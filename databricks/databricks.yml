@@ -1,0 +1,34 @@
+bundle:
+  name: kzn_recsys_spark
+
+variables:
+  catalog:      { default: main }
+  schema:       { default: kzn_recsys }
+  volume:       { default: models }
+  data_mode:    { default: synthetic }   # synthetic | delta
+  n_users:      { default: "500" }
+  n_items:      { default: "120" }
+  seed:         { default: "42" }
+  k:            { default: "10" }
+  ndcg_gate:    { default: "0.0" }
+  strategy:     { default: collect }     # collect | distributed
+  do_tune:      { default: "false" }
+  days_ago_cutoff: { default: "7.0" }
+  raw_engagement_table: { default: "" }  # used when data_mode=delta
+  raw_metadata_table:   { default: "" }
+
+artifacts:
+  spark_wheel:
+    type: whl
+    build: python -m build --wheel
+    path: ../packaging/pure-python
+
+include:
+  - resources/*.yml
+
+targets:
+  dev:
+    mode: development
+    default: true
+  prod:
+    mode: production

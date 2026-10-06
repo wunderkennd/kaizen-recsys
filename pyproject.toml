@@ -28,6 +28,7 @@ spark = [
     "numpy>=1.24",
     "scipy>=1.10",
     "pyspark>=3.4",
+    "pandas>=1.5",  # pyspark.ml.functions (hybrid_train.pca_reduce_embeddings) imports it
 ]
 
 [tool.pytest.ini_options]

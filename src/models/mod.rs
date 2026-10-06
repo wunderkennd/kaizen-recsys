@@ -4,7 +4,8 @@
 //! `EaseAdapter` that wraps the existing `RustFeaseModel`. No behavior
 //! change — every adapter method delegates to the concrete model.
 //! Phases 2–6 plug new models (SASRec, Two-Tower) in behind the same
-//! trait, and generalize the eval/tuning/serving consumers.
+//! trait, and generalize the eval/tuning/serving consumers. BERT4Rec
+//! (#96) follows the same pattern with its own `ModelInput` variant.
 
 // Phase 1 is scaffolding: lib.rs, evaluation, tuning, and serving still
 // reference `RustFeaseModel` concretely. Several trait methods and the
@@ -26,10 +27,16 @@ pub mod sasrec;
 #[cfg(feature = "ml-models")]
 pub mod two_tower;
 
+#[cfg(feature = "ml-models")]
+pub mod bert4rec;
+
 pub use ease::{EaseAdapter, EaseAdapterRef};
 
 #[cfg(feature = "ml-models")]
 pub use sasrec::TrainedSasRec;
+
+#[cfg(feature = "ml-models")]
+pub use bert4rec::TrainedBert4Rec;
 
 /// What kind of model this is. Used by callers that need to construct
 /// model-appropriate input shapes.
@@ -38,6 +45,8 @@ pub enum ModelKind {
     Ease,
     SasRec,
     TwoTower,
+    /// Bidirectional masked-item transformer (#96).
+    Bert4Rec,
 }
 
 /// Input passed to `predict_scores`. Each variant maps to a model family.
@@ -58,6 +67,15 @@ pub enum ModelInput<'a> {
         user_idx: Option<usize>,
         cat_features: &'a [usize],
         dense_features: &'a [f32],
+    },
+    /// BERT4Rec (#96): chronologically-ordered item indices (oldest
+    /// first) plus the matching relative-recency position buckets
+    /// (`crate::data::days_ago_to_log2_bucket`). The model clamps buckets
+    /// to its own position-table size; a `positions` slice shorter than
+    /// `history` is padded with bucket `0` ("now").
+    MaskedHistory {
+        history: &'a [usize],
+        positions: &'a [usize],
     },
 }
 

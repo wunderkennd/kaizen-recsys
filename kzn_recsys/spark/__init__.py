@@ -16,6 +16,7 @@ from kzn_recsys.spark.metrics import (
     coverage,
     hit_rate_at_k,
 )
+from kzn_recsys.spark.databricks import make_synthetic, feature_engineering
 
 __all__ = [
     "EaseParams",
@@ -34,4 +35,6 @@ __all__ = [
     "mean_average_precision",
     "coverage",
     "hit_rate_at_k",
+    "make_synthetic",
+    "feature_engineering",
 ]

@@ -19,6 +19,11 @@ exposed to Python via PyO3/maturin. Three models live behind one
 - **Two-Tower** — dual-tower retrieval with in-batch sampled-softmax and
   learned cold-start prior (id-dropout). Requires the `ml-models` Cargo
   feature.
+- **BERT4Rec** — bidirectional transformer with a masked-item (Cloze)
+  objective and log₂-bucketed `days_ago` positions (#96). Besides
+  scoring it exports dense user / item embeddings; the hybrid pipeline
+  (`kzn_recsys/hybrid_train.py`) feeds the user embeddings into EASE as
+  side features. Requires the `ml-models` Cargo feature.
 
 The evaluation, tuning, and serving layers (`src/evaluation.rs`,
 `src/tuning.rs`, `src/serving.rs`) are model-agnostic — they operate on
@@ -45,6 +50,8 @@ maturin build --release --features ml-models --out dist
 .venv/bin/python -m pytest tests/test_model.py -v
 .venv/bin/python -m pytest tests/test_sasrec.py -v       # needs --features ml-models
 .venv/bin/python -m pytest tests/test_two_tower.py -v    # needs --features ml-models
+.venv/bin/python -m pytest tests/test_bert4rec.py -v     # needs --features ml-models
+.venv/bin/python -m pytest tests/spark/ -v               # needs the [spark] extra + Java
 
 # Run a single test
 .venv/bin/python -m pytest tests/test_model.py::test_warm_user_prediction -v
@@ -53,6 +60,7 @@ maturin build --release --features ml-models --out dist
 cargo test                                  # EASE-only
 cargo test --features ml-models             # all models
 cargo test --features ml-models sasrec      # SASRec only
+cargo test --features ml-models bert4rec    # BERT4Rec only
 cargo test --release --features ml-models -- --ignored
                                             # SASRec + Two-Tower end-to-end
                                             # hyperparameter-search tests
@@ -77,12 +85,14 @@ docker build . -t fease-builder
 Python caller
     ↓
 src/lib.rs           — PyO3 entrypoint: FeaseModel, ModelRegistry, SASRecModel,
-                       TwoTowerModel (last two gated on `ml-models`),
-                       build_and_train{,_sasrec,_two_tower}, load_*_model,
+                       TwoTowerModel, Bert4RecModel (last three gated on `ml-models`),
+                       build_and_train{,_sasrec,_two_tower,_bert4rec}, load_*_model,
                        per-model grid_search_* / random_search_*, split/eval helpers
     ↓
 src/models/          — RecModel trait + adapters / impls (see below)
-src/data/            — sequences.rs (SASRec), triples.rs (Two-Tower)
+src/data/            — sequences.rs (SASRec), masked_sequences.rs (BERT4Rec),
+                       triples.rs (Two-Tower); mod.rs holds the ungated
+                       `days_ago_to_log2_bucket` shared with evaluation
 src/data_pipeline.rs — Long-format Parquet/CSV → sparse CSR matrices (EASE) and mappings
 src/weighting.rs     — Event-type weights, temporal decay, IPS reweighting configs
     ↓
@@ -105,27 +115,31 @@ src/data_validation.rs — GaussianAnomalyDetector for pre-training data quality
 
 ### Key Rust Modules
 
-- **`lib.rs`**: PyO3 bridge. Exposes `FeaseModel` (predict, predict_batch, predict_similar_items, evaluate, validate, save), `ModelRegistry`, EASE `build_and_train()` / `load_model()`, `validate_data()`, split functions, EASE search functions (`grid_search` / `random_search`), per-model search functions (`grid_search_{ease,sasrec,two_tower}` and `random_search_*`), and standalone metrics. Under `ml-models`, also exposes `SASRecModel` / `build_and_train_sasrec` / `load_sasrec_model` and `TwoTowerModel` / `build_and_train_two_tower` / `load_two_tower_model`.
-- **`models/mod.rs`**: `RecModel` trait (`kind`, `num_items`, `item_mapping`, `predict_scores(ModelInput<'_>)`, `predict_similar_items`, `validate`, `save`) + `ModelInput` enum (`Sparse`, `Sequence`, `TowerUser`).
+- **`lib.rs`**: PyO3 bridge. Exposes `FeaseModel` (predict, predict_batch, predict_similar_items, evaluate, validate, save), `ModelRegistry`, EASE `build_and_train()` / `load_model()`, `validate_data()`, split functions, EASE search functions (`grid_search` / `random_search`), per-model search functions (`grid_search_{ease,sasrec,two_tower}` and `random_search_*`), and standalone metrics. Under `ml-models`, also exposes `SASRecModel` / `build_and_train_sasrec` / `load_sasrec_model`, `TwoTowerModel` / `build_and_train_two_tower` / `load_two_tower_model`, and `Bert4RecModel` (predict / embed_user / embed_users / embed_items / predict_similar_items / evaluate / save) / `build_and_train_bert4rec` / `load_bert4rec_model`.
+- **`models/mod.rs`**: `RecModel` trait (`kind`, `num_items`, `item_mapping`, `predict_scores(ModelInput<'_>)`, `predict_similar_items`, `validate`, `save`) + `ModelInput` enum (`Sparse`, `Sequence`, `TowerUser`, `MaskedHistory`).
 - **`models/ease.rs`**: `EaseAdapter` / `EaseAdapterRef` — implement `RecModel` over `RustFeaseModel` with no algorithmic change.
 - **`models/sasrec.rs`**: `SasRecConfig`, `SasRecTrainingConfig`, `train_sasrec()`, `TrainedSasRec` (transformer; `burn` backend). Magic-bytes-framed save/load.
 - **`models/two_tower.rs`**: `TwoTowerConfig`, `TrainParams`, `train()`, `TrainedTwoTower`. Reserved cold-start row trained via `id_dropout`. Magic-bytes-framed save/load.
+- **`models/bert4rec.rs`**: `Bert4RecConfig`, `Bert4RecTrainingConfig`, `train_bert4rec()` (hand-rolled Adam loop with best-loss early stopping), `TrainedBert4Rec` (`embed_user`, `embed_users_batch`, `embed_items`; scoring appends a `[MASK]` query token). No causal mask; pad positions are excluded via `mask_pad`. `FB4R` framed save/load, format v1.
 - **`model.rs`**: Pure Rust `RustFeaseModel`. EASE training, prediction (including `predict_raw` over raw features via the embedded transformation schema), MLT similarity, validation, sparsity pruning.
 - **`transform.rs`**: `FeatureTransformationSchema` + `NumericalBucketConfig` — declarative raw-feature → engineered-key transformation embedded in the model for zero-drift online inference (`FeaseModel.predict_raw`, persisted in FEAS v3).
 - **`data/sequences.rs`**: Build chronologically-ordered left-padded item sequences for SASRec from a long-format interactions file with a `days_ago` column.
+- **`data/masked_sequences.rs`**: BERT4Rec data path. Tokens `0`=PAD, `1`=MASK, `item_idx + 2`; `build_masked_sequences(path, mappings, seq_len, mask_ratio, num_position_buckets, seed)` applies seeded random masking (at least one mask per row) and log₂ `days_ago` position buckets; `read_user_histories` is the shared per-user chronological reader also used for embedding extraction. `days_ago` is required (fails loudly).
 - **`data/triples.rs`**: Load `(user_idx, item_idx)` positive pairs (`TripleData`) and `FeatureTable` (categorical + dense per entity) for Two-Tower. Reserves a cold-start user row at index 0.
 - **`data_pipeline.rs`**: Long-format Parquet/CSV → sparse CSR matrices + string↔index mappings (EASE path). Hooks for weighting transforms.
 - **`weighting.rs`**: `WeightingConfig` struct + functions: `apply_event_weights()`, `apply_temporal_decay()`, `apply_ips()`.
-- **`evaluation.rs`**: `random_split()`, `temporal_split()`, `leave_k_out_split()` for data splitting; `evaluate_model()` harness generic over `&dyn RecModel`. Per-user input construction routes through the `EvalAdapter` trait (`EaseEvalAdapter` → `Sparse`; `SasRecEvalAdapter` → chronologically-sorted `Sequence`, requires `days_ago` in the train file; `TwoTowerEvalAdapter` → `TowerUser`). `evaluate_with_adapter()` is the lower-level entrypoint used by tuning's per-fold scorer (#51).
+- **`evaluation.rs`**: `random_split()`, `temporal_split()`, `leave_k_out_split()` for data splitting; `evaluate_model()` harness generic over `&dyn RecModel`. Per-user input construction routes through the `EvalAdapter` trait (`EaseEvalAdapter` → `Sparse`; `SasRecEvalAdapter` → chronologically-sorted `Sequence`, requires `days_ago` in the train file; `TwoTowerEvalAdapter` → `TowerUser`; `Bert4RecEvalAdapter` → chronologically-sorted `MaskedHistory` with log₂ recency buckets, requires `days_ago`). `evaluate_with_adapter()` is the lower-level entrypoint used by tuning's per-fold scorer (#51).
 - **`tuning.rs`**: `SearchSpace` and `FoldEvaluator<P>` traits; `grid_search_with` / `random_search_with` runners generic over `P`. EASE keeps `grid_search()` / `random_search()` (`P = HyperParams`) for callers; per-model entrypoints layer on top. Parallelized via rayon (ADR-0002).
 - **`metrics.rs`**: Pure functions: `precision_at_k`, `recall_at_k`, `ndcg_at_k`, `mean_average_precision`, `coverage`, `hit_rate_at_k`.
-- **`serialization.rs`**: Binary save/load with `FEAS` magic bytes for EASE (format v3 persists `WeightingConfig` + optional `FeatureTransformationSchema`; v1/v2 files migrate on load via version-field dispatch); top-level `load_model()` sniffs the magic bytes and dispatches to EASE / SASRec / Two-Tower loaders.
-- **`serving.rs`**: `ModelRegistry` for multi-territory model routing — stores `Box<dyn RecModel>`. `register()` keeps the EASE adapter shortcut; `register_model()` accepts any `RecModel`. String-id-native per-model predict methods (`predict_top_k_ease`, `predict_top_k_sasrec`, `predict_top_k_two_tower`) mirror the standalone model classes' input shapes; the legacy index-based `predict_top_k` is preserved (#56). `predict_batch()` / `predict_batch_top_k()` parallelized via rayon.
+- **`serialization.rs`**: Binary save/load with `FEAS` magic bytes for EASE (format v3 persists `WeightingConfig` + optional `FeatureTransformationSchema`; v1/v2 files migrate on load via version-field dispatch). `load_model()` is EASE-only, but recognises the sibling magics (`FSAS`/`FSAT` SASRec, `FTWO` Two-Tower, `FB4R` BERT4Rec) and names the right loader in its error.
+- **`serving.rs`**: `ModelRegistry` for multi-territory model routing — stores `Box<dyn RecModel>`. `register()` keeps the EASE adapter shortcut; `register_model()` accepts any `RecModel`. String-id-native per-model predict methods (`predict_top_k_ease`, `predict_top_k_sasrec`, `predict_top_k_two_tower`, `predict_top_k_bert4rec`) mirror the standalone model classes' input shapes; the legacy index-based `predict_top_k` is preserved (#56). `predict_batch()` / `predict_batch_top_k()` parallelized via rayon.
 - **`data_validation.rs`**: `GaussianAnomalyDetector` — confidence interval checks for data quality.
 
 ### Python Layer (`kzn_recsys/`)
 
-- `__init__.py` — Exports when the native extension is present (`_HAS_NATIVE`, i.e. any wheel except the pure-Python `kzn_recsys_spark` one): `FeaseModel`, `ModelRegistry`, `FeatureTransformationSchema`, `NumericalBucketConfig`, `build_and_train`, `load_model`, `validate_data`, split functions, `grid_search` / `grid_search_ease` / `random_search` / `random_search_ease`, metrics. Exports when pydantic + polars are installed (`_HAS_SCHEMAS`): `EngagementSchema`, `MetadataSchema`. The pure-Python install exposes the recommender via the `kzn_recsys.spark` subpackage instead. Conditional on the extension being built with `--features ml-models` (gated by `_HAS_ML_MODELS`): `SASRecModel`, `build_and_train_sasrec`, `load_sasrec_model`, `grid_search_sasrec`, `random_search_sasrec`, `TwoTowerModel`, `build_and_train_two_tower`, `load_two_tower_model`, `grid_search_two_tower`, `random_search_two_tower`.
+- `__init__.py` — Exports when the native extension is present (`_HAS_NATIVE`, i.e. any wheel except the pure-Python `kzn_recsys_spark` one): `FeaseModel`, `ModelRegistry`, `FeatureTransformationSchema`, `NumericalBucketConfig`, `build_and_train`, `load_model`, `validate_data`, split functions, `grid_search` / `grid_search_ease` / `random_search` / `random_search_ease`, metrics. Exports when pydantic + polars are installed (`_HAS_SCHEMAS`): `EngagementSchema`, `MetadataSchema`. The pure-Python install exposes the recommender via the `kzn_recsys.spark` subpackage instead. Conditional on the extension being built with `--features ml-models` (gated by `_HAS_ML_MODELS`): `SASRecModel`, `build_and_train_sasrec`, `load_sasrec_model`, `grid_search_sasrec`, `random_search_sasrec`, `TwoTowerModel`, `build_and_train_two_tower`, `load_two_tower_model`, `grid_search_two_tower`, `random_search_two_tower`, `Bert4RecModel`, `build_and_train_bert4rec`, `load_bert4rec_model`.
+- `cr_config.py` — Plain constants for the content-recommendation pipelines (BERT4Rec architecture/training defaults, hybrid FEASE `alpha`/`beta`/`lambda`, embedding feature-name prefixes). No heavy imports.
+- `hybrid_train.py` — Databricks notebook-style BERT4Rec → FEASE hybrid pipeline (#96): `run_hybrid_pipeline()` plus importable Spark helpers (`extract_user_embeddings`, `embeddings_to_long_format`, `pca_reduce_embeddings`, `write_single_parquet`). Needs `pyspark` and the `ml-models` build.
 - `schemas.py` — Pydantic models for column validation
 - `fease_wrapper.py` — Thin validation wrapper around `build_and_train()` with optional advanced weighting params
 - `train.py` — CLI training script (`--interactions`, `--user-features`, `--item-features`, `--output`)
@@ -188,11 +202,25 @@ training fails loudly otherwise.
 remapped to the reserved cold-start row so that row receives gradient
 and learns an average-user prior (PR #46).
 
+**BERT4Rec hyperparameters.** `embedding_dim` (divisible by
+`num_heads`; also the width of the exported user embedding),
+`max_seq_len`, `num_position_buckets` (log₂ `days_ago` table),
+`num_heads`, `num_layers`, `dropout`, `mask_ratio`, `num_epochs`,
+`batch_size`, `learning_rate`, `patience`, `seed`. The interactions
+file **must** include a numeric `days_ago` column — it orders each
+history and is bucketed into the relative-recency positions; training
+fails loudly otherwise. Scoring appends a `[MASK]` query token and
+reads its logits; `predict(history, days_ago=None)` treats a missing
+`days_ago` as "all now" (bucket 0).
+
 **Cold-start.**
 - *EASE*: users with zero interactions get recommendations through
   user-feature columns in the S-matrix; works at predict time with
   arbitrary side features.
 - *SASRec*: empty history → no recommendation (model is sequence-only).
+- *BERT4Rec*: empty history → zero embedding / no-context logits. In
+  the hybrid pipeline a user with no embedding simply has no
+  `bert_emb_*` features and is carried by EASE's categorical features.
 - *Two-Tower*: unknown user ids fall back to the reserved cold-start row.
   Predict-time arbitrary user features (`predict(user_id, features=...)`)
   are routed through the user-feature-name → category-index / dense-
@@ -223,7 +251,7 @@ new code can use the explicit `grid_search_ease` / `grid_search_sasrec`
 ## Data Format
 
 The models read from long-format tables (Parquet or CSV):
-- **Interactions**: `user_id`, `item_id`, `value` (+ optional `event_type` for EASE weighting, **required `days_ago` for SASRec**)
+- **Interactions**: `user_id`, `item_id`, `value` (+ optional `event_type` for EASE weighting, **required `days_ago` for SASRec and BERT4Rec**)
 - **User features**: `user_id`, `feature_name`, `value` (used by EASE and Two-Tower)
 - **Item features**: `item_id`, `feature_name`, `value` (used by EASE and Two-Tower)
 
