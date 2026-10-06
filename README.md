@@ -620,7 +620,7 @@ for trial in result["trials"][:5]:
     print(f"  Score={trial['mean_score']:.4f}, params={trial['params']}")
 ```
 
-### Per-Model Search (EASE / SASRec / Two-Tower)
+### Per-Model Search (EASE / SASRec / Two-Tower / BERT4Rec)
 
 `grid_search` / `random_search` above target EASE; the
 `*_ease` / `*_sasrec` / `*_two_tower` functions take each model's own
@@ -671,7 +671,74 @@ result = fease.grid_search_two_tower(
 
 `random_search_ease` / `random_search_sasrec` / `random_search_two_tower`
 mirror the same parameter shape, taking an additional `n_trials` and
-sampling uniformly from each list of candidate values.
+sampling uniformly from each list of candidate values. BERT4Rec has the
+same pair, `grid_search_bert4rec` / `random_search_bert4rec`, over
+`embedding_dim`, `num_heads`, `num_layers`, `dropout`, `mask_ratio`,
+`learning_rate`, `num_epochs` (interactions must carry `days_ago`).
+
+### Strategy-driven search: `tune_*` (grid / random / TPE)
+
+`tune_ease` / `tune_sasrec` / `tune_two_tower` / `tune_bert4rec`
+(issue #97, [ADR-0005](docs/adr/0005-hpo-strategy-seam.md)) run one
+search loop for every model: a **strategy** proposes a batch of
+configurations, the batch is evaluated under k-fold CV in parallel via
+rayon, the results feed back, and the loop repeats until `max_trials`.
+The space is a dict: a **list** is a finite set of candidates, a
+`(kind, low, high)` **tuple** (or `{"type", "low", "high"}` dict) is a
+range with kind `"uniform"`, `"log"`, `"int"` or `"logint"`. Omitted
+parameters keep their defaults.
+
+```python
+result = fease.tune_ease(
+    "interactions.parquet",
+    space={
+        "lambda_": ("log", 1.0, 1000.0),      # log-uniform range
+        "alpha": {"type": "uniform", "low": 0.5, "high": 2.0},
+        "beta": [0.5, 1.0],                   # finite choices
+    },
+    user_features_path="user_features.parquet",
+    item_features_path="item_features.parquet",
+    strategy="tpe",      # "grid" (finite axes only) | "random" | "tpe"
+    max_trials=40,
+    n_folds=3, eval_k=10, seed=42,
+)
+result["best_params"], result["best_score"], result["strategy"]
+
+# Resume / refine: feed a previous run's trials back in as a warm start.
+more = fease.tune_ease(
+    "interactions.parquet", space, user_features_path="user_features.parquet",
+    item_features_path="item_features.parquet", strategy="tpe", max_trials=20,
+    seed=43, warm_start=result["trials"],
+)
+
+# Burn models (need --features ml-models); feature paths are optional.
+result = fease.tune_bert4rec(
+    "interactions.parquet",   # must carry days_ago
+    space={"embedding_dim": [32, 64, 128], "learning_rate": ("log", 1e-4, 1e-2),
+           "num_layers": ("int", 1, 3)},
+    strategy="tpe", max_trials=20, n_folds=3,
+)
+```
+
+`strategy="tpe"` is a Tree-structured Parzen Estimator: after
+`n_startup` random trials (default `clamp(max_trials / 4, 3, 10)`) it
+models the best 10 % of trials against the rest and proposes
+`batch_size` (default 4) configurations per round that maximise their
+likelihood ratio. Smaller batches adapt faster; larger ones keep more
+rayon workers busy. `strategy="grid"` with `max_trials` evaluates the
+first `max_trials` combinations in grid order (enumerated lazily, so a
+huge grid with a small budget costs only the budget), and a grid run
+resumed with `warm_start` continues from where it stopped instead of
+repeating trials. `"random"` and `"grid"` reproduce `random_search_*` /
+`grid_search_*` exactly for the same seed. Warm-start trials whose
+values fall outside the current space (an axis was moved since the
+previous run) are ignored with a warning. Every search result, old and
+new entrypoints alike, carries a `strategy` key.
+
+For SASRec and BERT4Rec the per-fold score is leave-last-out within each
+held-out user's own history: folds are user-disjoint, so the older part
+of a test user's sequence is the context and the most recent fifth (at
+least one item) is the relevance set.
 
 ## Data Quality Validation
 
