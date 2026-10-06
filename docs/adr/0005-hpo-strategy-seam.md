@@ -107,6 +107,15 @@ Constraints that shaped the design:
   never passes empty lists, so its outputs are unchanged.
 - Determinism: a whole search is a function of `(seed, space, strategy
   settings)`; execution order and thread count do not affect it.
+- Grids are enumerated lazily (mixed-radix counter, first axis
+  outermost), so a trial budget bounds memory on any finite space, and a
+  grid resumed from a warm start skips already-evaluated assignments.
+  Warm-start trials outside the current space are dropped with a warning
+  and never count toward a finite space's exhaustion.
+- Sequence models (SASRec, BERT4Rec) are scored per fold on each held-out
+  user's own history, split leave-last-out: user-disjoint folds give a
+  test user no train interactions, so the previous "train history as
+  context" was always empty and every user received the same query.
 - Acceptance evidence (issue #97): on the Two-Tower fixture, TPE with half
   the budget matches or beats random search's best NDCG@k in a majority
   of seeds (`test_tpe_half_budget_matches_random_best_two_tower`,

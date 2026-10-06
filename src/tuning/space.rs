@@ -147,13 +147,51 @@ impl Axis {
     }
 
     /// Number of distinct values for a finite axis, `None` otherwise.
+    /// Computed in `i128` and saturated to `usize::MAX`, so a valid but
+    /// enormous `Int` range (`i64::MIN..=i64::MAX`) cannot overflow.
     pub fn cardinality(&self) -> Option<usize> {
         match self {
             Axis::Choice(v) => Some(v.len()),
             Axis::Int { low, high } | Axis::LogInt { low, high } => {
-                Some((high - low + 1).max(0) as usize)
+                let span = (*high as i128 - *low as i128 + 1).max(0);
+                Some(usize::try_from(span).unwrap_or(usize::MAX))
             }
             _ => None,
+        }
+    }
+
+    /// The `i`-th value of a finite axis in enumeration order (`Choice`
+    /// list order; ascending integers for `Int` / `LogInt`). Used by the
+    /// lazy grid enumerator so a huge integer range is never materialized.
+    ///
+    /// # Panics
+    ///
+    /// On a continuous axis or `i >= cardinality()`.
+    pub fn finite_value_at(&self, i: usize) -> Value {
+        match self {
+            Axis::Choice(v) => v[i],
+            Axis::Int { low, .. } | Axis::LogInt { low, .. } => {
+                Value::Int((*low as i128 + i as i128) as i64)
+            }
+            _ => panic!("finite_value_at on a continuous axis"),
+        }
+    }
+
+    /// `true` if `v` is a value this axis can produce: a listed `Choice`
+    /// candidate (numeric equality, so `Int(2)` matches `Float(2.0)`), a
+    /// number inside a continuous range, or an integer inside an integer
+    /// range.
+    pub fn contains(&self, v: Value) -> bool {
+        let x = v.as_f64();
+        match self {
+            Axis::Choice(values) => values.iter().any(|c| c.as_f64() == x),
+            Axis::Uniform { low, high } | Axis::LogUniform { low, high } => {
+                x.is_finite() && *low <= x && x <= *high
+            }
+            Axis::Int { low, high } | Axis::LogInt { low, high } => match v.as_i64() {
+                Ok(i) => *low <= i && i <= *high,
+                Err(_) => false,
+            },
         }
     }
 
@@ -183,7 +221,7 @@ impl Axis {
                     let _ = rng.r#gen::<f64>();
                     Value::Float(*low)
                 } else {
-                    Value::Float(rng.gen_range(*low..=*high))
+                    Value::Float(rng.gen_range(*low..=*high).clamp(*low, *high))
                 }
             }
             Axis::LogUniform { low, high } => {
@@ -191,7 +229,9 @@ impl Axis {
                     let _ = rng.r#gen::<f64>();
                     Value::Float(*low)
                 } else {
-                    Value::Float(rng.gen_range(low.ln()..=high.ln()).exp())
+                    // `exp(ln(high))` can land a rounding error above `high`;
+                    // clamp so every sample satisfies `contains`.
+                    Value::Float(rng.gen_range(low.ln()..=high.ln()).exp().clamp(*low, *high))
                 }
             }
             Axis::Int { low, high } => Value::Int(rng.gen_range(*low..=*high)),
@@ -229,10 +269,14 @@ impl Axis {
         let u = u.clamp(0.0, 1.0);
         match self {
             Axis::Choice(v) => v[((u * v.len() as f64) as usize).min(v.len() - 1)],
-            Axis::Uniform { low, high } => Value::Float(low + u * (high - low)),
-            Axis::LogUniform { low, high } => {
-                Value::Float((low.ln() + u * (high.ln() - low.ln())).exp())
+            Axis::Uniform { low, high } => {
+                Value::Float((low + u * (high - low)).clamp(*low, *high))
             }
+            Axis::LogUniform { low, high } => Value::Float(
+                (low.ln() + u * (high.ln() - low.ln()))
+                    .exp()
+                    .clamp(*low, *high),
+            ),
             Axis::Int { low, high } => {
                 let x = *low as f64 + u * (*high as f64 - *low as f64);
                 Value::Int((x.round() as i64).clamp(*low, *high))
@@ -327,24 +371,80 @@ impl ParamSpace {
     /// outermost loop**, matching the hand-written cartesian products the
     /// typed grids used before #97. Errors on continuous axes.
     pub fn combinations(&self) -> Result<Vec<Assignment>> {
-        let per_axis: Vec<Vec<Value>> = self
+        self.combinations_take(usize::MAX, |_| false)
+    }
+
+    /// Lazily enumerate the grid in the same first-axis-outermost order,
+    /// skipping assignments for which `skip` is `true`, and stop after
+    /// `max_n` have been collected. Only the collected assignments are
+    /// ever materialized, so a trial budget bounds memory and work even
+    /// on an astronomically large finite space. Errors on continuous axes.
+    pub fn combinations_take(
+        &self,
+        max_n: usize,
+        mut skip: impl FnMut(&Assignment) -> bool,
+    ) -> Result<Vec<Assignment>> {
+        // Validate every axis up front so a continuous axis errors even
+        // when `max_n == 0`.
+        let radix: Vec<usize> = self
             .axes
             .iter()
-            .map(|a| a.axis.enumerate(&a.name))
+            .map(|a| {
+                a.axis.cardinality().ok_or_else(|| {
+                    anyhow!(
+                        "axis `{}` is continuous; grid search needs a finite Choice / Int axis \
+                         (use random or tpe, or list explicit candidate values)",
+                        a.name
+                    )
+                })
+            })
             .collect::<Result<_>>()?;
-        let mut out: Vec<Assignment> = vec![Vec::new()];
-        for values in &per_axis {
-            let mut next = Vec::with_capacity(out.len() * values.len());
-            for prefix in &out {
-                for v in values {
-                    let mut row = prefix.clone();
-                    row.push(*v);
-                    next.push(row);
+        let mut out: Vec<Assignment> = Vec::new();
+        if max_n == 0 || radix.contains(&0) {
+            return Ok(out);
+        }
+        // Mixed-radix counter: the last axis is the innermost loop.
+        let mut idx = vec![0usize; radix.len()];
+        loop {
+            let a: Assignment = self
+                .axes
+                .iter()
+                .zip(&idx)
+                .map(|(spec, &i)| spec.axis.finite_value_at(i))
+                .collect();
+            if !skip(&a) {
+                out.push(a);
+                if out.len() >= max_n {
+                    break;
                 }
             }
-            out = next;
+            // Increment with carry; exhausted when the first axis wraps.
+            let mut k = idx.len();
+            loop {
+                if k == 0 {
+                    return Ok(out);
+                }
+                k -= 1;
+                idx[k] += 1;
+                if idx[k] < radix[k] {
+                    break;
+                }
+                idx[k] = 0;
+            }
         }
         Ok(out)
+    }
+
+    /// `true` if `a` has one value per axis and every value lies in its
+    /// axis (see [`Axis::contains`]). Warm-start trials from a different
+    /// space fail this and are ignored by the strategies.
+    pub fn contains(&self, a: &Assignment) -> bool {
+        a.len() == self.axes.len()
+            && self
+                .axes
+                .iter()
+                .zip(a)
+                .all(|(spec, v)| spec.axis.contains(*v))
     }
 
     /// Draw one configuration, sampling each axis independently in axis
@@ -523,6 +623,141 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn lazy_grid_enumeration_bounds_work_and_skips() {
+        // 3 axes × 10^6 values each: 10^18 combinations, untouchable eagerly.
+        let huge = ParamSpace::new(vec![
+            AxisSpec::new(
+                "a",
+                Axis::Int {
+                    low: 0,
+                    high: 999_999,
+                },
+            ),
+            AxisSpec::new(
+                "b",
+                Axis::Int {
+                    low: 0,
+                    high: 999_999,
+                },
+            ),
+            AxisSpec::new("c", Axis::choice_f64(&[0.5, 1.0])),
+        ])
+        .unwrap();
+        let first = huge.combinations_take(3, |_| false).unwrap();
+        assert_eq!(
+            first,
+            vec![
+                vec![Value::Int(0), Value::Int(0), Value::Float(0.5)],
+                vec![Value::Int(0), Value::Int(0), Value::Float(1.0)],
+                vec![Value::Int(0), Value::Int(1), Value::Float(0.5)],
+            ]
+        );
+        // Skipping already-seen assignments continues in grid order.
+        let s = space();
+        let all = s.combinations().unwrap();
+        let seen: Vec<Assignment> = all[..5].to_vec();
+        let next = s.combinations_take(2, |a| seen.contains(a)).unwrap();
+        assert_eq!(next, all[5..7].to_vec());
+        // Exhausting the grid while skipping returns what is left.
+        let rest = s.combinations_take(100, |a| seen.contains(a)).unwrap();
+        assert_eq!(rest, all[5..].to_vec());
+        assert!(s.combinations_take(0, |_| false).unwrap().is_empty());
+        // Continuous axes still error, even for a zero budget.
+        let cont = ParamSpace::new(vec![AxisSpec::new(
+            "x",
+            Axis::Uniform {
+                low: 0.0,
+                high: 1.0,
+            },
+        )])
+        .unwrap();
+        assert!(cont.combinations_take(0, |_| false).is_err());
+    }
+
+    #[test]
+    fn cardinality_saturates_on_wide_int_ranges() {
+        let wide = Axis::Int {
+            low: -1,
+            high: i64::MAX,
+        };
+        // 2^63 + 1 values: fits usize on 64-bit, would overflow i64 math.
+        assert_eq!(wide.cardinality(), Some(9_223_372_036_854_775_809));
+        let widest = Axis::Int {
+            low: i64::MIN,
+            high: i64::MAX,
+        };
+        assert_eq!(widest.cardinality(), Some(usize::MAX));
+        assert_eq!(wide.finite_value_at(0), Value::Int(-1));
+        assert_eq!(wide.finite_value_at(2), Value::Int(1));
+        let s = ParamSpace::new(vec![
+            AxisSpec::new("n", wide),
+            AxisSpec::new("m", Axis::Int { low: 0, high: 1 }),
+        ])
+        .unwrap();
+        assert_eq!(s.cardinality(), Some(usize::MAX), "product saturates");
+        assert_eq!(
+            s.combinations_take(3, |_| false).unwrap(),
+            vec![
+                vec![Value::Int(-1), Value::Int(0)],
+                vec![Value::Int(-1), Value::Int(1)],
+                vec![Value::Int(0), Value::Int(0)],
+            ]
+        );
+    }
+
+    #[test]
+    fn contains_checks_membership_per_axis() {
+        let s = space(); // a: {0.5, 1.0}, b: {8, 16, 32}, c: Int 1..=2
+        assert!(s.contains(&vec![Value::Float(0.5), Value::Int(8), Value::Int(2)]));
+        // Numeric equality across Int / Float.
+        assert!(s.contains(&vec![Value::Float(1.0), Value::Float(16.0), Value::Int(1)]));
+        assert!(!s.contains(&vec![Value::Float(2.0), Value::Int(8), Value::Int(2)]));
+        assert!(!s.contains(&vec![Value::Float(0.5), Value::Int(8), Value::Int(3)]));
+        assert!(!s.contains(&vec![Value::Float(0.5), Value::Int(8)]));
+        let u = Axis::LogUniform {
+            low: 1e-3,
+            high: 1.0,
+        };
+        assert!(u.contains(Value::Float(0.01)));
+        assert!(!u.contains(Value::Float(2.0)));
+        assert!(!u.contains(Value::Float(f64::NAN)));
+    }
+
+    #[test]
+    fn samples_and_unit_decodes_are_always_contained() {
+        let axes = [
+            Axis::Uniform {
+                low: -1.0,
+                high: 1.0,
+            },
+            Axis::LogUniform {
+                low: 1e-4,
+                high: 0.3,
+            },
+            Axis::LogUniform {
+                low: 0.01,
+                high: 1.0,
+            },
+            Axis::Int { low: 3, high: 9 },
+            Axis::LogInt { low: 4, high: 64 },
+        ];
+        let mut rng = StdRng::seed_from_u64(11);
+        for axis in &axes {
+            for _ in 0..500 {
+                let v = axis.sample(&mut rng);
+                assert!(axis.contains(v), "{axis:?} sampled {v:?} outside itself");
+            }
+            for u in [0.0, 1e-9, 0.5, 1.0 - 1e-9, 1.0] {
+                let v = axis.from_unit(u);
+                assert!(
+                    axis.contains(v),
+                    "{axis:?} from_unit({u}) = {v:?} outside itself"
+                );
+            }
+        }
     }
 
     #[test]

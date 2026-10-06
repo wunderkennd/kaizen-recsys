@@ -1119,8 +1119,12 @@ fn evaluate_trial(
 /// SASRec is order-sensitive; the sequence builder requires a numeric
 /// `days_ago` column. The per-fold scorer used to pass per-user train items
 /// as `ModelInput::Sparse`, which discarded chronology — fixed in #51 by
-/// routing through the adapter. `max_seq_len` is fixed per evaluator
-/// (not a tuned axis) so every trial sees the same sequence horizon.
+/// routing through the adapter. Since #97 held-out users are scored on
+/// their own leave-last-out history ([`score_sequence_model_leave_last_out`]):
+/// under user-disjoint folds they have no train interactions, so the old
+/// "train history" context was always empty. `max_seq_len` is fixed per
+/// evaluator (not a tuned axis) so every trial sees the same sequence
+/// horizon.
 #[cfg(feature = "ml-models")]
 pub struct SasRecFoldEvaluator {
     /// History length / positional-embedding cap shared by every trial.
@@ -1189,57 +1193,91 @@ impl FoldEvaluator<SasRecParams> for SasRecFoldEvaluator {
         )?;
         let trained = TrainedSasRec::new(fitted, model_config, mappings);
 
-        // SASRec per-fold scoring uses `SasRecEvalAdapter` for the
-        // chronological-sort + `Sequence` construction, but does *not*
-        // go through `evaluate_with_adapter`. That harness skips test
-        // users absent from `user_to_idx`, which is fine for the public
-        // eval API but wrong here: `generate_kfold_splits` partitions
-        // users disjointly, so by construction no test user is in the
-        // train fold's `user_to_idx` and the harness would skip them
-        // all (NDCG=0 every trial). Mirrors `score_two_tower_over_
-        // test_users`, which is its own loop for the same reason.
+        // Sequence models are scored on the held-out users' *own*
+        // histories (leave-last-out within the test fold): see
+        // `score_sequence_model_leave_last_out`.
         let adapter = crate::evaluation::SasRecEvalAdapter::new(&trained);
-
-        let train_df = read_interactions_df(train_interactions_path)?;
-        let (train_user_items, train_user_days_ago) =
-            group_user_items_with_days_ago(&train_df, trained.item_mapping())?;
         let test_df = read_interactions_df(test_interactions_path)?;
-        let test_user_items = group_user_items(&test_df, trained.item_mapping())?;
-
-        let mut ndcg_sum = 0.0;
-        let mut n_users = 0;
-        for (user_id, test_items) in &test_user_items {
-            if test_items.is_empty() {
-                continue;
-            }
-            let train_items: Vec<(usize, f64)> =
-                train_user_items.get(user_id).cloned().unwrap_or_default();
-            let days_ago_vec: Vec<f64> = train_user_days_ago
-                .get(user_id)
-                .cloned()
-                .unwrap_or_default();
-
-            let ctx = crate::evaluation::UserEvalContext {
-                train_items: &train_items,
-                // Always Some — group_user_items_with_days_ago already
-                // bailed if the train fold had no `days_ago` column.
-                // For test users with no train interactions (the common
-                // case under user-disjoint k-fold), the slice is empty.
-                train_days_ago: Some(&days_ago_vec),
-                user_features: &[],
-                user_idx: None,
-            };
-            let scores =
-                <_ as crate::evaluation::EvalAdapter>::predict_user_scores(&adapter, &ctx)?;
-            ndcg_sum += rank_and_ndcg(&scores, &train_items, test_items, eval_k);
-            n_users += 1;
-        }
-
-        if n_users == 0 {
-            return Ok(0.0);
-        }
-        Ok(ndcg_sum / n_users as f64)
+        score_sequence_model_leave_last_out(&adapter, &test_df, trained.item_mapping(), eval_k)
     }
+}
+
+/// Split one user's chronologically-sorted interactions into context
+/// (older) and held-out targets (the most recent `ceil(n / 5)`, at least
+/// one, leaving at least one context item). `None` for users with fewer
+/// than two interactions. Returns `(context_items, context_days_ago,
+/// target_items)`.
+#[cfg(feature = "ml-models")]
+#[allow(clippy::type_complexity)]
+fn split_leave_last_out(
+    items: &[(usize, f64)],
+    days_ago: &[f64],
+) -> Option<(Vec<(usize, f64)>, Vec<f64>, Vec<(usize, f64)>)> {
+    let n = items.len().min(days_ago.len());
+    if n < 2 {
+        return None;
+    }
+    // Oldest first (larger days_ago == older); stable for ties.
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by(|&a, &b| {
+        days_ago[b]
+            .partial_cmp(&days_ago[a])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let n_targets = n.div_ceil(5).clamp(1, n - 1);
+    let split_at = n - n_targets;
+    let context: Vec<(usize, f64)> = order[..split_at].iter().map(|&i| items[i]).collect();
+    let context_days: Vec<f64> = order[..split_at].iter().map(|&i| days_ago[i]).collect();
+    let targets: Vec<(usize, f64)> = order[split_at..].iter().map(|&i| items[i]).collect();
+    Some((context, context_days, targets))
+}
+
+/// Score a sequence model (SASRec / BERT4Rec) on a held-out fold.
+///
+/// `generate_kfold_splits` is user-disjoint, so a test user has **no**
+/// interactions in the train split: feeding "the user's train history"
+/// to a sequence model would give every test user the same empty-context
+/// query and measure nothing. Instead each test user's own interactions
+/// are split chronologically with [`split_leave_last_out`]: the older
+/// part is the history the adapter orders and buckets exactly as at
+/// training time, the most recent part is the relevance set. Context
+/// items are excluded from the ranking (as everywhere else in the
+/// crate). Users with a single interaction are skipped. The model never
+/// saw these users during training, which is the generalisation the
+/// search is meant to measure.
+#[cfg(feature = "ml-models")]
+fn score_sequence_model_leave_last_out(
+    adapter: &dyn crate::evaluation::EvalAdapter,
+    test_df: &DataFrame,
+    mappings: &Mappings,
+    eval_k: usize,
+) -> Result<f64> {
+    let (test_user_items, test_user_days_ago) = group_user_items_with_days_ago(test_df, mappings)?;
+
+    let mut ndcg_sum = 0.0;
+    let mut n_users = 0;
+    for (user_id, items) in &test_user_items {
+        let Some(days_ago) = test_user_days_ago.get(user_id) else {
+            continue;
+        };
+        let Some((context, context_days, targets)) = split_leave_last_out(items, days_ago) else {
+            continue;
+        };
+        let ctx = crate::evaluation::UserEvalContext {
+            train_items: &context,
+            train_days_ago: Some(&context_days),
+            user_features: &[],
+            user_idx: None,
+        };
+        let scores = adapter.predict_user_scores(&ctx)?;
+        ndcg_sum += rank_and_ndcg(&scores, &context, &targets, eval_k);
+        n_users += 1;
+    }
+
+    if n_users == 0 {
+        return Ok(0.0);
+    }
+    Ok(ndcg_sum / n_users as f64)
 }
 
 // ---------------------------------------------------------------------------
@@ -1331,10 +1369,10 @@ impl FoldEvaluator<TwoTowerParams> for TwoTowerFoldEvaluator {
 /// `seed` are fixed per evaluator; the tuned axes are the architecture /
 /// optimizer knobs in [`Bert4RecParams`].
 ///
-/// Like the SASRec evaluator this loops over test users itself rather
-/// than through `evaluate_with_adapter`: k-fold splits are user-disjoint,
-/// so no test user is in the train fold's `user_to_idx` and the public
-/// harness would skip them all.
+/// k-fold splits are user-disjoint, so held-out users are scored on
+/// their *own* chronologically split histories via
+/// [`score_sequence_model_leave_last_out`] (older part = context, most
+/// recent part = targets), exactly like the SASRec evaluator.
 #[cfg(feature = "ml-models")]
 pub struct Bert4RecFoldEvaluator {
     pub max_seq_len: usize,
@@ -1411,41 +1449,8 @@ impl FoldEvaluator<Bert4RecParams> for Bert4RecFoldEvaluator {
         )?;
         let trained = TrainedBert4Rec::new(fitted, model_config, mappings);
         let adapter = crate::evaluation::Bert4RecEvalAdapter::new(&trained);
-
-        let train_df = read_interactions_df(train_interactions_path)?;
-        let (train_user_items, train_user_days_ago) =
-            group_user_items_with_days_ago(&train_df, trained.item_mapping())?;
         let test_df = read_interactions_df(test_interactions_path)?;
-        let test_user_items = group_user_items(&test_df, trained.item_mapping())?;
-
-        let mut ndcg_sum = 0.0;
-        let mut n_users = 0;
-        for (user_id, test_items) in &test_user_items {
-            if test_items.is_empty() {
-                continue;
-            }
-            let train_items: Vec<(usize, f64)> =
-                train_user_items.get(user_id).cloned().unwrap_or_default();
-            let days_ago_vec: Vec<f64> = train_user_days_ago
-                .get(user_id)
-                .cloned()
-                .unwrap_or_default();
-            let ctx = crate::evaluation::UserEvalContext {
-                train_items: &train_items,
-                train_days_ago: Some(&days_ago_vec),
-                user_features: &[],
-                user_idx: None,
-            };
-            let scores =
-                <_ as crate::evaluation::EvalAdapter>::predict_user_scores(&adapter, &ctx)?;
-            ndcg_sum += rank_and_ndcg(&scores, &train_items, test_items, eval_k);
-            n_users += 1;
-        }
-
-        if n_users == 0 {
-            return Ok(0.0);
-        }
-        Ok(ndcg_sum / n_users as f64)
+        score_sequence_model_leave_last_out(&adapter, &test_df, trained.item_mapping(), eval_k)
     }
 }
 
@@ -1615,13 +1620,28 @@ where
     // Strategy RNG decoupled from fold generation (seed+1), as before.
     let mut rng = StdRng::seed_from_u64(cfg.seed.wrapping_add(1));
 
-    let mut history: Vec<Observation> = warm_start
-        .iter()
-        .map(|t| Observation {
-            assignment: space.encode(&t.params),
-            score: t.mean_score,
-        })
-        .collect();
+    // Warm-start trials whose values fall outside this space (the caller
+    // moved an axis since the previous run) are dropped here, loudly: they
+    // can neither inform a model of this space nor count as explored.
+    let mut history: Vec<Observation> = Vec::with_capacity(warm_start.len());
+    let mut dropped = 0usize;
+    for t in warm_start {
+        let assignment = space.encode(&t.params);
+        if axes.contains(&assignment) {
+            history.push(Observation {
+                assignment,
+                score: t.mean_score,
+            });
+        } else {
+            dropped += 1;
+        }
+    }
+    if dropped > 0 {
+        log::warn!(
+            "tune_with: ignored {dropped} warm-start trial(s) whose parameters lie outside the \
+             search space"
+        );
+    }
     let mut all_trials: Vec<TrialResult<S::Params>> = Vec::new();
 
     while all_trials.len() < cfg.max_trials {
@@ -2935,6 +2955,117 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "ml-models")]
+    #[test]
+    fn leave_last_out_splits_chronologically_and_skips_singletons() {
+        // items[i] has days_ago[i]; larger == older.
+        let items = [
+            (10_usize, 1.0_f64),
+            (20, 1.0),
+            (30, 1.0),
+            (40, 1.0),
+            (50, 1.0),
+        ];
+        let days = [1.0_f64, 5.0, 3.0, 4.0, 2.0];
+        let (ctx, ctx_days, targets) = split_leave_last_out(&items, &days).unwrap();
+        // Oldest first: 20 (5d), 40 (4d), 30 (3d), 50 (2d), 10 (1d); hold
+        // out ceil(5/5) = 1 most recent.
+        assert_eq!(
+            ctx.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+            vec![20, 40, 30, 50]
+        );
+        assert_eq!(ctx_days, vec![5.0, 4.0, 3.0, 2.0]);
+        assert_eq!(targets, vec![(10, 1.0)]);
+        // 2 items -> 1 context + 1 target; 1 item -> skipped.
+        let (c, _, t) = split_leave_last_out(&items[..2], &days[..2]).unwrap();
+        assert_eq!((c.len(), t.len()), (1, 1));
+        assert!(split_leave_last_out(&items[..1], &days[..1]).is_none());
+        // 10 items -> 2 targets.
+        let ten: Vec<(usize, f64)> = (0..10).map(|i| (i, 1.0)).collect();
+        let ten_days: Vec<f64> = (0..10).map(|i| 10.0 - i as f64).collect();
+        let (c, _, t) = split_leave_last_out(&ten, &ten_days).unwrap();
+        assert_eq!((c.len(), t.len()), (8, 2));
+        assert_eq!(t, vec![(8, 1.0), (9, 1.0)]);
+    }
+
+    #[test]
+    fn test_tune_with_drops_out_of_space_warm_start() -> Result<()> {
+        let (i_path, u_path, t_path, _tmpdir) = create_test_dataset()?;
+        let evaluator = EaseFoldEvaluator {
+            user_features_path: u_path,
+            item_features_path: t_path,
+        };
+        // Finite space of 2; warm start holds 2 trials from a *different*
+        // alpha axis. They must not exhaust the new space.
+        let space =
+            EaseSpace::from_axes(vec![AxisSpec::new("alpha", Axis::choice_f64(&[2.0, 3.0]))])?;
+        let foreign: Vec<TrialResult<HyperParams>> = [0.5, 1.0]
+            .iter()
+            .map(|&a| TrialResult {
+                params: HyperParams {
+                    alpha: a,
+                    beta: 1.0,
+                    lambda_: 100.0,
+                    meta_weight: 0.0,
+                    decay_rate: 0.0,
+                    ips_alpha: 0.0,
+                    sparsity_threshold: 0.0,
+                },
+                mean_score: 0.1,
+                fold_scores: vec![],
+            })
+            .collect();
+        let cfg = TuneConfig {
+            n_folds: 2,
+            eval_k: 10,
+            seed: 42,
+            max_trials: 2,
+        };
+        let r = tune_with(
+            &evaluator,
+            &i_path,
+            &space,
+            &mut TpeStrategy::new().with_n_startup(1),
+            &cfg,
+            &foreign,
+        )?;
+        let mut alphas: Vec<f64> = r.all_trials.iter().map(|t| t.params.alpha).collect();
+        alphas.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        assert_eq!(alphas, vec![2.0, 3.0]);
+        // Grid with an in-space warm start continues instead of repeating.
+        let grid = ParamGrid {
+            alpha: vec![0.5, 1.0],
+            beta: vec![1.0],
+            lambda_: vec![10.0, 100.0],
+            meta_weight: vec![0.0],
+            decay_rate: vec![0.0],
+            ips_alpha: vec![0.0],
+            sparsity_threshold: vec![0.0],
+        };
+        let first = tune_with(
+            &evaluator,
+            &i_path,
+            &grid,
+            &mut GridStrategy::new(),
+            &cfg,
+            &[],
+        )?;
+        let second = tune_with(
+            &evaluator,
+            &i_path,
+            &grid,
+            &mut GridStrategy::new(),
+            &cfg,
+            &first.all_trials,
+        )?;
+        let combos = grid.combinations()?;
+        assert_eq!(second.all_trials.len(), 2);
+        for (t, c) in second.all_trials.iter().zip(&combos[2..]) {
+            assert_eq!(EaseSchema::encode(&t.params), EaseSchema::encode(c));
+        }
+        Ok(())
+    }
+
     /// BERT4Rec grid + random search run end-to-end through the real
     /// evaluator (#97 Phase 1).
     #[cfg(feature = "ml-models")]
@@ -2974,42 +3105,69 @@ mod tests {
         Ok(())
     }
 
-    /// #97 acceptance: on the Two-Tower fixture, TPE with half the budget
-    /// matches or beats random search's best NDCG@k in a majority of seeds.
-    #[cfg(feature = "ml-models")]
+    /// #97 acceptance: TPE with half the budget matches or beats random
+    /// search's best NDCG@k in a majority of seeds.
+    ///
+    /// Runs on EASE, whose closed-form solve is byte-deterministic, so the
+    /// comparison measures the strategies and nothing else. (The burn
+    /// models cannot host this claim: `NdArray` does not reseed parameter
+    /// init, so their per-trial scores vary run to run and a comparison on
+    /// a small fixture rides the init lottery — see the SASRec overfit
+    /// test's note.) Under user-disjoint folds EASE scores held-out users
+    /// through their side features, so the objective is a smooth function
+    /// of `lambda_` / `alpha` / `beta` with a clear sweet spot.
+    ///
+    /// Ignored in debug: 1800 EASE trainings through nested rayon
+    /// parallelism (`tune_with`'s trial batch × nalgebra's own pool) is
+    /// fast, but the deep debug-build frames overflow a 2 MiB worker stack
+    /// when the rest of the suite is also feeding the global pool.
     #[test]
-    #[ignore = "trains real burn models; impractically slow in a debug CI build. Run with: cargo test --release --features ml-models -- --ignored"]
-    fn test_tpe_half_budget_matches_random_best_two_tower() -> Result<()> {
-        let (i_path, _tmp) = make_seq_dataset(24, 8, 6)?;
-        let evaluator = TwoTowerFoldEvaluator {
-            epochs: 10,
-            batch_size: 16,
-            seed: 0,
+    #[ignore = "nested rayon work overflows worker stacks in a debug build. Run with: cargo test --release -- --ignored test_tpe_half_budget_matches_random_best_ease"]
+    fn test_tpe_half_budget_matches_random_best_ease() -> Result<()> {
+        let (i_path, u_path, t_path, _tmp) = make_big_dataset(60, 30)?;
+        let evaluator = EaseFoldEvaluator {
+            user_features_path: u_path,
+            item_features_path: t_path,
         };
-        let space = TwoTowerSpace::from_axes(vec![
-            AxisSpec::new("embedding_dim", Axis::choice_usize(&[4, 8, 16, 32])),
+        let space = EaseSpace::from_axes(vec![
             AxisSpec::new(
-                "temperature",
+                "lambda_",
                 Axis::LogUniform {
-                    low: 0.01,
-                    high: 1.0,
+                    low: 1e-2,
+                    high: 1e6,
                 },
             ),
             AxisSpec::new(
-                "learning_rate",
-                Axis::LogUniform {
-                    low: 1e-3,
-                    high: 0.3,
+                "alpha",
+                Axis::Uniform {
+                    low: 0.0,
+                    high: 3.0,
+                },
+            ),
+            AxisSpec::new(
+                "beta",
+                Axis::Uniform {
+                    low: 0.0,
+                    high: 3.0,
                 },
             ),
         ])?;
-        let budget = 16;
+        // Random gets `budget` trials, TPE half of them. The objective
+        // plateaus once `lambda_` is small, so "best of N" among plateau
+        // draws is partly a lottery that random wins by buying twice the
+        // tickets; the budget is set where TPE's model has room to work
+        // (3 start-up + 17 guided trials). Mean trial quality is the
+        // sample-efficiency claim and must hold on every seed.
+        let budget = 40;
+        let seeds = [1_u64, 2, 3, 4, 5];
+        let mean = |r: &SearchResult<HyperParams>| {
+            r.all_trials.iter().map(|t| t.mean_score).sum::<f64>() / r.all_trials.len() as f64
+        };
         let mut wins = 0;
-        let seeds = [1_u64, 2, 3];
         for &seed in &seeds {
             let cfg_r = TuneConfig {
-                n_folds: 2,
-                eval_k: 5,
+                n_folds: 3,
+                eval_k: 10,
                 seed,
                 max_trials: budget,
             };
@@ -3034,7 +3192,13 @@ mod tests {
                 &[],
             )?;
             assert_eq!(tpe.all_trials.len(), budget / 2);
-            if tpe.best_score >= random.best_score - 1e-9 {
+            assert!(
+                mean(&tpe) > mean(&random),
+                "seed {seed}: TPE's mean trial NDCG {:.4} should exceed random's {:.4}",
+                mean(&tpe),
+                mean(&random)
+            );
+            if tpe.best_score >= random.best_score - 1e-12 {
                 wins += 1;
             }
         }
@@ -3043,6 +3207,62 @@ mod tests {
             "TPE (half budget) should match/beat random's best in a majority of seeds; won {wins}/{}",
             seeds.len()
         );
+        Ok(())
+    }
+
+    /// TPE drives the real Two-Tower evaluator end to end (mixed Choice +
+    /// log-uniform space, batched proposals). No comparative assertion:
+    /// Two-Tower training is not seeded, so its scores are not reproducible
+    /// run to run; the TPE-vs-random claim is made on EASE above.
+    #[cfg(feature = "ml-models")]
+    #[test]
+    #[ignore = "trains real burn models; impractically slow in a debug CI build. Run with: cargo test --release --features ml-models -- --ignored"]
+    fn test_tpe_two_tower_end_to_end() -> Result<()> {
+        let (i_path, _tmp) = make_seq_dataset(24, 8, 6)?;
+        let evaluator = TwoTowerFoldEvaluator {
+            epochs: 10,
+            batch_size: 16,
+            seed: 0,
+        };
+        let space = TwoTowerSpace::from_axes(vec![
+            AxisSpec::new("embedding_dim", Axis::choice_usize(&[4, 8, 16, 32])),
+            AxisSpec::new(
+                "temperature",
+                Axis::LogUniform {
+                    low: 0.01,
+                    high: 1.0,
+                },
+            ),
+            AxisSpec::new(
+                "learning_rate",
+                Axis::LogUniform {
+                    low: 1e-3,
+                    high: 0.3,
+                },
+            ),
+        ])?;
+        let cfg = TuneConfig {
+            n_folds: 2,
+            eval_k: 5,
+            seed: 1,
+            max_trials: 6,
+        };
+        let tpe = tune_with(
+            &evaluator,
+            &i_path,
+            &space,
+            &mut TpeStrategy::for_budget(6).with_batch_size(2),
+            &cfg,
+            &[],
+        )?;
+        assert_eq!(tpe.strategy, "tpe");
+        assert_eq!(tpe.all_trials.len(), 6);
+        for t in &tpe.all_trials {
+            assert!([4usize, 8, 16, 32].contains(&t.params.embedding_dim));
+            assert!((0.01..=1.0).contains(&t.params.temperature));
+            assert!((1e-3..=0.3).contains(&t.params.learning_rate));
+            assert!(t.mean_score.is_finite());
+        }
         Ok(())
     }
 }

@@ -726,8 +726,19 @@ models the best 10 % of trials against the rest and proposes
 `batch_size` (default 4) configurations per round that maximise their
 likelihood ratio. Smaller batches adapt faster; larger ones keep more
 rayon workers busy. `strategy="grid"` with `max_trials` evaluates the
-first `max_trials` combinations in grid order; `"random"` and `"grid"`
-reproduce `random_search_*` / `grid_search_*` exactly for the same seed.
+first `max_trials` combinations in grid order (enumerated lazily, so a
+huge grid with a small budget costs only the budget), and a grid run
+resumed with `warm_start` continues from where it stopped instead of
+repeating trials. `"random"` and `"grid"` reproduce `random_search_*` /
+`grid_search_*` exactly for the same seed. Warm-start trials whose
+values fall outside the current space (an axis was moved since the
+previous run) are ignored with a warning. Every search result, old and
+new entrypoints alike, carries a `strategy` key.
+
+For SASRec and BERT4Rec the per-fold score is leave-last-out within each
+held-out user's own history: folds are user-disjoint, so the older part
+of a test user's sequence is the context and the most recent fifth (at
+least one item) is the relevance set.
 
 ## Data Quality Validation
 

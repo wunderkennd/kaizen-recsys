@@ -58,11 +58,14 @@ pub trait SearchStrategy: Send {
 // Grid
 // ---------------------------------------------------------------------------
 
-/// Exhaustive enumeration of a finite space in one batch (first axis
-/// outermost). A second `propose` call returns nothing. `max_n` truncates
-/// the enumeration, so `tune_*` with `strategy="grid"` and a small
-/// `max_trials` evaluates the first `max_trials` combinations in grid
-/// order.
+/// Enumeration of a finite space in one batch (first axis outermost). A
+/// second `propose` call returns nothing. The grid is generated lazily
+/// and stops after `max_n` assignments, so `tune_*` with `strategy="grid"`
+/// and a small `max_trials` evaluates the first `max_trials` combinations
+/// in grid order without materializing the rest. Assignments already in
+/// the history (a warm start from a partial grid run) are skipped, so a
+/// resumed grid search continues from where it stopped; history entries
+/// from a different space are ignored.
 #[derive(Debug, Default)]
 pub struct GridStrategy {
     done: bool,
@@ -82,7 +85,7 @@ impl SearchStrategy for GridStrategy {
     fn propose(
         &mut self,
         space: &ParamSpace,
-        _history: &[Observation],
+        history: &[Observation],
         max_n: usize,
         _rng: &mut StdRng,
     ) -> Result<Vec<Assignment>> {
@@ -90,9 +93,12 @@ impl SearchStrategy for GridStrategy {
             return Ok(Vec::new());
         }
         self.done = true;
-        let mut combos = space.combinations()?;
-        combos.truncate(max_n);
-        Ok(combos)
+        let seen: ahash::AHashSet<Vec<u64>> = history
+            .iter()
+            .filter(|o| space.contains(&o.assignment))
+            .map(|o| key_of(&o.assignment))
+            .collect();
+        space.combinations_take(max_n, |a| seen.contains(&key_of(a)))
     }
 }
 
@@ -283,12 +289,22 @@ impl SearchStrategy for TpeStrategy {
             return Ok(Vec::new());
         }
 
+        // Only observations that lie in *this* space inform the model or
+        // count toward exhaustion: a warm start from a different space
+        // (say, after the caller moved an axis) must neither bias the
+        // densities toward values that no longer exist nor make a fresh
+        // finite space look fully explored.
+        let in_space: Vec<&Observation> = history
+            .iter()
+            .filter(|o| space.contains(&o.assignment))
+            .collect();
+
         // A finite space can be exhausted: stop once every configuration
         // has been observed, and never propose a duplicate.
         let finite = space.is_finite();
         let cardinality = space.cardinality().unwrap_or(usize::MAX);
         let mut seen: ahash::AHashSet<Vec<u64>> = if finite {
-            history.iter().map(|o| key_of(&o.assignment)).collect()
+            in_space.iter().map(|o| key_of(&o.assignment)).collect()
         } else {
             ahash::AHashSet::new()
         };
@@ -297,8 +313,11 @@ impl SearchStrategy for TpeStrategy {
         }
 
         // Rank history once per round: best first.
-        let mut ranked: Vec<&Observation> =
-            history.iter().filter(|o| o.score.is_finite()).collect();
+        let mut ranked: Vec<&Observation> = in_space
+            .iter()
+            .copied()
+            .filter(|o| o.score.is_finite())
+            .collect();
         ranked.sort_by(|a, b| {
             b.score
                 .partial_cmp(&a.score)
@@ -542,6 +561,86 @@ mod tests {
 
         let mut g2 = GridStrategy::new();
         assert_eq!(g2.propose(&s, &[], 2, &mut rng).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn grid_warm_start_continues_from_where_it_stopped() {
+        let s = finite_space(); // 6 configs
+        let all = s.combinations().unwrap();
+        let mut rng = StdRng::seed_from_u64(0);
+        let history: Vec<Observation> = all[..2]
+            .iter()
+            .map(|a| Observation {
+                assignment: a.clone(),
+                score: 0.1,
+            })
+            .collect();
+        let mut g = GridStrategy::new();
+        let next = g.propose(&s, &history, 2, &mut rng).unwrap();
+        assert_eq!(
+            next,
+            all[2..4].to_vec(),
+            "must skip A and B, not repeat them"
+        );
+
+        // History from a different space is ignored, not counted.
+        let foreign = vec![Observation {
+            assignment: vec![Value::Float(99.0), Value::Int(8)],
+            score: 1.0,
+        }];
+        let mut g2 = GridStrategy::new();
+        assert_eq!(
+            g2.propose(&s, &foreign, 1, &mut rng).unwrap(),
+            all[..1].to_vec()
+        );
+    }
+
+    #[test]
+    fn grid_is_lazy_on_huge_spaces() {
+        let huge = ParamSpace::new(vec![
+            AxisSpec::new(
+                "a",
+                Axis::Int {
+                    low: 0,
+                    high: 99_999_999,
+                },
+            ),
+            AxisSpec::new(
+                "b",
+                Axis::Int {
+                    low: 0,
+                    high: 99_999_999,
+                },
+            ),
+        ])
+        .unwrap();
+        let mut g = GridStrategy::new();
+        let mut rng = StdRng::seed_from_u64(0);
+        let one = g.propose(&huge, &[], 1, &mut rng).unwrap();
+        assert_eq!(one, vec![vec![Value::Int(0), Value::Int(0)]]);
+    }
+
+    #[test]
+    fn tpe_ignores_warm_start_from_another_space() {
+        // alpha moved from {0.5, 1.0} to {2.0, 3.0}: the two old trials
+        // must not count toward the new space's cardinality of 2.
+        let s = ParamSpace::new(vec![AxisSpec::new("a", Axis::choice_f64(&[2.0, 3.0]))]).unwrap();
+        let history = vec![
+            Observation {
+                assignment: vec![Value::Float(0.5)],
+                score: 0.3,
+            },
+            Observation {
+                assignment: vec![Value::Float(1.0)],
+                score: 0.4,
+            },
+        ];
+        let mut t = TpeStrategy::new().with_n_startup(1).with_batch_size(4);
+        let mut rng = StdRng::seed_from_u64(0);
+        let batch = t.propose(&s, &history, 10, &mut rng).unwrap();
+        let mut got: Vec<f64> = batch.iter().map(|a| a[0].as_f64()).collect();
+        got.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        assert_eq!(got, vec![2.0, 3.0]);
     }
 
     #[test]

@@ -1531,6 +1531,7 @@ fn search_result_to_py(py: Python<'_>, result: &tuning::SearchResult) -> PyResul
 
     dict.set_item("best_score", result.best_score)?;
     dict.set_item("metric", &result.metric_name)?;
+    dict.set_item("strategy", &result.strategy)?;
 
     // trials
     let trials_list = PyList::empty(py);
@@ -1632,6 +1633,7 @@ fn sasrec_search_result_to_py(
     dict.set_item("best_params", params_dict(py, &result.best_params)?)?;
     dict.set_item("best_score", result.best_score)?;
     dict.set_item("metric", &result.metric_name)?;
+    dict.set_item("strategy", &result.strategy)?;
     let trials_list = PyList::empty(py);
     for trial in &result.all_trials {
         let trial_dict = PyDict::new(py);
@@ -1667,6 +1669,7 @@ fn two_tower_search_result_to_py(
     dict.set_item("best_params", params_dict(py, &result.best_params)?)?;
     dict.set_item("best_score", result.best_score)?;
     dict.set_item("metric", &result.metric_name)?;
+    dict.set_item("strategy", &result.strategy)?;
     let trials_list = PyList::empty(py);
     for trial in &result.all_trials {
         let trial_dict = PyDict::new(py);
