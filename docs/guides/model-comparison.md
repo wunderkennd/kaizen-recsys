@@ -138,9 +138,15 @@ in this crate default to or where the included tests succeed.
   learning_rate=1e-3, batch_size=64, num_epochs=50, patience=5`
   (`kzn_recsys/cr_config.py`). `embedding_dim` ∈ {32, 64, 128, 256}
   is the main knob: it is also the width of the user vector fed into
-  EASE, so larger values grow the hybrid's Gram matrix. There is no
-  `grid_search_bert4rec` yet; sweep by hand or via the hybrid's
-  evaluation report.
+  EASE, so larger values grow the hybrid's Gram matrix. Tune with
+  `kzn_recsys.grid_search_bert4rec` / `random_search_bert4rec` or the
+  strategy-driven `tune_bert4rec`.
 
-For the three searchable models, k-fold CV is user-based; metric optimization target is
+Every model also has a `tune_<model>` entrypoint (ADR-0005) that takes a
+dict space with continuous / log / integer ranges and a `strategy` of
+`"grid"`, `"random"` or `"tpe"` (Tree-structured Parzen Estimator): start
+with TPE and `max_trials` in the 20–40 range, and pass a previous result's
+`trials` as `warm_start` to refine.
+
+For all four models, k-fold CV is user-based; metric optimization target is
 NDCG@k (default `k=10`). `RAYON_NUM_THREADS` caps trial parallelism.

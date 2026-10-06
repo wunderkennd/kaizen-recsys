@@ -1679,6 +1679,666 @@ fn two_tower_search_result_to_py(
     Ok(dict.into())
 }
 
+// --- #97: BERT4Rec grid/random search + strategy-driven `tune_*` -------------
+//
+// `tune_{ease,sasrec,two_tower,bert4rec}` expose `tuning::tune_with`: a
+// dict-driven parameter space (lists = Choice axes; `("uniform"|"log"|
+// "int"|"logint", low, high)` tuples or `{"type": ..., "low": ..., "high":
+// ...}` dicts = ranges), a strategy name (`"grid"`, `"random"`, `"tpe"`), a
+// trial budget, and an optional warm start. Results share the dict shape of
+// the older `grid_search_*` / `random_search_*` functions plus a `strategy`
+// key. Everything model-specific is the `FoldEvaluator` + `DynSpace` pair.
+
+/// Parse one axis spec from Python.
+fn parse_axis(name: &str, obj: &Bound<'_, PyAny>) -> PyResult<tuning::Axis> {
+    use pyo3::types::{PyDict, PyList, PyTuple};
+    let bad = |msg: String| PyErr::new::<pyo3::exceptions::PyValueError, _>(msg);
+
+    // `[v1, v2, ...]` → Choice. Ints stay ints (so `embedding_dim: [32, 64]`
+    // decodes as usize); anything else is a float.
+    if let Ok(list) = obj.cast::<PyList>() {
+        let mut values = Vec::with_capacity(list.len());
+        for item in list.iter() {
+            if item.is_instance_of::<pyo3::types::PyBool>() {
+                return Err(bad(format!("axis `{name}`: booleans are not valid values")));
+            }
+            if let Ok(i) = item.extract::<i64>() {
+                values.push(tuning::Value::Int(i));
+            } else if let Ok(f) = item.extract::<f64>() {
+                values.push(tuning::Value::Float(f));
+            } else {
+                return Err(bad(format!("axis `{name}`: values must be int or float")));
+            }
+        }
+        return Ok(tuning::Axis::Choice(values));
+    }
+
+    // `("log", low, high)` → range.
+    let (kind, low, high): (String, Bound<'_, PyAny>, Bound<'_, PyAny>) =
+        if let Ok(t) = obj.cast::<PyTuple>() {
+            if t.len() != 3 {
+                return Err(bad(format!(
+                    "axis `{name}`: a range is a 3-tuple (kind, low, high), got {} items",
+                    t.len()
+                )));
+            }
+            (t.get_item(0)?.extract()?, t.get_item(1)?, t.get_item(2)?)
+        } else if let Ok(d) = obj.cast::<PyDict>() {
+            let get = |k: &str| {
+                d.get_item(k)?
+                    .ok_or_else(|| bad(format!("axis `{name}`: range dict needs `{k}`")))
+            };
+            (get("type")?.extract()?, get("low")?, get("high")?)
+        } else {
+            return Err(bad(format!(
+                "axis `{name}`: expected a list of candidates, a (kind, low, high) tuple, \
+                 or a {{'type', 'low', 'high'}} dict"
+            )));
+        };
+    let axis = match kind.to_ascii_lowercase().as_str() {
+        "uniform" | "float" => tuning::Axis::Uniform {
+            low: low.extract()?,
+            high: high.extract()?,
+        },
+        "log" | "loguniform" | "log_uniform" => tuning::Axis::LogUniform {
+            low: low.extract()?,
+            high: high.extract()?,
+        },
+        "int" => tuning::Axis::Int {
+            low: low.extract()?,
+            high: high.extract()?,
+        },
+        "logint" | "log_int" => tuning::Axis::LogInt {
+            low: low.extract()?,
+            high: high.extract()?,
+        },
+        other => {
+            return Err(bad(format!(
+                "axis `{name}`: unknown range kind `{other}` (uniform, log, int, logint)"
+            )));
+        }
+    };
+    Ok(axis)
+}
+
+/// Parse a `{name: axis_spec}` dict into axes (order is irrelevant: the
+/// model schema puts them in canonical order).
+fn parse_axes(dict: &Bound<'_, PyDict>) -> PyResult<Vec<tuning::AxisSpec>> {
+    let mut axes = Vec::with_capacity(dict.len());
+    for (k, v) in dict.iter() {
+        let name: String = k.extract()?;
+        axes.push(tuning::AxisSpec::new(name.clone(), parse_axis(&name, &v)?));
+    }
+    Ok(axes)
+}
+
+fn value_to_py<'py>(py: Python<'py>, v: tuning::Value) -> Bound<'py, PyAny> {
+    match v {
+        tuning::Value::Int(i) => i.into_pyobject(py).expect("int").into_any(),
+        tuning::Value::Float(f) => PyFloat::new(py, f).into_any(),
+    }
+}
+
+/// `{axis_name: value}` dict for one configuration.
+fn assignment_to_py<'py>(
+    py: Python<'py>,
+    names: &[&str],
+    a: &tuning::Assignment,
+) -> PyResult<Bound<'py, PyDict>> {
+    let d = PyDict::new(py);
+    for (n, v) in names.iter().zip(a) {
+        d.set_item(n, value_to_py(py, *v))?;
+    }
+    Ok(d)
+}
+
+/// Serialize any model's [`tuning::SearchResult`] via its space's axis
+/// names: `best_params` / `best_score` / `metric` / `strategy` / `trials`.
+fn tune_result_to_py<S: tuning::SearchSpace>(
+    py: Python<'_>,
+    space: &S,
+    result: &tuning::SearchResult<S::Params>,
+) -> PyResult<Py<PyAny>> {
+    let axes = space.axes();
+    let names = axes.names();
+    let dict = PyDict::new(py);
+    dict.set_item(
+        "best_params",
+        assignment_to_py(py, &names, &space.encode(&result.best_params))?,
+    )?;
+    dict.set_item("best_score", result.best_score)?;
+    dict.set_item("metric", &result.metric_name)?;
+    dict.set_item("strategy", &result.strategy)?;
+    let trials_list = PyList::empty(py);
+    for trial in &result.all_trials {
+        let t = PyDict::new(py);
+        t.set_item(
+            "params",
+            assignment_to_py(py, &names, &space.encode(&trial.params))?,
+        )?;
+        t.set_item("mean_score", trial.mean_score)?;
+        t.set_item("fold_scores", trial.fold_scores.clone())?;
+        trials_list.append(t)?;
+    }
+    dict.set_item("trials", trials_list)?;
+    Ok(dict.into())
+}
+
+/// Parse `warm_start=[{"params": {...}, "mean_score": s}, ...]` (the
+/// `trials` list of a previous result) into typed trials.
+fn parse_warm_start<S: tuning::SearchSpace>(
+    space: &S,
+    warm_start: Option<&Bound<'_, PyList>>,
+) -> PyResult<Vec<tuning::TrialResult<S::Params>>> {
+    let Some(list) = warm_start else {
+        return Ok(Vec::new());
+    };
+    let axes = space.axes();
+    let mut out = Vec::with_capacity(list.len());
+    for (i, item) in list.iter().enumerate() {
+        let d = item.cast::<PyDict>().map_err(|_| {
+            PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                "warm_start[{i}] must be a dict with `params` and `mean_score`"
+            ))
+        })?;
+        let params = d
+            .get_item("params")?
+            .ok_or_else(|| {
+                PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                    "warm_start[{i}] is missing `params`"
+                ))
+            })?
+            .cast_into::<PyDict>()?;
+        let mean_score: f64 = d
+            .get_item("mean_score")?
+            .ok_or_else(|| {
+                PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                    "warm_start[{i}] is missing `mean_score`"
+                ))
+            })?
+            .extract()?;
+        let mut assignment = Vec::with_capacity(axes.len());
+        for spec in axes.axes() {
+            let v = params.get_item(&spec.name)?.ok_or_else(|| {
+                PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                    "warm_start[{i}].params is missing `{}`",
+                    spec.name
+                ))
+            })?;
+            assignment.push(if let Ok(n) = v.extract::<i64>() {
+                tuning::Value::Int(n)
+            } else {
+                tuning::Value::Float(v.extract::<f64>()?)
+            });
+        }
+        let fold_scores: Vec<f64> = match d.get_item("fold_scores")? {
+            Some(f) => f.extract().unwrap_or_default(),
+            None => Vec::new(),
+        };
+        let typed = space
+            .decode(&assignment)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?;
+        out.push(tuning::TrialResult {
+            params: typed,
+            mean_score,
+            fold_scores,
+        });
+    }
+    Ok(out)
+}
+
+/// Build the strategy named by `strategy`.
+fn make_strategy(
+    strategy: &str,
+    max_trials: usize,
+    batch_size: Option<usize>,
+    n_startup: Option<usize>,
+) -> PyResult<Box<dyn tuning::SearchStrategy>> {
+    Ok(match strategy.to_ascii_lowercase().as_str() {
+        "grid" => Box::new(tuning::GridStrategy::new()),
+        "random" => Box::new(tuning::RandomStrategy::new(max_trials)),
+        "tpe" => {
+            let mut t = tuning::TpeStrategy::for_budget(max_trials);
+            if let Some(b) = batch_size {
+                t = t.with_batch_size(b);
+            }
+            if let Some(n) = n_startup {
+                t = t.with_n_startup(n);
+            }
+            Box::new(t)
+        }
+        other => {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                "unknown strategy `{other}`; expected one of: grid, random, tpe"
+            )));
+        }
+    })
+}
+
+/// Shared body of the `tune_*` entrypoints: parse, run with the GIL
+/// released, serialize.
+#[allow(clippy::too_many_arguments)]
+fn tune_generic<M, E>(
+    py: Python<'_>,
+    evaluator: E,
+    interactions_path: &str,
+    space: &Bound<'_, PyDict>,
+    strategy: &str,
+    max_trials: usize,
+    n_folds: usize,
+    eval_k: usize,
+    seed: u64,
+    batch_size: Option<usize>,
+    n_startup: Option<usize>,
+    warm_start: Option<&Bound<'_, PyList>>,
+) -> PyResult<Py<PyAny>>
+where
+    M: tuning::ParamSchema,
+    E: tuning::FoldEvaluator<M::Params> + Send,
+{
+    let space = tuning::DynSpace::<M>::from_axes(parse_axes(space)?)
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?;
+    let warm = parse_warm_start(&space, warm_start)?;
+    let mut strat = make_strategy(strategy, max_trials, batch_size, n_startup)?;
+    let cfg = tuning::TuneConfig {
+        n_folds,
+        eval_k,
+        seed,
+        max_trials,
+    };
+    let result = py
+        .detach(|| {
+            tuning::tune_with(
+                &evaluator,
+                interactions_path,
+                &space,
+                strat.as_mut(),
+                &cfg,
+                &warm,
+            )
+        })
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+    tune_result_to_py(py, &space, &result)
+}
+
+/// Strategy-driven EASE hyperparameter search (#97).
+///
+/// Args:
+///     interactions_path, user_features_path, item_features_path (str):
+///         long-format tables (EASE needs all three).
+///     space (dict): `{param: axis}` where an axis is a list of candidate
+///         values, a `(kind, low, high)` tuple with kind in
+///         `{"uniform", "log", "int", "logint"}`, or a
+///         `{"type", "low", "high"}` dict. Params: alpha, beta, lambda_,
+///         meta_weight, decay_rate, ips_alpha, sparsity_threshold;
+///         omitted ones keep their defaults.
+///     strategy (str): "grid" (finite axes only), "random", or "tpe".
+///     max_trials (int): trial budget (grid: evaluates the first
+///         `max_trials` combinations in grid order).
+///     n_folds, eval_k, seed: k-fold CV and optimisation target NDCG@k.
+///     batch_size (int, optional): TPE proposals per round (default 4).
+///     n_startup (int, optional): TPE random start-up trials (default
+///         `clamp(max_trials / 4, 3, 10)`).
+///     warm_start (list[dict], optional): a previous result's `trials`
+///         list; seeds the strategy without re-evaluating them.
+///
+/// Returns:
+///     dict: best_params, best_score, metric, strategy, trials.
+#[pyfunction]
+#[pyo3(signature = (
+    interactions_path,
+    space,
+    user_features_path = None,
+    item_features_path = None,
+    strategy = "tpe",
+    max_trials = 40,
+    n_folds = 3,
+    eval_k = 10,
+    seed = 42,
+    batch_size = None,
+    n_startup = None,
+    warm_start = None
+))]
+#[allow(clippy::too_many_arguments)]
+fn tune_ease(
+    py: Python<'_>,
+    interactions_path: &str,
+    space: &Bound<'_, PyDict>,
+    user_features_path: Option<&str>,
+    item_features_path: Option<&str>,
+    strategy: &str,
+    max_trials: usize,
+    n_folds: usize,
+    eval_k: usize,
+    seed: u64,
+    batch_size: Option<usize>,
+    n_startup: Option<usize>,
+    warm_start: Option<&Bound<'_, PyList>>,
+) -> PyResult<Py<PyAny>> {
+    let (Some(u), Some(t)) = (user_features_path, item_features_path) else {
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+            "tune_ease requires user_features_path and item_features_path",
+        ));
+    };
+    let evaluator = tuning::EaseFoldEvaluator {
+        user_features_path: u.to_string(),
+        item_features_path: t.to_string(),
+    };
+    tune_generic::<tuning::EaseSchema, _>(
+        py,
+        evaluator,
+        interactions_path,
+        space,
+        strategy,
+        max_trials,
+        n_folds,
+        eval_k,
+        seed,
+        batch_size,
+        n_startup,
+        warm_start,
+    )
+}
+
+/// Strategy-driven SASRec hyperparameter search (#97). Same arguments as
+/// `tune_ease` (feature paths are accepted and ignored). Params:
+/// embedding_dim, num_heads, num_layers, dropout, learning_rate,
+/// num_epochs. Interactions must carry `days_ago`. Requires `ml-models`.
+#[pyfunction]
+#[pyo3(signature = (
+    interactions_path,
+    space,
+    user_features_path = None,
+    item_features_path = None,
+    strategy = "tpe",
+    max_trials = 20,
+    n_folds = 3,
+    eval_k = 10,
+    seed = 42,
+    batch_size = None,
+    n_startup = None,
+    warm_start = None
+))]
+#[allow(clippy::too_many_arguments, unused_variables)]
+fn tune_sasrec(
+    py: Python<'_>,
+    interactions_path: &str,
+    space: &Bound<'_, PyDict>,
+    user_features_path: Option<&str>,
+    item_features_path: Option<&str>,
+    strategy: &str,
+    max_trials: usize,
+    n_folds: usize,
+    eval_k: usize,
+    seed: u64,
+    batch_size: Option<usize>,
+    n_startup: Option<usize>,
+    warm_start: Option<&Bound<'_, PyList>>,
+) -> PyResult<Py<PyAny>> {
+    #[cfg(feature = "ml-models")]
+    {
+        tune_generic::<tuning::SasRecSchema, _>(
+            py,
+            tuning::SasRecFoldEvaluator::default(),
+            interactions_path,
+            space,
+            strategy,
+            max_trials,
+            n_folds,
+            eval_k,
+            seed,
+            batch_size,
+            n_startup,
+            warm_start,
+        )
+    }
+    #[cfg(not(feature = "ml-models"))]
+    {
+        Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+            "SASRec hyperparameter search requires the `ml-models` build feature.",
+        ))
+    }
+}
+
+/// Strategy-driven Two-Tower hyperparameter search (#97). Params:
+/// embedding_dim, temperature, learning_rate, id_dropout. Requires
+/// `ml-models`.
+#[pyfunction]
+#[pyo3(signature = (
+    interactions_path,
+    space,
+    user_features_path = None,
+    item_features_path = None,
+    strategy = "tpe",
+    max_trials = 20,
+    n_folds = 3,
+    eval_k = 10,
+    seed = 42,
+    batch_size = None,
+    n_startup = None,
+    warm_start = None
+))]
+#[allow(clippy::too_many_arguments, unused_variables)]
+fn tune_two_tower(
+    py: Python<'_>,
+    interactions_path: &str,
+    space: &Bound<'_, PyDict>,
+    user_features_path: Option<&str>,
+    item_features_path: Option<&str>,
+    strategy: &str,
+    max_trials: usize,
+    n_folds: usize,
+    eval_k: usize,
+    seed: u64,
+    batch_size: Option<usize>,
+    n_startup: Option<usize>,
+    warm_start: Option<&Bound<'_, PyList>>,
+) -> PyResult<Py<PyAny>> {
+    #[cfg(feature = "ml-models")]
+    {
+        tune_generic::<tuning::TwoTowerSchema, _>(
+            py,
+            tuning::TwoTowerFoldEvaluator::default(),
+            interactions_path,
+            space,
+            strategy,
+            max_trials,
+            n_folds,
+            eval_k,
+            seed,
+            batch_size,
+            n_startup,
+            warm_start,
+        )
+    }
+    #[cfg(not(feature = "ml-models"))]
+    {
+        Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+            "Two-Tower hyperparameter search requires the `ml-models` build feature.",
+        ))
+    }
+}
+
+/// Strategy-driven BERT4Rec hyperparameter search (#97). Params:
+/// embedding_dim, num_heads, num_layers, dropout, mask_ratio,
+/// learning_rate, num_epochs. Interactions must carry `days_ago`.
+/// Requires `ml-models`.
+#[pyfunction]
+#[pyo3(signature = (
+    interactions_path,
+    space,
+    user_features_path = None,
+    item_features_path = None,
+    strategy = "tpe",
+    max_trials = 20,
+    n_folds = 3,
+    eval_k = 10,
+    seed = 42,
+    batch_size = None,
+    n_startup = None,
+    warm_start = None
+))]
+#[allow(clippy::too_many_arguments, unused_variables)]
+fn tune_bert4rec(
+    py: Python<'_>,
+    interactions_path: &str,
+    space: &Bound<'_, PyDict>,
+    user_features_path: Option<&str>,
+    item_features_path: Option<&str>,
+    strategy: &str,
+    max_trials: usize,
+    n_folds: usize,
+    eval_k: usize,
+    seed: u64,
+    batch_size: Option<usize>,
+    n_startup: Option<usize>,
+    warm_start: Option<&Bound<'_, PyList>>,
+) -> PyResult<Py<PyAny>> {
+    #[cfg(feature = "ml-models")]
+    {
+        tune_generic::<tuning::Bert4RecSchema, _>(
+            py,
+            tuning::Bert4RecFoldEvaluator::default(),
+            interactions_path,
+            space,
+            strategy,
+            max_trials,
+            n_folds,
+            eval_k,
+            seed,
+            batch_size,
+            n_startup,
+            warm_start,
+        )
+    }
+    #[cfg(not(feature = "ml-models"))]
+    {
+        Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+            "BERT4Rec hyperparameter search requires the `ml-models` build feature.",
+        ))
+    }
+}
+
+/// Parse a Python dict into a [`tuning::Bert4RecParamGrid`], defaulting any
+/// missing axis to a single sensible value.
+#[cfg(feature = "ml-models")]
+fn parse_bert4rec_grid(dict: &Bound<'_, PyDict>) -> PyResult<tuning::Bert4RecParamGrid> {
+    Ok(tuning::Bert4RecParamGrid {
+        embedding_dim: extract_usize_vec(dict, "embedding_dim", 64)?,
+        num_heads: extract_usize_vec(dict, "num_heads", 4)?,
+        num_layers: extract_usize_vec(dict, "num_layers", 2)?,
+        dropout: extract_f64_vec(dict, "dropout", 0.1)?,
+        mask_ratio: extract_f64_vec(dict, "mask_ratio", 0.2)?,
+        learning_rate: extract_f64_vec(dict, "learning_rate", 1e-3)?,
+        num_epochs: extract_usize_vec(dict, "num_epochs", 50)?,
+    })
+}
+
+/// BERT4Rec grid search: every combination of `param_grid` under k-fold
+/// CV through the real BERT4Rec trainer. Same dict shape as
+/// `grid_search_sasrec`; interactions must carry `days_ago`. Requires
+/// `ml-models`.
+#[pyfunction]
+#[pyo3(signature = (
+    interactions_path,
+    user_features_path,
+    item_features_path,
+    param_grid,
+    n_folds = 3,
+    eval_k = 10,
+    seed = 42
+))]
+#[allow(clippy::too_many_arguments, unused_variables)]
+fn grid_search_bert4rec(
+    py: Python<'_>,
+    interactions_path: &str,
+    user_features_path: &str,
+    item_features_path: &str,
+    param_grid: &Bound<'_, PyDict>,
+    n_folds: usize,
+    eval_k: usize,
+    seed: u64,
+) -> PyResult<Py<PyAny>> {
+    #[cfg(feature = "ml-models")]
+    {
+        let grid = parse_bert4rec_grid(param_grid)?;
+        let result = py
+            .detach(|| {
+                let evaluator = tuning::Bert4RecFoldEvaluator::default();
+                tuning::grid_search_with(
+                    &evaluator,
+                    interactions_path,
+                    &grid,
+                    n_folds,
+                    eval_k,
+                    seed,
+                )
+            })
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+        tune_result_to_py(py, &grid, &result)
+    }
+    #[cfg(not(feature = "ml-models"))]
+    {
+        Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+            "BERT4Rec hyperparameter search requires the `ml-models` build feature \
+             (the burn-backed BERT4Rec model is not compiled into this EASE-only build).",
+        ))
+    }
+}
+
+/// BERT4Rec random search: `n_trials` configurations sampled from
+/// `param_grid`. Requires `ml-models`.
+#[pyfunction]
+#[pyo3(signature = (
+    interactions_path,
+    user_features_path,
+    item_features_path,
+    param_grid,
+    n_trials = 10,
+    n_folds = 3,
+    eval_k = 10,
+    seed = 42
+))]
+#[allow(clippy::too_many_arguments, unused_variables)]
+fn random_search_bert4rec(
+    py: Python<'_>,
+    interactions_path: &str,
+    user_features_path: &str,
+    item_features_path: &str,
+    param_grid: &Bound<'_, PyDict>,
+    n_trials: usize,
+    n_folds: usize,
+    eval_k: usize,
+    seed: u64,
+) -> PyResult<Py<PyAny>> {
+    #[cfg(feature = "ml-models")]
+    {
+        let grid = parse_bert4rec_grid(param_grid)?;
+        let result = py
+            .detach(|| {
+                let evaluator = tuning::Bert4RecFoldEvaluator::default();
+                tuning::random_search_with(
+                    &evaluator,
+                    interactions_path,
+                    &grid,
+                    n_trials,
+                    n_folds,
+                    eval_k,
+                    seed,
+                )
+            })
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+        tune_result_to_py(py, &grid, &result)
+    }
+    #[cfg(not(feature = "ml-models"))]
+    {
+        Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+            "BERT4Rec hyperparameter search requires the `ml-models` build feature \
+             (the burn-backed BERT4Rec model is not compiled into this EASE-only build).",
+        ))
+    }
+}
+
 // --- SASRec PyO3 surface (ml-models feature) -----------------------------
 //
 // Mirrors the `FeaseModel` class (predict / evaluate / save / load) for
@@ -2799,6 +3459,12 @@ fn _native(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(random_search_sasrec, m)?)?;
     m.add_function(wrap_pyfunction!(grid_search_two_tower, m)?)?;
     m.add_function(wrap_pyfunction!(random_search_two_tower, m)?)?;
+    m.add_function(wrap_pyfunction!(grid_search_bert4rec, m)?)?;
+    m.add_function(wrap_pyfunction!(random_search_bert4rec, m)?)?;
+    m.add_function(wrap_pyfunction!(tune_ease, m)?)?;
+    m.add_function(wrap_pyfunction!(tune_sasrec, m)?)?;
+    m.add_function(wrap_pyfunction!(tune_two_tower, m)?)?;
+    m.add_function(wrap_pyfunction!(tune_bert4rec, m)?)?;
     m.add_class::<FeaseModel>()?;
     m.add_class::<ModelRegistry>()?;
     m.add_class::<transform::NumericalBucketConfig>()?;
