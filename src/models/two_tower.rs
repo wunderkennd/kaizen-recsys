@@ -34,6 +34,9 @@
 //! Backend stays generic (`TwoTower<B: Backend>`); training uses
 //! `Autodiff<NdArray>`, inference plain `NdArray`. Everything is
 //! `ml-models`-gated.
+// burn 0.21 `#[derive(Config)]` expands to `Self { field: field, .. }`, which
+// clippy >= 1.99 lints even inside the derive output.
+#![allow(clippy::redundant_field_names)]
 
 use crate::data::triples::{FeatureTable, TripleData};
 use crate::data_pipeline::Mappings;

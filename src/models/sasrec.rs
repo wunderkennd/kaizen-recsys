@@ -17,6 +17,9 @@
 //! burn's `generate_autoregressive_mask` passed through
 //! `TransformerEncoderInput` — see burn's text-generation example for
 //! the canonical structure.
+// burn 0.21 `#[derive(Config)]` expands to `Self { field: field, .. }`, which
+// clippy >= 1.99 lints even inside the derive output.
+#![allow(clippy::redundant_field_names)]
 
 use burn::config::Config;
 use burn::module::Module;
