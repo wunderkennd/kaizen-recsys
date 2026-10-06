@@ -18,6 +18,7 @@ try:  # The compiled Rust extension is absent in pure-Python (e.g. Spark) instal
         random_search_ease,
         random_search_py as random_search,
         recall_at_k,
+        tune_ease,
         validate_data,
         random_split,
         temporal_split,
@@ -50,13 +51,18 @@ try:  # pragma: no cover - import guard, exercised by build matrix
         build_and_train_bert4rec,
         build_and_train_sasrec,
         build_and_train_two_tower,
+        grid_search_bert4rec,
         grid_search_sasrec,
         grid_search_two_tower,
         load_bert4rec_model,
         load_sasrec_model,
         load_two_tower_model,
+        random_search_bert4rec,
         random_search_sasrec,
         random_search_two_tower,
+        tune_bert4rec,
+        tune_sasrec,
+        tune_two_tower,
     )
 
     _HAS_ML_MODELS = True
@@ -86,6 +92,7 @@ if _HAS_NATIVE:
         "random_search",
         "random_search_ease",
         "recall_at_k",
+        "tune_ease",
         "validate_data",
         "random_split",
         "temporal_split",
@@ -104,13 +111,18 @@ if _HAS_ML_MODELS:
         "build_and_train_bert4rec",
         "build_and_train_sasrec",
         "build_and_train_two_tower",
+        "grid_search_bert4rec",
         "grid_search_sasrec",
         "grid_search_two_tower",
         "load_bert4rec_model",
         "load_sasrec_model",
         "load_two_tower_model",
+        "random_search_bert4rec",
         "random_search_sasrec",
         "random_search_two_tower",
+        "tune_bert4rec",
+        "tune_sasrec",
+        "tune_two_tower",
     ]
 
 try:  # pragma: no cover - import guard, exercised by build matrix

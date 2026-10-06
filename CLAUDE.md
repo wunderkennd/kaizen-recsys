@@ -51,6 +51,7 @@ maturin build --release --features ml-models --out dist
 .venv/bin/python -m pytest tests/test_sasrec.py -v       # needs --features ml-models
 .venv/bin/python -m pytest tests/test_two_tower.py -v    # needs --features ml-models
 .venv/bin/python -m pytest tests/test_bert4rec.py -v     # needs --features ml-models
+.venv/bin/python -m pytest tests/test_tuning.py -v       # tune_* on EASE (no feature needed)
 .venv/bin/python -m pytest tests/spark/ -v               # needs the [spark] extra + Java
 
 # Run a single test
@@ -100,9 +101,13 @@ src/model.rs         — Core EASE algorithm: block Gram matrix, inversion, S-ma
     ↓
 src/evaluation.rs    — Train/test splitting (random, temporal, leave-K-out),
                        generic evaluate_model harness over &dyn RecModel
-src/tuning.rs        — SearchSpace + FoldEvaluator traits; grid/random search generic over
-                       any model's HyperParams; per-model schemas (HyperParams /
-                       SasRecParams / TwoTowerParams) + FoldEvaluator impls
+src/tuning.rs        — SearchSpace + FoldEvaluator traits; strategy-driven `tune_with`
+                       runner (grid / random / TPE) generic over any model's params;
+                       per-model schemas (HyperParams / SasRecParams / TwoTowerParams /
+                       Bert4RecParams) + FoldEvaluator impls
+src/tuning/space.rs  — ParamSpace / Axis / Assignment: named, mixed discrete +
+                       continuous search spaces (ADR-0005)
+src/tuning/strategy.rs — SearchStrategy trait + GridStrategy / RandomStrategy / TpeStrategy
 src/metrics.rs       — Pure ranking metrics: precision, recall, NDCG, MAP, coverage, hit rate
     ↓
 src/serialization.rs — EASE save/load (FEAS magic bytes, v1/v2 versioning).
@@ -129,7 +134,9 @@ src/data_validation.rs — GaussianAnomalyDetector for pre-training data quality
 - **`data_pipeline.rs`**: Long-format Parquet/CSV → sparse CSR matrices + string↔index mappings (EASE path). Hooks for weighting transforms.
 - **`weighting.rs`**: `WeightingConfig` struct + functions: `apply_event_weights()`, `apply_temporal_decay()`, `apply_ips()`.
 - **`evaluation.rs`**: `random_split()`, `temporal_split()`, `leave_k_out_split()` for data splitting; `evaluate_model()` harness generic over `&dyn RecModel`. Per-user input construction routes through the `EvalAdapter` trait (`EaseEvalAdapter` → `Sparse`; `SasRecEvalAdapter` → chronologically-sorted `Sequence`, requires `days_ago` in the train file; `TwoTowerEvalAdapter` → `TowerUser`; `Bert4RecEvalAdapter` → chronologically-sorted `MaskedHistory` with log₂ recency buckets, requires `days_ago`). `evaluate_with_adapter()` is the lower-level entrypoint used by tuning's per-fold scorer (#51).
-- **`tuning.rs`**: `SearchSpace` and `FoldEvaluator<P>` traits; `grid_search_with` / `random_search_with` runners generic over `P`. EASE keeps `grid_search()` / `random_search()` (`P = HyperParams`) for callers; per-model entrypoints layer on top. Parallelized via rayon (ADR-0002).
+- **`tuning.rs`**: `SearchSpace` (named `axes()` + `decode` / `encode` codecs; `combinations` / `sample_one` derived) and `FoldEvaluator<P>` traits; `ParamSchema` impls (`EaseSchema`, `SasRecSchema`, `TwoTowerSchema`, `Bert4RecSchema`) shared by the typed `*ParamGrid`s and the dict-driven `DynSpace<Schema>` (`EaseSpace`, …). `tune_with(evaluator, space, strategy, TuneConfig, warm_start)` is the one runner: folds once, then ask → parallel batch → observe (ADR-0005). `grid_search_with` / `random_search_with` are thin wrappers over it and stay byte-identical to their pre-#97 output. EASE keeps `grid_search()` / `random_search()` for callers. Per-model fold evaluators: `EaseFoldEvaluator`, `SasRecFoldEvaluator`, `TwoTowerFoldEvaluator`, `Bert4RecFoldEvaluator`. Parallelized via rayon (ADR-0002).
+- **`tuning/space.rs`**: `Axis` (`Choice`, `Uniform`, `LogUniform`, `Int`, `LogInt`), `AxisSpec`, `ParamSpace` (validated, ordered; `combinations()` first-axis-outermost, `sample_one()` axis-ordered `choose`), `Value`, `Assignment`.
+- **`tuning/strategy.rs`**: `SearchStrategy::propose(space, history, max_n, rng)`; `GridStrategy`, `RandomStrategy`, `TpeStrategy` (Parzen estimators per axis, Optuna-style bandwidths, Laplace-smoothed categoricals, `batch_size` proposals per round, dedup on finite spaces).
 - **`metrics.rs`**: Pure functions: `precision_at_k`, `recall_at_k`, `ndcg_at_k`, `mean_average_precision`, `coverage`, `hit_rate_at_k`.
 - **`serialization.rs`**: Binary save/load with `FEAS` magic bytes for EASE (format v3 persists `WeightingConfig` + optional `FeatureTransformationSchema`; v1/v2 files migrate on load via version-field dispatch). `load_model()` is EASE-only, but recognises the sibling magics (`FSAS`/`FSAT` SASRec, `FTWO` Two-Tower, `FB4R` BERT4Rec) and names the right loader in its error.
 - **`serving.rs`**: `ModelRegistry` for multi-territory model routing — stores `Box<dyn RecModel>`. `register()` keeps the EASE adapter shortcut; `register_model()` accepts any `RecModel`. String-id-native per-model predict methods (`predict_top_k_ease`, `predict_top_k_sasrec`, `predict_top_k_two_tower`, `predict_top_k_bert4rec`) mirror the standalone model classes' input shapes; the legacy index-based `predict_top_k` is preserved (#56). `predict_batch()` / `predict_batch_top_k()` parallelized via rayon.
@@ -137,7 +144,7 @@ src/data_validation.rs — GaussianAnomalyDetector for pre-training data quality
 
 ### Python Layer (`kzn_recsys/`)
 
-- `__init__.py` — Exports when the native extension is present (`_HAS_NATIVE`, i.e. any wheel except the pure-Python `kzn_recsys_spark` one): `FeaseModel`, `ModelRegistry`, `FeatureTransformationSchema`, `NumericalBucketConfig`, `build_and_train`, `load_model`, `validate_data`, split functions, `grid_search` / `grid_search_ease` / `random_search` / `random_search_ease`, metrics. Exports when pydantic + polars are installed (`_HAS_SCHEMAS`): `EngagementSchema`, `MetadataSchema`. The pure-Python install exposes the recommender via the `kzn_recsys.spark` subpackage instead. Conditional on the extension being built with `--features ml-models` (gated by `_HAS_ML_MODELS`): `SASRecModel`, `build_and_train_sasrec`, `load_sasrec_model`, `grid_search_sasrec`, `random_search_sasrec`, `TwoTowerModel`, `build_and_train_two_tower`, `load_two_tower_model`, `grid_search_two_tower`, `random_search_two_tower`, `Bert4RecModel`, `build_and_train_bert4rec`, `load_bert4rec_model`.
+- `__init__.py` — Exports when the native extension is present (`_HAS_NATIVE`, i.e. any wheel except the pure-Python `kzn_recsys_spark` one): `FeaseModel`, `ModelRegistry`, `FeatureTransformationSchema`, `NumericalBucketConfig`, `build_and_train`, `load_model`, `validate_data`, split functions, `grid_search` / `grid_search_ease` / `random_search` / `random_search_ease` / `tune_ease`, metrics. Exports when pydantic + polars are installed (`_HAS_SCHEMAS`): `EngagementSchema`, `MetadataSchema`. The pure-Python install exposes the recommender via the `kzn_recsys.spark` subpackage instead. Conditional on the extension being built with `--features ml-models` (gated by `_HAS_ML_MODELS`): `SASRecModel`, `build_and_train_sasrec`, `load_sasrec_model`, `grid_search_sasrec`, `random_search_sasrec`, `TwoTowerModel`, `build_and_train_two_tower`, `load_two_tower_model`, `grid_search_two_tower`, `random_search_two_tower`, `Bert4RecModel`, `build_and_train_bert4rec`, `load_bert4rec_model`, `grid_search_bert4rec`, `random_search_bert4rec`, `tune_sasrec`, `tune_two_tower`, `tune_bert4rec`.
 - `cr_config.py` — Plain constants for the content-recommendation pipelines (BERT4Rec architecture/training defaults, hybrid FEASE `alpha`/`beta`/`lambda`, embedding feature-name prefixes). No heavy imports.
 - `hybrid_train.py` — Databricks notebook-style BERT4Rec → FEASE hybrid pipeline (#96): `run_hybrid_pipeline()` plus importable Spark helpers (`extract_user_embeddings`, `embeddings_to_long_format`, `pca_reduce_embeddings`, `write_single_parquet`). Needs `pyspark` and the `ml-models` build.
 - `schemas.py` — Pydantic models for column validation
@@ -236,12 +243,16 @@ hit rate at multiple K values, plus catalog coverage. All splits use
 sorted key iteration before RNG consumption to ensure deterministic
 results despite AHashMap's randomized hash seeds.
 
-**Hyperparameter tuning.** Grid search and random search over each
-model's parameter type with user-based k-fold CV. Optimization target is
-NDCG@k. Trials run in parallel via rayon (ADR-0002); `RAYON_NUM_THREADS`
-caps concurrency. EASE callers use `grid_search()` / `random_search()`;
-new code can use the explicit `grid_search_ease` / `grid_search_sasrec`
-/ `grid_search_two_tower` (and `random_search_*`) entrypoints.
+**Hyperparameter tuning.** Grid, random and TPE (Bayesian) search over
+each model's parameter space with user-based k-fold CV (ADR-0005).
+Optimization target is NDCG@k. Each proposed batch runs in parallel via
+rayon (ADR-0002); `RAYON_NUM_THREADS` caps concurrency. EASE callers use
+`grid_search()` / `random_search()`; per-model `grid_search_{ease,sasrec,
+two_tower,bert4rec}` / `random_search_*` keep the list-only grids; the
+strategy-driven `tune_{ease,sasrec,two_tower,bert4rec}(interactions_path,
+space, strategy=..., max_trials=..., warm_start=...)` take a dict space
+with continuous / log / int ranges. A search is deterministic for a fixed
+seed regardless of thread count.
 
 ## Key Dependencies
 

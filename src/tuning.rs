@@ -21,6 +21,21 @@
 //! [`TwoTowerParams`]/[`TwoTowerParamGrid`] for Two-Tower — while sharing
 //! the k-fold split generation, the rayon trial runner, and the
 //! deterministic result assembly.
+//!
+//! Issue #97 / ADR-0005 add a strategy seam on top: every search is
+//! `tune_with(evaluator, space, strategy, cfg)`, where a [`SearchStrategy`]
+//! (grid, random, TPE) proposes batches of model-agnostic [`Assignment`]s
+//! over a named [`ParamSpace`], the runner evaluates each batch in
+//! parallel, and the model's [`SearchSpace`] impl decodes assignments into
+//! its typed params. `grid_search_with` / `random_search_with` are thin
+//! wrappers over that loop and produce byte-identical results to their
+//! pre-#97 implementations for a fixed seed.
+
+pub mod space;
+pub mod strategy;
+
+pub use space::{Assignment, Axis, AxisSpec, ParamSpace, Value};
+pub use strategy::{GridStrategy, Observation, RandomStrategy, SearchStrategy, TpeStrategy};
 
 use crate::data_pipeline::{self, Mappings};
 use crate::evaluation::{build_user_features_map, read_interactions_df, write_parquet};
@@ -81,6 +96,10 @@ pub struct SearchResult<P = HyperParams> {
     pub best_score: f64,
     pub all_trials: Vec<TrialResult<P>>,
     pub metric_name: String,
+    /// Which [`SearchStrategy`] produced the trials (`"grid"`, `"random"`,
+    /// `"tpe"`).
+    #[serde(default)]
+    pub strategy: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -138,115 +157,506 @@ pub struct TwoTowerParamGrid {
 }
 
 // ---------------------------------------------------------------------------
+// BERT4Rec parameter schema (#96 / #97)
+// ---------------------------------------------------------------------------
+
+/// A single BERT4Rec hyperparameter configuration (see
+/// [`crate::models::bert4rec::Bert4RecConfig`] /
+/// [`crate::models::bert4rec::Bert4RecTrainingConfig`]).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Bert4RecParams {
+    pub embedding_dim: usize,
+    pub num_heads: usize,
+    pub num_layers: usize,
+    pub dropout: f64,
+    pub mask_ratio: f64,
+    pub learning_rate: f64,
+    pub num_epochs: usize,
+}
+
+/// Search space for BERT4Rec grid / random search.
+#[derive(Debug, Clone)]
+pub struct Bert4RecParamGrid {
+    pub embedding_dim: Vec<usize>,
+    pub num_heads: Vec<usize>,
+    pub num_layers: Vec<usize>,
+    pub dropout: Vec<f64>,
+    pub mask_ratio: Vec<f64>,
+    pub learning_rate: Vec<f64>,
+    pub num_epochs: Vec<usize>,
+}
+
+// ---------------------------------------------------------------------------
 // Search space abstraction
 // ---------------------------------------------------------------------------
 
 /// A model's parameter search space: the only model-specific knowledge the
-/// generic runner needs beyond the [`FoldEvaluator`]. Implementors enumerate
-/// every grid combination (`combinations`) and draw one seeded random
-/// configuration (`sample_one`); the runner owns the k-fold split, the
-/// rayon `(params × fold)` product, and deterministic result assembly.
-pub trait SearchSpace {
+/// generic runner needs beyond the [`FoldEvaluator`].
+///
+/// Since #97 the space is described by named [`Axis`]es ([`axes`](Self::axes))
+/// and the model supplies the two codecs between a model-agnostic
+/// [`Assignment`] and its typed `Params` ([`decode`](Self::decode) /
+/// [`encode`](Self::encode)). [`combinations`](Self::combinations) and
+/// [`sample_one`](Self::sample_one) are provided in terms of those, so a
+/// typed grid and a dict-driven space share one implementation — and so
+/// every [`SearchStrategy`] works on every model with no per-model code.
+///
+/// Ordering / RNG contract (what keeps `grid_search_with` and
+/// `random_search_with` byte-identical to their pre-#97 output): the axes
+/// are in the typed struct's field order; the grid is enumerated with the
+/// first axis outermost; and random sampling draws each axis in order via
+/// `SliceRandom::choose` on its candidate list. The one intentional
+/// difference: an *empty* candidate list used to mean "default value, no
+/// RNG draw" — it now becomes a one-element axis that does draw, so only
+/// Rust callers passing empty lists (the Python layer never does) see a
+/// different sampled sequence.
+pub trait SearchSpace: Send + Sync {
     /// The concrete parameter type this space produces.
     type Params: Clone + Send + Sync;
 
+    /// The named axes, in the model's canonical parameter order.
+    fn axes(&self) -> ParamSpace;
+
+    /// Typed params from one value per axis (in [`axes`](Self::axes) order).
+    fn decode(&self, a: &Assignment) -> Result<Self::Params>;
+
+    /// Inverse of [`decode`](Self::decode); used to warm-start a strategy
+    /// from previous [`TrialResult`]s.
+    fn encode(&self, p: &Self::Params) -> Assignment;
+
     /// Every configuration in the grid, in a deterministic (nested-loop)
-    /// order. Empty iff some axis is empty.
-    fn combinations(&self) -> Vec<Self::Params>;
+    /// order. Errors if an axis is continuous.
+    fn combinations(&self) -> Result<Vec<Self::Params>> {
+        self.axes()
+            .combinations()?
+            .iter()
+            .map(|a| self.decode(a))
+            .collect()
+    }
 
     /// Draw one configuration, sampling each axis independently from `rng`.
-    fn sample_one(&self, rng: &mut StdRng) -> Self::Params;
+    fn sample_one(&self, rng: &mut StdRng) -> Self::Params {
+        let a = self.axes().sample_one(rng);
+        self.decode(&a)
+            .expect("an assignment sampled from the space must decode")
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Per-model parameter schemas: names, defaults, and the Assignment codecs
+// ---------------------------------------------------------------------------
+
+/// The per-model knowledge a dict-driven space needs: the canonical axis
+/// names, a default axis for any the caller omits, and the codecs.
+/// Implemented once per model and shared by its typed `*ParamGrid`
+/// (`SearchSpace` impl) and its [`DynSpace`].
+pub trait ParamSchema: Send + Sync + 'static {
+    type Params: Clone + Send + Sync;
+    /// Canonical axis names, in the typed struct's field order.
+    const NAMES: &'static [&'static str];
+    /// Single-value axis holding the default for `name`.
+    fn default_axis(name: &str) -> Axis;
+    fn decode(a: &Assignment) -> Result<Self::Params>;
+    fn encode(p: &Self::Params) -> Assignment;
+}
+
+fn expect_len(a: &Assignment, n: usize, model: &str) -> Result<()> {
+    if a.len() != n {
+        return Err(anyhow!(
+            "{model} assignment has {} values, expected {n}",
+            a.len()
+        ));
+    }
+    Ok(())
+}
+
+/// EASE schema ([`HyperParams`]).
+pub struct EaseSchema;
+
+impl ParamSchema for EaseSchema {
+    type Params = HyperParams;
+    const NAMES: &'static [&'static str] = &[
+        "alpha",
+        "beta",
+        "lambda_",
+        "meta_weight",
+        "decay_rate",
+        "ips_alpha",
+        "sparsity_threshold",
+    ];
+
+    fn default_axis(name: &str) -> Axis {
+        let v = match name {
+            "alpha" | "beta" => 1.0,
+            "lambda_" => 100.0,
+            _ => 0.0,
+        };
+        Axis::choice_f64(&[v])
+    }
+
+    fn decode(a: &Assignment) -> Result<HyperParams> {
+        expect_len(a, 7, "EASE")?;
+        Ok(HyperParams {
+            alpha: a[0].as_f64(),
+            beta: a[1].as_f64(),
+            lambda_: a[2].as_f64(),
+            meta_weight: a[3].as_f64(),
+            decay_rate: a[4].as_f64(),
+            ips_alpha: a[5].as_f64(),
+            sparsity_threshold: a[6].as_f64(),
+        })
+    }
+
+    fn encode(p: &HyperParams) -> Assignment {
+        vec![
+            p.alpha.into(),
+            p.beta.into(),
+            p.lambda_.into(),
+            p.meta_weight.into(),
+            p.decay_rate.into(),
+            p.ips_alpha.into(),
+            p.sparsity_threshold.into(),
+        ]
+    }
+}
+
+/// SASRec schema ([`SasRecParams`]).
+pub struct SasRecSchema;
+
+impl ParamSchema for SasRecSchema {
+    type Params = SasRecParams;
+    const NAMES: &'static [&'static str] = &[
+        "embedding_dim",
+        "num_heads",
+        "num_layers",
+        "dropout",
+        "learning_rate",
+        "num_epochs",
+    ];
+
+    fn default_axis(name: &str) -> Axis {
+        match name {
+            "embedding_dim" => Axis::choice_usize(&[64]),
+            "num_heads" => Axis::choice_usize(&[2]),
+            "num_layers" => Axis::choice_usize(&[2]),
+            "dropout" => Axis::choice_f64(&[0.2]),
+            "learning_rate" => Axis::choice_f64(&[1e-3]),
+            _ => Axis::choice_usize(&[50]),
+        }
+    }
+
+    fn decode(a: &Assignment) -> Result<SasRecParams> {
+        expect_len(a, 6, "SASRec")?;
+        Ok(SasRecParams {
+            embedding_dim: a[0].as_usize()?,
+            num_heads: a[1].as_usize()?,
+            num_layers: a[2].as_usize()?,
+            dropout: a[3].as_f64(),
+            learning_rate: a[4].as_f64(),
+            num_epochs: a[5].as_usize()?,
+        })
+    }
+
+    fn encode(p: &SasRecParams) -> Assignment {
+        vec![
+            p.embedding_dim.into(),
+            p.num_heads.into(),
+            p.num_layers.into(),
+            p.dropout.into(),
+            p.learning_rate.into(),
+            p.num_epochs.into(),
+        ]
+    }
+}
+
+/// Two-Tower schema ([`TwoTowerParams`]).
+pub struct TwoTowerSchema;
+
+impl ParamSchema for TwoTowerSchema {
+    type Params = TwoTowerParams;
+    const NAMES: &'static [&'static str] = &[
+        "embedding_dim",
+        "temperature",
+        "learning_rate",
+        "id_dropout",
+    ];
+
+    fn default_axis(name: &str) -> Axis {
+        match name {
+            "embedding_dim" => Axis::choice_usize(&[32]),
+            "temperature" => Axis::choice_f64(&[0.05]),
+            "learning_rate" => Axis::choice_f64(&[0.01]),
+            _ => Axis::choice_f64(&[0.1]),
+        }
+    }
+
+    fn decode(a: &Assignment) -> Result<TwoTowerParams> {
+        expect_len(a, 4, "Two-Tower")?;
+        Ok(TwoTowerParams {
+            embedding_dim: a[0].as_usize()?,
+            temperature: a[1].as_f64(),
+            learning_rate: a[2].as_f64(),
+            id_dropout: a[3].as_f64(),
+        })
+    }
+
+    fn encode(p: &TwoTowerParams) -> Assignment {
+        vec![
+            p.embedding_dim.into(),
+            p.temperature.into(),
+            p.learning_rate.into(),
+            p.id_dropout.into(),
+        ]
+    }
+}
+
+/// BERT4Rec schema ([`Bert4RecParams`]).
+pub struct Bert4RecSchema;
+
+impl ParamSchema for Bert4RecSchema {
+    type Params = Bert4RecParams;
+    const NAMES: &'static [&'static str] = &[
+        "embedding_dim",
+        "num_heads",
+        "num_layers",
+        "dropout",
+        "mask_ratio",
+        "learning_rate",
+        "num_epochs",
+    ];
+
+    fn default_axis(name: &str) -> Axis {
+        match name {
+            "embedding_dim" => Axis::choice_usize(&[64]),
+            "num_heads" => Axis::choice_usize(&[4]),
+            "num_layers" => Axis::choice_usize(&[2]),
+            "dropout" => Axis::choice_f64(&[0.1]),
+            "mask_ratio" => Axis::choice_f64(&[0.2]),
+            "learning_rate" => Axis::choice_f64(&[1e-3]),
+            _ => Axis::choice_usize(&[50]),
+        }
+    }
+
+    fn decode(a: &Assignment) -> Result<Bert4RecParams> {
+        expect_len(a, 7, "BERT4Rec")?;
+        Ok(Bert4RecParams {
+            embedding_dim: a[0].as_usize()?,
+            num_heads: a[1].as_usize()?,
+            num_layers: a[2].as_usize()?,
+            dropout: a[3].as_f64(),
+            mask_ratio: a[4].as_f64(),
+            learning_rate: a[5].as_f64(),
+            num_epochs: a[6].as_usize()?,
+        })
+    }
+
+    fn encode(p: &Bert4RecParams) -> Assignment {
+        vec![
+            p.embedding_dim.into(),
+            p.num_heads.into(),
+            p.num_layers.into(),
+            p.dropout.into(),
+            p.mask_ratio.into(),
+            p.learning_rate.into(),
+            p.num_epochs.into(),
+        ]
+    }
+}
+
+/// A dict-driven space for schema `M`: any subset of `M::NAMES` with an
+/// arbitrary [`Axis`] each (continuous ranges included); omitted names get
+/// `M::default_axis`. This is what the Python `tune_*` entrypoints build.
+pub struct DynSpace<M: ParamSchema> {
+    space: ParamSpace,
+    _schema: std::marker::PhantomData<M>,
+}
+
+impl<M: ParamSchema> DynSpace<M> {
+    /// Build from caller-supplied axes. Unknown names are an error (a typo
+    /// would otherwise silently tune nothing); missing names default.
+    pub fn from_axes(axes: Vec<AxisSpec>) -> Result<Self> {
+        for a in &axes {
+            if !M::NAMES.contains(&a.name.as_str()) {
+                return Err(anyhow!(
+                    "unknown parameter `{}`; expected one of {:?}",
+                    a.name,
+                    M::NAMES
+                ));
+            }
+        }
+        let ordered: Vec<AxisSpec> = M::NAMES
+            .iter()
+            .map(|name| {
+                axes.iter()
+                    .find(|a| a.name == *name)
+                    .cloned()
+                    .unwrap_or_else(|| AxisSpec::new(*name, M::default_axis(name)))
+            })
+            .collect();
+        Ok(Self {
+            space: ParamSpace::new(ordered)?,
+            _schema: std::marker::PhantomData,
+        })
+    }
+
+    pub fn space(&self) -> &ParamSpace {
+        &self.space
+    }
+}
+
+impl<M: ParamSchema> SearchSpace for DynSpace<M> {
+    type Params = M::Params;
+
+    fn axes(&self) -> ParamSpace {
+        self.space.clone()
+    }
+
+    fn decode(&self, a: &Assignment) -> Result<M::Params> {
+        M::decode(a)
+    }
+
+    fn encode(&self, p: &M::Params) -> Assignment {
+        M::encode(p)
+    }
+}
+
+/// Dict-driven spaces per model.
+pub type EaseSpace = DynSpace<EaseSchema>;
+pub type SasRecSpace = DynSpace<SasRecSchema>;
+pub type TwoTowerSpace = DynSpace<TwoTowerSchema>;
+pub type Bert4RecSpace = DynSpace<Bert4RecSchema>;
+
+/// `Choice` axis from a typed grid's candidate list, substituting the
+/// schema default for an empty list (see the [`SearchSpace`] contract).
+fn choice_or_default<M: ParamSchema>(name: &str, axis: Axis) -> AxisSpec {
+    let axis = match axis {
+        Axis::Choice(v) if v.is_empty() => M::default_axis(name),
+        other => other,
+    };
+    AxisSpec::new(name, axis)
 }
 
 impl SearchSpace for ParamGrid {
     type Params = HyperParams;
 
-    fn combinations(&self) -> Vec<HyperParams> {
-        cartesian_product(self)
+    fn axes(&self) -> ParamSpace {
+        let lists = [
+            &self.alpha,
+            &self.beta,
+            &self.lambda_,
+            &self.meta_weight,
+            &self.decay_rate,
+            &self.ips_alpha,
+            &self.sparsity_threshold,
+        ];
+        ParamSpace::new(
+            EaseSchema::NAMES
+                .iter()
+                .zip(lists)
+                .map(|(n, l)| choice_or_default::<EaseSchema>(n, Axis::choice_f64(l)))
+                .collect(),
+        )
+        .expect("typed EASE grid axes are valid by construction")
     }
 
-    fn sample_one(&self, rng: &mut StdRng) -> HyperParams {
-        HyperParams {
-            alpha: *self.alpha.choose(rng).unwrap_or(&1.0),
-            beta: *self.beta.choose(rng).unwrap_or(&1.0),
-            lambda_: *self.lambda_.choose(rng).unwrap_or(&100.0),
-            meta_weight: *self.meta_weight.choose(rng).unwrap_or(&0.0),
-            decay_rate: *self.decay_rate.choose(rng).unwrap_or(&0.0),
-            ips_alpha: *self.ips_alpha.choose(rng).unwrap_or(&0.0),
-            sparsity_threshold: *self.sparsity_threshold.choose(rng).unwrap_or(&0.0),
-        }
+    fn decode(&self, a: &Assignment) -> Result<HyperParams> {
+        EaseSchema::decode(a)
+    }
+
+    fn encode(&self, p: &HyperParams) -> Assignment {
+        EaseSchema::encode(p)
     }
 }
 
 impl SearchSpace for SasRecParamGrid {
     type Params = SasRecParams;
 
-    fn combinations(&self) -> Vec<SasRecParams> {
-        let mut combos = Vec::new();
-        for &embedding_dim in &self.embedding_dim {
-            for &num_heads in &self.num_heads {
-                for &num_layers in &self.num_layers {
-                    for &dropout in &self.dropout {
-                        for &learning_rate in &self.learning_rate {
-                            for &num_epochs in &self.num_epochs {
-                                combos.push(SasRecParams {
-                                    embedding_dim,
-                                    num_heads,
-                                    num_layers,
-                                    dropout,
-                                    learning_rate,
-                                    num_epochs,
-                                });
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        combos
+    fn axes(&self) -> ParamSpace {
+        let axes = vec![
+            Axis::choice_usize(&self.embedding_dim),
+            Axis::choice_usize(&self.num_heads),
+            Axis::choice_usize(&self.num_layers),
+            Axis::choice_f64(&self.dropout),
+            Axis::choice_f64(&self.learning_rate),
+            Axis::choice_usize(&self.num_epochs),
+        ];
+        ParamSpace::new(
+            SasRecSchema::NAMES
+                .iter()
+                .zip(axes)
+                .map(|(n, a)| choice_or_default::<SasRecSchema>(n, a))
+                .collect(),
+        )
+        .expect("typed SASRec grid axes are valid by construction")
     }
 
-    fn sample_one(&self, rng: &mut StdRng) -> SasRecParams {
-        SasRecParams {
-            embedding_dim: *self.embedding_dim.choose(rng).unwrap_or(&64),
-            num_heads: *self.num_heads.choose(rng).unwrap_or(&2),
-            num_layers: *self.num_layers.choose(rng).unwrap_or(&2),
-            dropout: *self.dropout.choose(rng).unwrap_or(&0.2),
-            learning_rate: *self.learning_rate.choose(rng).unwrap_or(&1e-3),
-            num_epochs: *self.num_epochs.choose(rng).unwrap_or(&50),
-        }
+    fn decode(&self, a: &Assignment) -> Result<SasRecParams> {
+        SasRecSchema::decode(a)
+    }
+
+    fn encode(&self, p: &SasRecParams) -> Assignment {
+        SasRecSchema::encode(p)
     }
 }
 
 impl SearchSpace for TwoTowerParamGrid {
     type Params = TwoTowerParams;
 
-    fn combinations(&self) -> Vec<TwoTowerParams> {
-        let mut combos = Vec::new();
-        for &embedding_dim in &self.embedding_dim {
-            for &temperature in &self.temperature {
-                for &learning_rate in &self.learning_rate {
-                    for &id_dropout in &self.id_dropout {
-                        combos.push(TwoTowerParams {
-                            embedding_dim,
-                            temperature,
-                            learning_rate,
-                            id_dropout,
-                        });
-                    }
-                }
-            }
-        }
-        combos
+    fn axes(&self) -> ParamSpace {
+        let axes = vec![
+            Axis::choice_usize(&self.embedding_dim),
+            Axis::choice_f64(&self.temperature),
+            Axis::choice_f64(&self.learning_rate),
+            Axis::choice_f64(&self.id_dropout),
+        ];
+        ParamSpace::new(
+            TwoTowerSchema::NAMES
+                .iter()
+                .zip(axes)
+                .map(|(n, a)| choice_or_default::<TwoTowerSchema>(n, a))
+                .collect(),
+        )
+        .expect("typed Two-Tower grid axes are valid by construction")
     }
 
-    fn sample_one(&self, rng: &mut StdRng) -> TwoTowerParams {
-        TwoTowerParams {
-            embedding_dim: *self.embedding_dim.choose(rng).unwrap_or(&32),
-            temperature: *self.temperature.choose(rng).unwrap_or(&0.05),
-            learning_rate: *self.learning_rate.choose(rng).unwrap_or(&0.01),
-            id_dropout: *self.id_dropout.choose(rng).unwrap_or(&0.1),
-        }
+    fn decode(&self, a: &Assignment) -> Result<TwoTowerParams> {
+        TwoTowerSchema::decode(a)
+    }
+
+    fn encode(&self, p: &TwoTowerParams) -> Assignment {
+        TwoTowerSchema::encode(p)
+    }
+}
+
+impl SearchSpace for Bert4RecParamGrid {
+    type Params = Bert4RecParams;
+
+    fn axes(&self) -> ParamSpace {
+        let axes = vec![
+            Axis::choice_usize(&self.embedding_dim),
+            Axis::choice_usize(&self.num_heads),
+            Axis::choice_usize(&self.num_layers),
+            Axis::choice_f64(&self.dropout),
+            Axis::choice_f64(&self.mask_ratio),
+            Axis::choice_f64(&self.learning_rate),
+            Axis::choice_usize(&self.num_epochs),
+        ];
+        ParamSpace::new(
+            Bert4RecSchema::NAMES
+                .iter()
+                .zip(axes)
+                .map(|(n, a)| choice_or_default::<Bert4RecSchema>(n, a))
+                .collect(),
+        )
+        .expect("typed BERT4Rec grid axes are valid by construction")
+    }
+
+    fn decode(&self, a: &Assignment) -> Result<Bert4RecParams> {
+        Bert4RecSchema::decode(a)
+    }
+
+    fn encode(&self, p: &Bert4RecParams) -> Assignment {
+        Bert4RecSchema::encode(p)
     }
 }
 
@@ -288,6 +698,11 @@ fn ndcg_at_k(recommended: &[usize], relevant: &ahash::AHashSet<usize>, k: usize)
 // ---------------------------------------------------------------------------
 
 /// Generates the cartesian product of all parameter values in the grid.
+///
+/// Pre-#97 hand-written enumeration, kept as the test-side reference that
+/// `ParamGrid::combinations()` must reproduce exactly (same nested-loop
+/// order, first field outermost).
+#[cfg(test)]
 fn cartesian_product(grid: &ParamGrid) -> Vec<HyperParams> {
     let mut combos = Vec::new();
     for &alpha in &grid.alpha {
@@ -904,11 +1319,142 @@ impl FoldEvaluator<TwoTowerParams> for TwoTowerFoldEvaluator {
 }
 
 // ---------------------------------------------------------------------------
+// BERT4Rec fold evaluator (ml-models, #96 / #97)
+// ---------------------------------------------------------------------------
+
+/// BERT4Rec [`FoldEvaluator`]: builds masked Cloze sequences from the
+/// fold's training interactions (`days_ago` required), trains a burn
+/// `Bert4Rec` for the trial's config, wraps it in [`TrainedBert4Rec`], and
+/// scores held-out users through `Bert4RecEvalAdapter` so each history is
+/// ordered by `days_ago` and bucketed exactly as at training time.
+/// `max_seq_len`, `num_position_buckets`, `batch_size`, `patience` and
+/// `seed` are fixed per evaluator; the tuned axes are the architecture /
+/// optimizer knobs in [`Bert4RecParams`].
+///
+/// Like the SASRec evaluator this loops over test users itself rather
+/// than through `evaluate_with_adapter`: k-fold splits are user-disjoint,
+/// so no test user is in the train fold's `user_to_idx` and the public
+/// harness would skip them all.
+#[cfg(feature = "ml-models")]
+pub struct Bert4RecFoldEvaluator {
+    pub max_seq_len: usize,
+    pub num_position_buckets: usize,
+    pub batch_size: usize,
+    pub patience: usize,
+    pub seed: u64,
+}
+
+#[cfg(feature = "ml-models")]
+impl Default for Bert4RecFoldEvaluator {
+    fn default() -> Self {
+        Self {
+            max_seq_len: 50,
+            num_position_buckets: 32,
+            batch_size: 64,
+            patience: 5,
+            seed: 42,
+        }
+    }
+}
+
+#[cfg(feature = "ml-models")]
+impl FoldEvaluator<Bert4RecParams> for Bert4RecFoldEvaluator {
+    fn evaluate_fold(
+        &self,
+        train_interactions_path: &str,
+        test_interactions_path: &str,
+        params: &Bert4RecParams,
+        eval_k: usize,
+    ) -> Result<f64> {
+        use crate::data::masked_sequences::build_masked_sequences;
+        use crate::models::bert4rec::{
+            Bert4RecConfig, Bert4RecTrainingConfig, TrainedBert4Rec, train_bert4rec,
+        };
+        use burn::backend::ndarray::NdArrayDevice;
+        use burn::backend::{Autodiff, NdArray};
+
+        let mappings = data_pipeline::build_interaction_mappings(train_interactions_path)?;
+        let vocab_size = mappings.idx_to_item.len() + 2;
+        let model_config = Bert4RecConfig::new(
+            vocab_size,
+            self.max_seq_len,
+            params.num_heads,
+            params.num_layers,
+        )
+        .with_embedding_dim(params.embedding_dim)
+        .with_num_position_buckets(self.num_position_buckets)
+        .with_dropout(params.dropout)
+        .with_mask_ratio(params.mask_ratio);
+        model_config.check()?;
+
+        let dataset = build_masked_sequences(
+            train_interactions_path,
+            &mappings,
+            self.max_seq_len,
+            params.mask_ratio,
+            self.num_position_buckets,
+            self.seed,
+        )?;
+        let train_config = Bert4RecTrainingConfig::new()
+            .with_num_epochs(params.num_epochs)
+            .with_batch_size(self.batch_size)
+            .with_learning_rate(params.learning_rate)
+            .with_patience(self.patience)
+            .with_seed(self.seed);
+
+        let device = NdArrayDevice::default();
+        let fitted = train_bert4rec::<Autodiff<NdArray<f32>>>(
+            &model_config,
+            &train_config,
+            &dataset,
+            &device,
+        )?;
+        let trained = TrainedBert4Rec::new(fitted, model_config, mappings);
+        let adapter = crate::evaluation::Bert4RecEvalAdapter::new(&trained);
+
+        let train_df = read_interactions_df(train_interactions_path)?;
+        let (train_user_items, train_user_days_ago) =
+            group_user_items_with_days_ago(&train_df, trained.item_mapping())?;
+        let test_df = read_interactions_df(test_interactions_path)?;
+        let test_user_items = group_user_items(&test_df, trained.item_mapping())?;
+
+        let mut ndcg_sum = 0.0;
+        let mut n_users = 0;
+        for (user_id, test_items) in &test_user_items {
+            if test_items.is_empty() {
+                continue;
+            }
+            let train_items: Vec<(usize, f64)> =
+                train_user_items.get(user_id).cloned().unwrap_or_default();
+            let days_ago_vec: Vec<f64> = train_user_days_ago
+                .get(user_id)
+                .cloned()
+                .unwrap_or_default();
+            let ctx = crate::evaluation::UserEvalContext {
+                train_items: &train_items,
+                train_days_ago: Some(&days_ago_vec),
+                user_features: &[],
+                user_idx: None,
+            };
+            let scores =
+                <_ as crate::evaluation::EvalAdapter>::predict_user_scores(&adapter, &ctx)?;
+            ndcg_sum += rank_and_ndcg(&scores, &train_items, test_items, eval_k);
+            n_users += 1;
+        }
+
+        if n_users == 0 {
+            return Ok(0.0);
+        }
+        Ok(ndcg_sum / n_users as f64)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Parallel trial runner
 // ---------------------------------------------------------------------------
 
-/// Runs each parameter configuration over all CV folds in parallel and
-/// assembles a deterministic [`SearchResult`].
+/// Evaluates every `configs` entry over all CV folds in parallel and returns
+/// one [`TrialResult`] per config, in `configs` order.
 ///
 /// The `(params × fold)` work product is embarrassingly parallel: each trial
 /// is a pure function of `(params, train_path, test_path)` reading immutable
@@ -917,21 +1463,23 @@ impl FoldEvaluator<TwoTowerParams> for TwoTowerFoldEvaluator {
 /// constructed, per ADR-0002 §"Risks".
 ///
 /// Determinism is preserved despite non-deterministic completion order:
-/// - each trial is keyed by its stable `trial_idx` (the index in `configs`);
-/// - `all_trials` is sorted by `trial_idx` before returning;
-/// - `best_params` is the highest `mean_score`, ties broken on the lowest
-///   `trial_idx`, so the result is independent of execution order.
-fn run_trials_parallel<P, E>(
+/// each trial is keyed by its stable index in `configs`, and the fold
+/// scores are regrouped by `(trial_idx, fold_idx)` so `fold_scores[i]`
+/// always corresponds to `fold_paths[i]`. `trial_offset` / `total` only
+/// affect the progress log.
+fn evaluate_configs_parallel<P, E>(
     evaluator: &E,
     configs: &[P],
     fold_paths: &[(String, String)],
     eval_k: usize,
-) -> Result<SearchResult<P>>
+    trial_offset: usize,
+    total: usize,
+) -> Result<Vec<TrialResult<P>>>
 where
     P: Clone + Send + Sync,
     E: FoldEvaluator<P>,
 {
-    let total = configs.len();
+    let n_configs = configs.len();
     let n_folds = fold_paths.len();
 
     // Flatten the `(trial, fold)` cartesian product into one flat work list
@@ -939,8 +1487,8 @@ where
     // `configs.par_iter()` → `fold_paths.par_iter()` would let the outer
     // parallelism saturate the pool and effectively serialize the inner
     // fold loop for small fold counts; one flat `par_iter` over the
-    // `total * n_folds` items distributes work evenly.
-    let work: Vec<(usize, usize)> = (0..total)
+    // `n_configs * n_folds` items distributes work evenly.
+    let work: Vec<(usize, usize)> = (0..n_configs)
         .flat_map(|trial_idx| (0..n_folds).map(move |fold_idx| (trial_idx, fold_idx)))
         .collect();
 
@@ -955,60 +1503,163 @@ where
         .collect::<Result<Vec<_>>>()?;
 
     // Regroup deterministically: sorting by `(trial_idx, fold_idx)` makes
-    // each trial's fold scores independent of parallel completion order, so
-    // `fold_scores[i]` always corresponds to `fold_paths[i]`. Each trial has
-    // exactly `n_folds` consecutive entries, so `chunks(n_folds)` yields the
-    // per-trial groups in ascending `trial_idx` order.
+    // each trial's fold scores independent of parallel completion order.
+    // Each trial has exactly `n_folds` consecutive entries, so
+    // `chunks(n_folds)` yields the per-trial groups in ascending
+    // `trial_idx` order.
     fold_results.sort_by_key(|&(trial_idx, fold_idx, _)| (trial_idx, fold_idx));
 
-    let indexed: Vec<(usize, TrialResult<P>)> = fold_results
+    Ok(fold_results
         .chunks(n_folds)
         .enumerate()
         .map(|(trial_idx, chunk)| {
             debug_assert!(chunk.iter().all(|&(t, _, _)| t == trial_idx));
             let fold_scores: Vec<f64> = chunk.iter().map(|&(_, _, s)| s).collect();
             let mean_score = fold_scores.iter().sum::<f64>() / fold_scores.len() as f64;
-
             log::info!(
                 "Trial {}/{} -> NDCG@{}={:.4}",
-                trial_idx + 1,
+                trial_offset + trial_idx + 1,
                 total,
                 eval_k,
                 mean_score
             );
-
-            (
-                trial_idx,
-                TrialResult::<P> {
-                    params: configs[trial_idx].clone(),
-                    mean_score,
-                    fold_scores,
-                },
-            )
+            TrialResult::<P> {
+                params: configs[trial_idx].clone(),
+                mean_score,
+                fold_scores,
+            }
         })
-        .collect();
-    // `indexed` is in ascending `trial_idx` order by construction.
+        .collect())
+}
 
-    // Pick best deterministically: highest mean_score, ties broken on lowest
-    // trial_idx. `indexed` is now sorted ascending by trial_idx, so a strict
-    // `>` keeps the first-seen (lowest-index) winner among score ties.
+/// Assemble a [`SearchResult`] from trials in evaluation order. `best` is
+/// the highest `mean_score`, ties broken on the earliest trial, so the
+/// result is independent of execution order.
+fn assemble_result<P: Clone>(
+    all_trials: Vec<TrialResult<P>>,
+    eval_k: usize,
+    strategy: &str,
+) -> Result<SearchResult<P>> {
+    let first = all_trials
+        .first()
+        .ok_or_else(|| anyhow!("search produced no trials"))?;
     let mut best_score = f64::NEG_INFINITY;
-    let mut best_params = configs[0].clone();
-    for (_, trial) in &indexed {
+    let mut best_params = first.params.clone();
+    for trial in &all_trials {
+        // Strict `>` keeps the first-seen winner among score ties.
         if trial.mean_score > best_score {
             best_score = trial.mean_score;
             best_params = trial.params.clone();
         }
     }
-
-    let all_trials: Vec<TrialResult<P>> = indexed.into_iter().map(|(_, trial)| trial).collect();
-
     Ok(SearchResult {
         best_params,
         best_score,
         all_trials,
         metric_name: format!("ndcg@{}", eval_k),
+        strategy: strategy.to_string(),
     })
+}
+
+// ---------------------------------------------------------------------------
+// Strategy-driven runner (#97 / ADR-0005)
+// ---------------------------------------------------------------------------
+
+/// Budget and CV settings for [`tune_with`].
+#[derive(Debug, Clone)]
+pub struct TuneConfig {
+    /// User-based k-fold count (`>= 2`).
+    pub n_folds: usize,
+    /// NDCG cutoff that is optimised.
+    pub eval_k: usize,
+    /// Seeds the fold shuffle (`seed`) and the strategy RNG (`seed + 1`,
+    /// matching the pre-#97 random search).
+    pub seed: u64,
+    /// Maximum number of new trials to evaluate.
+    pub max_trials: usize,
+}
+
+/// Run `strategy` over `space` against `evaluator` with user-based k-fold
+/// CV: generate the folds once, then loop *ask → evaluate batch in
+/// parallel → observe* until the strategy stops proposing or `max_trials`
+/// is reached. `warm_start` trials (e.g. a previous run's `all_trials`)
+/// seed the strategy's history but are not re-evaluated and are not part
+/// of the returned `all_trials`.
+pub fn tune_with<S, E>(
+    evaluator: &E,
+    interactions_path: &str,
+    space: &S,
+    strategy: &mut dyn SearchStrategy,
+    cfg: &TuneConfig,
+    warm_start: &[TrialResult<S::Params>],
+) -> Result<SearchResult<S::Params>>
+where
+    S: SearchSpace,
+    E: FoldEvaluator<S::Params>,
+{
+    if cfg.max_trials == 0 {
+        return Err(anyhow!("max_trials must be >= 1"));
+    }
+    let axes = space.axes();
+    log::info!(
+        "{} search: up to {} trials over {} axes, {}-fold CV",
+        strategy.name(),
+        cfg.max_trials,
+        axes.len(),
+        cfg.n_folds
+    );
+
+    // Generate k-fold splits once.
+    let (_tmp_dir, fold_paths) = generate_kfold_splits(interactions_path, cfg.n_folds, cfg.seed)?;
+
+    // Strategy RNG decoupled from fold generation (seed+1), as before.
+    let mut rng = StdRng::seed_from_u64(cfg.seed.wrapping_add(1));
+
+    let mut history: Vec<Observation> = warm_start
+        .iter()
+        .map(|t| Observation {
+            assignment: space.encode(&t.params),
+            score: t.mean_score,
+        })
+        .collect();
+    let mut all_trials: Vec<TrialResult<S::Params>> = Vec::new();
+
+    while all_trials.len() < cfg.max_trials {
+        let remaining = cfg.max_trials - all_trials.len();
+        let batch = strategy.propose(&axes, &history, remaining, &mut rng)?;
+        if batch.is_empty() {
+            break;
+        }
+        let configs: Vec<S::Params> = batch
+            .iter()
+            .map(|a| {
+                axes.check(a)?;
+                space.decode(a)
+            })
+            .collect::<Result<_>>()?;
+        let total_hint = if strategy.name() == "tpe" {
+            cfg.max_trials
+        } else {
+            all_trials.len() + configs.len()
+        };
+        let trials = evaluate_configs_parallel(
+            evaluator,
+            &configs,
+            &fold_paths,
+            cfg.eval_k,
+            all_trials.len(),
+            total_hint,
+        )?;
+        for (assignment, trial) in batch.into_iter().zip(&trials) {
+            history.push(Observation {
+                assignment,
+                score: trial.mean_score,
+            });
+        }
+        all_trials.extend(trials);
+    }
+
+    assemble_result(all_trials, cfg.eval_k, strategy.name())
 }
 
 // ---------------------------------------------------------------------------
@@ -1017,10 +1668,9 @@ where
 
 /// Generic grid search over any [`FoldEvaluator`].
 ///
-/// Generates k-fold splits from `interactions_path`, then runs every
-/// grid combination across all folds in parallel via the shared
-/// [`run_trials_parallel`] runner. Model-specific training/scoring is
-/// entirely delegated to `evaluator`.
+/// Thin wrapper over [`tune_with`] with a [`GridStrategy`]: every
+/// combination of the (finite) space runs across all folds in one
+/// parallel batch. Errors if the grid is empty or an axis is continuous.
 pub fn grid_search_with<S, E>(
     evaluator: &E,
     interactions_path: &str,
@@ -1033,28 +1683,30 @@ where
     S: SearchSpace,
     E: FoldEvaluator<S::Params>,
 {
-    let combos = grid.combinations();
-    let total = combos.len();
+    let total = grid.axes().cardinality().unwrap_or(0);
     if total == 0 {
         return Err(anyhow!("Parameter grid produced 0 combinations"));
     }
-    log::info!(
-        "Grid search: {} parameter combinations, {}-fold CV",
-        total,
-        n_folds
-    );
-
-    // Generate k-fold splits once
-    let (_tmp_dir, fold_paths) = generate_kfold_splits(interactions_path, n_folds, seed)?;
-
-    run_trials_parallel(evaluator, &combos, &fold_paths, eval_k)
+    let cfg = TuneConfig {
+        n_folds,
+        eval_k,
+        seed,
+        max_trials: total,
+    };
+    tune_with(
+        evaluator,
+        interactions_path,
+        grid,
+        &mut GridStrategy::new(),
+        &cfg,
+        &[],
+    )
 }
-
 /// EASE grid search: evaluates all combinations of parameters in the grid.
 ///
 /// The `(params × fold)` trials run in parallel via rayon's global pool
 /// (ADR-0002 Phase 1). The result is deterministic for a fixed `seed` and
-/// grid regardless of thread count: see [`run_trials_parallel`]. This is a
+/// grid regardless of thread count: see [`evaluate_configs_parallel`]. This is a
 /// thin wrapper over [`grid_search_with`] using [`EaseFoldEvaluator`], kept
 /// so the existing EASE call sites and determinism guard are unchanged.
 pub fn grid_search(
@@ -1077,17 +1729,12 @@ pub fn grid_search(
 // Random search
 // ---------------------------------------------------------------------------
 
-/// Random search: samples n_trials random parameter configurations from the grid.
-///
-/// Config sampling stays sequential so the sampled set is a deterministic
-/// function of `seed`; the resulting `(params × fold)` trials run in parallel
-/// via rayon's global pool (ADR-0002 Phase 1). See [`run_trials_parallel`].
 /// Generic random search over any [`FoldEvaluator`].
 ///
-/// Config sampling stays sequential so the sampled set is a deterministic
-/// function of `seed`; the resulting `(params × fold)` trials run in
-/// parallel via the shared runner. Model-specific training/scoring is
-/// delegated to `evaluator`.
+/// Thin wrapper over [`tune_with`] with a [`RandomStrategy`]: `n_trials`
+/// configurations are sampled sequentially from an RNG seeded with
+/// `seed + 1` (so the set is a deterministic function of `seed`), then
+/// evaluated in one parallel batch.
 #[allow(clippy::too_many_arguments)]
 pub fn random_search_with<S, E>(
     evaluator: &E,
@@ -1105,22 +1752,21 @@ where
     if n_trials == 0 {
         return Err(anyhow!("n_trials must be >= 1"));
     }
-    log::info!("Random search: {} trials, {}-fold CV", n_trials, n_folds);
-
-    // Generate k-fold splits once
-    let (_tmp_dir, fold_paths) = generate_kfold_splits(interactions_path, n_folds, seed)?;
-
-    // Sample random parameter configs (use seed+1 to decouple from fold generation).
-    // Sampling is sequential so the config set is deterministic for a fixed seed.
-    let mut rng = StdRng::seed_from_u64(seed.wrapping_add(1));
-    let mut sampled_configs = Vec::with_capacity(n_trials);
-    for _ in 0..n_trials {
-        sampled_configs.push(grid.sample_one(&mut rng));
-    }
-
-    run_trials_parallel(evaluator, &sampled_configs, &fold_paths, eval_k)
+    let cfg = TuneConfig {
+        n_folds,
+        eval_k,
+        seed,
+        max_trials: n_trials,
+    };
+    tune_with(
+        evaluator,
+        interactions_path,
+        grid,
+        &mut RandomStrategy::new(n_trials),
+        &cfg,
+        &[],
+    )
 }
-
 /// EASE random search: samples n_trials random parameter configurations
 /// from the grid.
 ///
@@ -1736,6 +2382,7 @@ mod tests {
             best_score,
             all_trials,
             metric_name: format!("ndcg@{}", eval_k),
+            strategy: "grid".to_string(),
         })
     }
 
@@ -2038,6 +2685,364 @@ mod tests {
             assert_eq!(trial.fold_scores.len(), 2);
             assert!(trial.mean_score.is_finite());
         }
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------
+    // #97: strategy seam regression guards + adaptive search
+    // -----------------------------------------------------------------
+
+    /// `ParamGrid::combinations()` (now derived from the generic axes)
+    /// must reproduce the pre-#97 hand-written cartesian product exactly:
+    /// same count, same order, same bits.
+    #[test]
+    fn test_grid_combinations_match_legacy_cartesian_product_bitwise() -> Result<()> {
+        let grid = ParamGrid {
+            alpha: vec![0.5, 1.0],
+            beta: vec![0.25, 1.0],
+            lambda_: vec![10.0, 100.0, 500.0],
+            meta_weight: vec![0.0, 0.5],
+            decay_rate: vec![0.0],
+            ips_alpha: vec![0.0, 0.1],
+            sparsity_threshold: vec![0.0],
+        };
+        let legacy = cartesian_product(&grid);
+        let now = grid.combinations()?;
+        assert_eq!(legacy.len(), now.len());
+        assert_eq!(now.len(), 48);
+        for (a, b) in legacy.iter().zip(&now) {
+            assert_eq!(EaseSchema::encode(a), EaseSchema::encode(b));
+        }
+        Ok(())
+    }
+
+    /// Pre-#97 random sampling: per-field `choose` in field order from an
+    /// RNG seeded with `seed + 1`.
+    fn legacy_random_sample(grid: &ParamGrid, n: usize, seed: u64) -> Vec<HyperParams> {
+        let mut rng = StdRng::seed_from_u64(seed.wrapping_add(1));
+        (0..n)
+            .map(|_| HyperParams {
+                alpha: *grid.alpha.choose(&mut rng).unwrap(),
+                beta: *grid.beta.choose(&mut rng).unwrap(),
+                lambda_: *grid.lambda_.choose(&mut rng).unwrap(),
+                meta_weight: *grid.meta_weight.choose(&mut rng).unwrap(),
+                decay_rate: *grid.decay_rate.choose(&mut rng).unwrap(),
+                ips_alpha: *grid.ips_alpha.choose(&mut rng).unwrap(),
+                sparsity_threshold: *grid.sparsity_threshold.choose(&mut rng).unwrap(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_random_search_params_match_legacy_sampling_bitwise() -> Result<()> {
+        let (i_path, u_path, t_path, _tmpdir) = create_test_dataset()?;
+        let grid = ParamGrid {
+            alpha: vec![0.5, 1.0, 2.0],
+            beta: vec![0.5, 1.0],
+            lambda_: vec![10.0, 50.0, 100.0],
+            meta_weight: vec![0.0],
+            decay_rate: vec![0.0],
+            ips_alpha: vec![0.0],
+            sparsity_threshold: vec![0.0],
+        };
+        let (n, seed) = (5, 42);
+        let result = random_search(&i_path, &u_path, &t_path, &grid, n, 2, 10, seed)?;
+        let legacy = legacy_random_sample(&grid, n, seed);
+        assert_eq!(result.strategy, "random");
+        assert_eq!(result.all_trials.len(), n);
+        for (t, l) in result.all_trials.iter().zip(&legacy) {
+            assert_eq!(EaseSchema::encode(&t.params), EaseSchema::encode(l));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_dyn_space_orders_defaults_and_rejects_unknown() -> Result<()> {
+        let s = EaseSpace::from_axes(vec![
+            AxisSpec::new(
+                "lambda_",
+                Axis::LogUniform {
+                    low: 1.0,
+                    high: 1000.0,
+                },
+            ),
+            AxisSpec::new("alpha", Axis::choice_f64(&[0.5, 2.0])),
+        ])?;
+        assert_eq!(s.space().names(), EaseSchema::NAMES);
+        let mut rng = StdRng::seed_from_u64(0);
+        let p = s.sample_one(&mut rng);
+        assert!((1.0..=1000.0).contains(&p.lambda_));
+        assert!([0.5, 2.0].contains(&p.alpha));
+        assert_eq!(p.beta, 1.0, "omitted axes take the schema default");
+        assert!(
+            s.combinations().is_err(),
+            "grid over a continuous axis is refused"
+        );
+        assert_eq!(s.encode(&p).len(), 7);
+        assert_eq!(EaseSchema::encode(&s.decode(&s.encode(&p))?), s.encode(&p));
+
+        assert!(
+            EaseSpace::from_axes(vec![AxisSpec::new("lambda", Axis::choice_f64(&[1.0]))]).is_err()
+        );
+        assert!(
+            SasRecSpace::from_axes(vec![AxisSpec::new(
+                "embedding_dim",
+                Axis::LogInt { low: 8, high: 128 }
+            )])
+            .is_ok()
+        );
+        assert!(
+            Bert4RecSpace::from_axes(vec![AxisSpec::new("mask_ratio", Axis::choice_f64(&[0.2]))])
+                .is_ok()
+        );
+        // Integer axes reject non-integral values at decode time.
+        let bad = Bert4RecSpace::from_axes(vec![])?;
+        let mut a = bad.encode(&Bert4RecParams {
+            embedding_dim: 64,
+            num_heads: 4,
+            num_layers: 2,
+            dropout: 0.1,
+            mask_ratio: 0.2,
+            learning_rate: 1e-3,
+            num_epochs: 50,
+        });
+        a[0] = Value::Float(64.5);
+        assert!(bad.decode(&a).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn test_tune_with_grid_truncates_to_max_trials() -> Result<()> {
+        let (i_path, u_path, t_path, _tmpdir) = create_test_dataset()?;
+        let evaluator = EaseFoldEvaluator {
+            user_features_path: u_path,
+            item_features_path: t_path,
+        };
+        let grid = ParamGrid {
+            alpha: vec![0.5, 1.0],
+            beta: vec![1.0],
+            lambda_: vec![10.0, 100.0, 500.0],
+            meta_weight: vec![0.0],
+            decay_rate: vec![0.0],
+            ips_alpha: vec![0.0],
+            sparsity_threshold: vec![0.0],
+        };
+        let cfg = TuneConfig {
+            n_folds: 2,
+            eval_k: 10,
+            seed: 42,
+            max_trials: 2,
+        };
+        let r = tune_with(
+            &evaluator,
+            &i_path,
+            &grid,
+            &mut GridStrategy::new(),
+            &cfg,
+            &[],
+        )?;
+        assert_eq!(r.strategy, "grid");
+        assert_eq!(r.all_trials.len(), 2);
+        let combos = grid.combinations()?;
+        for (t, c) in r.all_trials.iter().zip(&combos) {
+            assert_eq!(EaseSchema::encode(&t.params), EaseSchema::encode(c));
+        }
+        assert!(
+            tune_with(
+                &evaluator,
+                &i_path,
+                &grid,
+                &mut GridStrategy::new(),
+                &TuneConfig {
+                    max_trials: 0,
+                    ..cfg
+                },
+                &[]
+            )
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_tune_with_tpe_ease_end_to_end_deterministic_and_warm_start() -> Result<()> {
+        let (i_path, u_path, t_path, _tmpdir) = create_test_dataset()?;
+        let evaluator = EaseFoldEvaluator {
+            user_features_path: u_path,
+            item_features_path: t_path,
+        };
+        let space = EaseSpace::from_axes(vec![
+            AxisSpec::new(
+                "lambda_",
+                Axis::LogUniform {
+                    low: 1.0,
+                    high: 1000.0,
+                },
+            ),
+            AxisSpec::new("alpha", Axis::choice_f64(&[0.5, 1.0, 2.0])),
+        ])?;
+        let cfg = TuneConfig {
+            n_folds: 2,
+            eval_k: 10,
+            seed: 42,
+            max_trials: 6,
+        };
+        let run = || {
+            let mut tpe = TpeStrategy::new().with_n_startup(2).with_batch_size(2);
+            tune_with(&evaluator, &i_path, &space, &mut tpe, &cfg, &[])
+        };
+        let r1 = run()?;
+        assert_eq!(r1.strategy, "tpe");
+        assert_eq!(r1.metric_name, "ndcg@10");
+        assert_eq!(r1.all_trials.len(), 6);
+        for t in &r1.all_trials {
+            assert!((1.0..=1000.0).contains(&t.params.lambda_));
+            assert!([0.5, 1.0, 2.0].contains(&t.params.alpha));
+            assert_eq!(t.fold_scores.len(), 2);
+            assert!(t.mean_score.is_finite());
+        }
+        let max = r1
+            .all_trials
+            .iter()
+            .map(|t| t.mean_score)
+            .fold(f64::NEG_INFINITY, f64::max);
+        assert!((r1.best_score - max).abs() < 1e-12);
+
+        // Deterministic for a fixed seed.
+        let r2 = run()?;
+        for (a, b) in r1.all_trials.iter().zip(&r2.all_trials) {
+            assert_eq!(EaseSchema::encode(&a.params), EaseSchema::encode(&b.params));
+            assert_eq!(a.mean_score.to_bits(), b.mean_score.to_bits());
+        }
+
+        // Warm start: prior trials seed the model; only new trials come back
+        // and, with the start-up budget already covered by history, the
+        // model path runs from the first proposal.
+        let cfg3 = TuneConfig {
+            max_trials: 3,
+            ..cfg
+        };
+        let mut tpe3 = TpeStrategy::new().with_n_startup(2).with_batch_size(2);
+        let r3 = tune_with(
+            &evaluator,
+            &i_path,
+            &space,
+            &mut tpe3,
+            &cfg3,
+            &r1.all_trials,
+        )?;
+        assert_eq!(r3.all_trials.len(), 3);
+        Ok(())
+    }
+
+    /// BERT4Rec grid + random search run end-to-end through the real
+    /// evaluator (#97 Phase 1).
+    #[cfg(feature = "ml-models")]
+    #[test]
+    #[ignore = "trains real burn models; impractically slow in a debug CI build. Run with: cargo test --release --features ml-models -- --ignored"]
+    fn test_bert4rec_grid_and_random_search_end_to_end() -> Result<()> {
+        let (i_path, _tmp) = make_seq_dataset(12, 6, 5)?;
+        let grid = Bert4RecParamGrid {
+            embedding_dim: vec![8, 16],
+            num_heads: vec![2],
+            num_layers: vec![1],
+            dropout: vec![0.0],
+            mask_ratio: vec![0.3],
+            learning_rate: vec![1e-2],
+            num_epochs: vec![5],
+        };
+        let evaluator = Bert4RecFoldEvaluator {
+            max_seq_len: 8,
+            num_position_buckets: 8,
+            batch_size: 8,
+            patience: 5,
+            seed: 42,
+        };
+        let result = grid_search_with(&evaluator, &i_path, &grid, 2, 5, 42)?;
+        assert_eq!(result.all_trials.len(), 2);
+        assert_eq!(result.metric_name, "ndcg@5");
+        for trial in &result.all_trials {
+            assert_eq!(trial.fold_scores.len(), 2);
+            assert!(trial.mean_score.is_finite());
+            assert!((0.0..=1.0).contains(&trial.mean_score));
+        }
+        assert!([8usize, 16].contains(&result.best_params.embedding_dim));
+
+        let rr = random_search_with(&evaluator, &i_path, &grid, 3, 2, 5, 42)?;
+        assert_eq!(rr.all_trials.len(), 3);
+        assert_eq!(rr.strategy, "random");
+        Ok(())
+    }
+
+    /// #97 acceptance: on the Two-Tower fixture, TPE with half the budget
+    /// matches or beats random search's best NDCG@k in a majority of seeds.
+    #[cfg(feature = "ml-models")]
+    #[test]
+    #[ignore = "trains real burn models; impractically slow in a debug CI build. Run with: cargo test --release --features ml-models -- --ignored"]
+    fn test_tpe_half_budget_matches_random_best_two_tower() -> Result<()> {
+        let (i_path, _tmp) = make_seq_dataset(24, 8, 6)?;
+        let evaluator = TwoTowerFoldEvaluator {
+            epochs: 10,
+            batch_size: 16,
+            seed: 0,
+        };
+        let space = TwoTowerSpace::from_axes(vec![
+            AxisSpec::new("embedding_dim", Axis::choice_usize(&[4, 8, 16, 32])),
+            AxisSpec::new(
+                "temperature",
+                Axis::LogUniform {
+                    low: 0.01,
+                    high: 1.0,
+                },
+            ),
+            AxisSpec::new(
+                "learning_rate",
+                Axis::LogUniform {
+                    low: 1e-3,
+                    high: 0.3,
+                },
+            ),
+        ])?;
+        let budget = 16;
+        let mut wins = 0;
+        let seeds = [1_u64, 2, 3];
+        for &seed in &seeds {
+            let cfg_r = TuneConfig {
+                n_folds: 2,
+                eval_k: 5,
+                seed,
+                max_trials: budget,
+            };
+            let random = tune_with(
+                &evaluator,
+                &i_path,
+                &space,
+                &mut RandomStrategy::new(budget),
+                &cfg_r,
+                &[],
+            )?;
+            let cfg_t = TuneConfig {
+                max_trials: budget / 2,
+                ..cfg_r
+            };
+            let tpe = tune_with(
+                &evaluator,
+                &i_path,
+                &space,
+                &mut TpeStrategy::for_budget(budget / 2).with_batch_size(2),
+                &cfg_t,
+                &[],
+            )?;
+            assert_eq!(tpe.all_trials.len(), budget / 2);
+            if tpe.best_score >= random.best_score - 1e-9 {
+                wins += 1;
+            }
+        }
+        assert!(
+            wins * 2 > seeds.len(),
+            "TPE (half budget) should match/beat random's best in a majority of seeds; won {wins}/{}",
+            seeds.len()
+        );
         Ok(())
     }
 }

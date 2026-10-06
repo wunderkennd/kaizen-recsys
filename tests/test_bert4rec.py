@@ -218,3 +218,73 @@ def test_invalid_architecture_is_a_value_error(trained_bert4rec):
         fease.build_and_train_bert4rec(
             interactions_path=i_path, embedding_dim=10, num_heads=4, num_epochs=1
         )
+
+
+def _make_tuning_interactions(path: Path) -> None:
+    """12 users over 6 items with strictly ordered days_ago, enough for 2-fold CV."""
+    rows = {"user_id": [], "item_id": [], "value": [], "days_ago": []}
+    for u in range(12):
+        for k in range(5):
+            rows["user_id"].append(f"u{u:02}")
+            rows["item_id"].append(f"i{(u + k) % 6}")
+            rows["value"].append(1.0)
+            rows["days_ago"].append(float(5 - k))
+    pl.DataFrame(rows).write_parquet(path)
+
+
+@pytest.fixture(scope="module")
+def bert4rec_tuning_path():
+    with tempfile.TemporaryDirectory() as tmp:
+        p = Path(tmp) / "interactions.parquet"
+        _make_tuning_interactions(p)
+        yield str(p)
+
+
+_TINY_GRID = {
+    "embedding_dim": [8],
+    "num_heads": [2],
+    "num_layers": [1],
+    "dropout": [0.0],
+    "mask_ratio": [0.3],
+    "learning_rate": [1e-2],
+    "num_epochs": [2],
+}
+
+
+def test_grid_and_random_search_bert4rec(bert4rec_tuning_path):
+    grid = dict(_TINY_GRID, embedding_dim=[8, 16])
+    result = fease.grid_search_bert4rec(
+        bert4rec_tuning_path, "", "", param_grid=grid, n_folds=2, eval_k=5, seed=42
+    )
+    assert result["metric"] == "ndcg@5"
+    assert result["strategy"] == "grid"
+    assert len(result["trials"]) == 2
+    assert [t["params"]["embedding_dim"] for t in result["trials"]] == [8, 16]
+    assert isinstance(result["best_params"]["embedding_dim"], int)
+    assert set(result["best_params"]) == {
+        "embedding_dim", "num_heads", "num_layers", "dropout",
+        "mask_ratio", "learning_rate", "num_epochs",
+    }
+    for t in result["trials"]:
+        assert len(t["fold_scores"]) == 2
+        assert 0.0 <= t["mean_score"] <= 1.0
+
+    rnd = fease.random_search_bert4rec(
+        bert4rec_tuning_path, "", "", param_grid=grid, n_trials=2, n_folds=2, eval_k=5, seed=42
+    )
+    assert rnd["strategy"] == "random"
+    assert len(rnd["trials"]) == 2
+
+
+def test_tune_bert4rec_tpe_over_mixed_space(bert4rec_tuning_path):
+    space = dict(_TINY_GRID, embedding_dim=[8, 16], learning_rate=("log", 1e-3, 1e-1))
+    result = fease.tune_bert4rec(
+        bert4rec_tuning_path, space, strategy="tpe", max_trials=3, n_folds=2,
+        eval_k=5, seed=42, batch_size=2, n_startup=2,
+    )
+    assert result["strategy"] == "tpe"
+    assert len(result["trials"]) == 3
+    for t in result["trials"]:
+        assert t["params"]["embedding_dim"] in (8, 16)
+        assert 1e-3 <= t["params"]["learning_rate"] <= 1e-1
+    assert result["best_score"] == max(t["mean_score"] for t in result["trials"])
