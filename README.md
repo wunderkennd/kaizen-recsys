@@ -65,7 +65,7 @@ evaluation, tuning, and serving layers are model-agnostic (they operate on
   algorithmic change, so EASE behavior and outputs are unchanged. Everything
   in the Python sections below uses EASE.
 - **`ml-models` Cargo feature (off by default).** Additional burn-based model
-  code (the `sasrec` / `two_tower` modules) is compiled only when this feature
+  code (the `sasrec` / `two_tower` / `bert4rec` modules) is compiled only when this feature
   is enabled. With it off — the default — the dependency tree, build time, and
   wheel size are unchanged, and the published PyPI wheels do not include
   `burn`. The `RecModel` trait, the `ModelInput` enum, and the EASE adapter
@@ -329,6 +329,60 @@ model.save("sasrec.fsat")
 loaded = fease.load_sasrec_model("sasrec.fsat")
 ```
 
+## BERT4Rec Usage (+ FEASE hybrid)
+
+BERT4Rec is a *bidirectional* transformer trained with a masked-item
+(Cloze) objective: it learns "what belongs in this collection" rather
+than SASRec's "what comes next", which suits catalogs where discovery
+order carries little signal (anime, back-catalog film). Positions are
+log₂-bucketed `days_ago` values rather than sequence offsets, so two
+titles watched in the same doubling window share a position regardless
+of absolute date. Compiled only with `--features ml-models`; the
+interactions file **must** carry a numeric `days_ago` column.
+
+```python
+import kzn_recsys as fease
+
+model = fease.build_and_train_bert4rec(
+    interactions_path="interactions.parquet",  # user_id, item_id, value, days_ago
+    embedding_dim=64,          # must be divisible by num_heads
+    max_seq_len=200,
+    num_position_buckets=32,   # log2(days_ago) buckets
+    num_heads=4,
+    num_layers=2,
+    dropout=0.1,
+    mask_ratio=0.2,
+    num_epochs=50,
+    batch_size=64,
+    learning_rate=1e-3,
+    patience=5,
+    seed=42,
+)
+
+# Scoring appends a [MASK] query token to the history. `days_ago` (optional,
+# parallel to `history`) is bucketed exactly as at training time; without it
+# every item is treated as "now".
+recs = model.predict(["A", "B", "C"], days_ago=[30.0, 7.0, 1.0], top_k=10)
+
+# Dense embeddings for the hybrid pipeline: mean-pooled hidden states over
+# the user's unmasked history, and the learned item table.
+user_vec = model.embed_user(["A", "B", "C"], days_ago=[30.0, 7.0, 1.0])  # len == embedding_dim
+users = model.embed_users("interactions.parquet")  # {user_id: [floats]}, reads days_ago
+items = model.embed_items()                        # {item_id: [floats]}
+
+model.save("bert4rec.fb4r")                        # framed `FB4R` format
+loaded = fease.load_bert4rec_model("bert4rec.fb4r")
+```
+
+`kzn_recsys/hybrid_train.py` orchestrates the **BERT4Rec → FEASE hybrid**
+(issue #96): it trains BERT4Rec, melts the user embeddings into FEASE's
+long feature format (`bert_emb_0 …`), unions them with categorical user
+features, adds PCA-reduced MyAnimeList knowledge-graph item embeddings
+(`kg_emb_*`), trains FEASE on the enriched tables with a temporal
+hold-out evaluation, and saves both models. Users without a BERT4Rec
+embedding (new users) fall through to FEASE's categorical cold-start.
+Defaults live in `kzn_recsys/cr_config.py`.
+
 ## Two-Tower Usage
 
 Two-Tower is a dual-tower retrieval model with separate user / item
@@ -393,6 +447,7 @@ registry = fease.ModelRegistry(fallback_territory="US")
 # inputs each model expects are explicit in the call site.
 registry.register("US", ease_model)               # EASE
 registry.register_sasrec("UK", sasrec_model)      # SASRec    (needs ml-models)
+registry.register_bert4rec("JP", bert4rec_model)  # BERT4Rec  (needs ml-models)
 registry.register_two_tower("BR", two_tower_model)  # Two-Tower (needs ml-models)
 
 print(registry.territories())  # ["US", "UK", "BR"]
@@ -413,6 +468,8 @@ recs = registry.predict_top_k_ease(
 
 # SASRec: chronological history (list[str], oldest first).
 recs = registry.predict_top_k_sasrec("UK", history=["A", "B", "C"], top_k=10)
+# BERT4Rec: same history shape plus optional parallel `days_ago`.
+recs = registry.predict_top_k_bert4rec("JP", history=["A", "B"], days_ago=[9.0, 1.0], top_k=10)
 
 # Two-Tower: user id + optional features. Warm users use their learned
 # id row; unknown users transparently fall back to the cold-start row.

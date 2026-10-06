@@ -21,6 +21,17 @@ const FORMAT_VERSION: u32 = 3;
 /// Magic bytes to identify FEASE model files.
 const MAGIC: &[u8; 4] = b"FEAS";
 
+/// Magic bytes of the sibling model formats, so a FEAS loader handed the
+/// wrong file can name the right loader instead of just "invalid magic".
+/// The bytes are duplicated here (rather than imported from the
+/// `ml-models`-gated modules) so the hint works in EASE-only builds too.
+const SIBLING_MAGICS: &[(&[u8; 4], &str, &str)] = &[
+    (b"FSAS", "SASRec", "models::sasrec::load_sasrec"),
+    (b"FSAT", "SASRec", "load_sasrec_model"),
+    (b"FTWO", "Two-Tower", "load_two_tower_model"),
+    (b"FB4R", "BERT4Rec", "load_bert4rec_model"),
+];
+
 /// V1 serialization format (without weighting_config).
 /// Used for backward-compatible loading of models saved before v2.
 #[derive(Serialize, Deserialize)]
@@ -303,6 +314,16 @@ pub fn load_model(path: &Path) -> Result<RustFeaseModel> {
     }
 
     if &data[..MAGIC.len()] != MAGIC {
+        if let Some((_, name, loader)) = SIBLING_MAGICS
+            .iter()
+            .find(|(magic, _, _)| &data[..MAGIC.len()] == *magic)
+        {
+            anyhow::bail!(
+                "Invalid magic bytes in {}. Expected FEAS header, but this looks like a \
+                 {name} model file — load it with `{loader}` instead.",
+                path.display()
+            );
+        }
         anyhow::bail!(
             "Invalid magic bytes in {}. Expected FEAS header.",
             path.display()
@@ -479,6 +500,24 @@ mod tests {
         );
 
         std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn test_load_sibling_magic_names_the_right_loader() {
+        let dir = tempfile::tempdir().unwrap();
+        for (magic, name, loader) in [
+            (b"FB4R", "BERT4Rec", "load_bert4rec_model"),
+            (b"FSAT", "SASRec", "load_sasrec_model"),
+            (b"FTWO", "Two-Tower", "load_two_tower_model"),
+        ] {
+            let path = dir.path().join(format!("{name}.bin"));
+            let mut bytes = magic.to_vec();
+            bytes.extend_from_slice(&[0u8; 16]);
+            fs::write(&path, &bytes).unwrap();
+            let msg = load_model(&path).unwrap_err().to_string();
+            assert!(msg.contains("Invalid magic bytes"), "{msg}");
+            assert!(msg.contains(name) && msg.contains(loader), "{msg}");
+        }
     }
 
     #[test]

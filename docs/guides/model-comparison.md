@@ -16,6 +16,7 @@ helps you pick.
 | I just want a strong baseline with minimal data wrangling. | — | **EASE** |
 | I have very long item catalogs and need an embedding-based retrieval index. | — | **Two-Tower** |
 | I care about *which item the user looked at last*, not just *what they've ever liked*. | — | **SASRec** |
+| Discovery order carries little signal (users find old titles years later) and I want dense taste embeddings to feed EASE. | — | **BERT4Rec** (+ FEASE hybrid) |
 
 ## Comparison
 
@@ -81,6 +82,34 @@ trained model persists feature-name → index maps so
 learned cold-start prior (#55). Loses when warm users have very strong
 direct co-purchase signals that EASE captures more cheaply.
 
+## BERT4Rec and the FEASE hybrid
+
+BERT4Rec (issue #96) is the bidirectional sibling of SASRec: a
+transformer trained with a masked-item (Cloze) objective, no causal
+mask, and positions that are log₂-bucketed `days_ago` values rather
+than sequence offsets. It learns "what belongs in this collection"
+instead of "what comes next".
+
+| Dimension | BERT4Rec |
+|-----------|----------|
+| Required cargo feature | `ml-models` |
+| Required input columns | `user_id`, `item_id`, `value`, **`days_ago`** |
+| Side features used | No (sequence-only), but it *exports* embeddings for EASE |
+| Cold-start strategy | Empty history → zero embedding; the hybrid falls back to EASE's categorical features |
+| Training | Adam over the Cloze loss at masked positions; best-loss early stopping. Seedable |
+| Persisted format magic bytes | `FB4R` |
+| Python predict-time inputs | `history: list[str]` (oldest first) + optional parallel `days_ago: list[float]` |
+| Embedding exports | `embed_user` / `embed_users(path)` (mean-pooled hidden states), `embed_items()` (item table) |
+
+**When to pick it.** Catalogs where users discover titles long after
+release and in no particular order (anime, back-catalog film), and
+when you want a dense per-user taste vector. On its own it has no side
+features; the intended deployment is the **hybrid** in
+`kzn_recsys/hybrid_train.py`: BERT4Rec user embeddings become
+`bert_emb_*` user features, PCA-reduced knowledge-graph item embeddings
+become `kg_emb_*` item features, and EASE's closed-form solve plus
+serving stack produce the final recommendations.
+
 ## Mixing models
 
 The `ModelRegistry` is now generic over `&dyn RecModel`, so a single
@@ -104,6 +133,14 @@ in this crate default to or where the included tests succeed.
 - **Two-Tower**: `embedding_dim=32, temperature=0.05,
   learning_rate=0.01, epochs=50, batch_size=256, id_dropout=0.1`. Tune
   with `kzn_recsys.grid_search_two_tower`.
+- **BERT4Rec**: `embedding_dim=64, num_heads=4, num_layers=2,
+  dropout=0.1, mask_ratio=0.2, max_seq_len=200, num_position_buckets=32,
+  learning_rate=1e-3, batch_size=64, num_epochs=50, patience=5`
+  (`kzn_recsys/cr_config.py`). `embedding_dim` ∈ {32, 64, 128, 256}
+  is the main knob: it is also the width of the user vector fed into
+  EASE, so larger values grow the hybrid's Gram matrix. There is no
+  `grid_search_bert4rec` yet; sweep by hand or via the hybrid's
+  evaluation report.
 
-For all three, k-fold CV is user-based; metric optimization target is
+For the three searchable models, k-fold CV is user-based; metric optimization target is
 NDCG@k (default `k=10`). `RAYON_NUM_THREADS` caps trial parallelism.

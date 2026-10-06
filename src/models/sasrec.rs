@@ -773,6 +773,9 @@ impl RecModel for TrainedSasRec {
             ModelInput::TowerUser { .. } => Err(anyhow::anyhow!(
                 "SASRec does not support ModelInput::TowerUser; expected ModelInput::Sequence"
             )),
+            ModelInput::MaskedHistory { .. } => Err(anyhow::anyhow!(
+                "SASRec does not support ModelInput::MaskedHistory; expected ModelInput::Sequence"
+            )),
         }
     }
 

@@ -204,8 +204,10 @@ pub fn build_sequences(
 /// Read a Parquet or CSV interactions file into a DataFrame.
 ///
 /// Mirrors `data_pipeline::read_lazyframe` so the two paths accept the
-/// same files; kept local to keep that module's API private.
-fn read_interactions(path_str: &str) -> Result<DataFrame> {
+/// same files; kept local to keep that module's API private. Shared with
+/// `data::masked_sequences` (BERT4Rec) so both sequence paths accept
+/// exactly the same inputs.
+pub(crate) fn read_interactions(path_str: &str) -> Result<DataFrame> {
     let path = Path::new(path_str);
     match path.extension().and_then(|s| s.to_str()) {
         Some("parquet") => Ok(ParquetReader::new(std::fs::File::open(path)?).finish()?),

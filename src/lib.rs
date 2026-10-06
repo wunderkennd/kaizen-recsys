@@ -485,6 +485,7 @@ impl FeaseModel {
             ModelKind::Ease => "ease",
             ModelKind::SasRec => "sasrec",
             ModelKind::TwoTower => "two_tower",
+            ModelKind::Bert4Rec => "bert4rec",
         };
 
         let d = PyDict::new(py);
@@ -925,6 +926,15 @@ impl ModelRegistry {
             .register_model(territory, Box::new(model.model.clone()));
     }
 
+    /// Registers a trained BERT4Rec model for a territory (#96).
+    /// Mirrors `register` (EASE) but for `Bert4RecModel`. Available
+    /// only when the extension is built with `--features ml-models`.
+    #[cfg(feature = "ml-models")]
+    fn register_bert4rec(&mut self, territory: String, model: &bert4rec_py::Bert4RecModel) {
+        self.inner
+            .register_model(territory, Box::new(model.model.clone()));
+    }
+
     /// Predicts top-K items for an EASE territory using string ids
     /// (#56). Mirrors `FeaseModel.predict`'s API surface so callers no
     /// longer have to map `dict[str, float]` to integer indices by
@@ -977,6 +987,31 @@ impl ModelRegistry {
     ) -> PyResult<Vec<(String, f64)>> {
         self.inner
             .predict_top_k_sasrec(territory, &history, top_k)
+            .map(|ranked| ranked.into_iter().map(|(i, s)| (i, s as f64)).collect())
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))
+    }
+
+    /// Predicts top-K items for a BERT4Rec territory using string ids
+    /// (#96). `history` is the user's item-id list, oldest first;
+    /// optional `days_ago` is parallel to it and is bucketed exactly as
+    /// at training time (omit it to treat every item as "now"). Same
+    /// conventions as `Bert4RecModel.predict`. Unknown item ids are
+    /// silently skipped.
+    ///
+    /// Errors:
+    ///     ValueError: territory is unknown, the registered model is
+    ///         not BERT4Rec, or `days_ago` and `history` differ in length.
+    #[cfg(feature = "ml-models")]
+    #[pyo3(signature = (territory, history, days_ago=None, top_k=100))]
+    fn predict_top_k_bert4rec(
+        &self,
+        territory: &str,
+        history: Vec<String>,
+        days_ago: Option<Vec<f64>>,
+        top_k: usize,
+    ) -> PyResult<Vec<(String, f64)>> {
+        self.inner
+            .predict_top_k_bert4rec(territory, &history, days_ago.as_deref(), top_k)
             .map(|ranked| ranked.into_iter().map(|(i, s)| (i, s as f64)).collect())
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))
     }
@@ -1914,6 +1949,392 @@ mod sasrec_py {
     }
 }
 
+// --- BERT4Rec PyO3 surface (ml-models feature, #96) -----------------------
+//
+// Mirrors `SASRecModel` (predict / evaluate / save / load) and adds the
+// embedding extractors (`embed_user` / `embed_users` / `embed_items`) the
+// hybrid BERT4Rec → FEASE pipeline (`kzn_recsys/hybrid_train.py`) is built
+// on. Gated on `ml-models` so the default EASE-only build neither pulls
+// burn nor exposes these symbols.
+
+#[cfg(feature = "ml-models")]
+mod bert4rec_py {
+    use super::*;
+    use crate::data::days_ago_to_log2_bucket;
+    use crate::data::masked_sequences::build_masked_sequences;
+    use crate::models::bert4rec::{
+        Bert4RecConfig, Bert4RecTrainingConfig, TrainedBert4Rec, train_bert4rec,
+    };
+    use crate::models::{ModelInput, RecModel};
+    use burn::backend::ndarray::NdArrayDevice;
+    use burn::backend::{Autodiff, NdArray};
+
+    /// A trained BERT4Rec model, callable from Python.
+    #[pyclass]
+    pub struct Bert4RecModel {
+        // `pub(crate)` so `ModelRegistry::register_bert4rec` (sibling
+        // module in lib.rs) can clone the underlying model into the
+        // trait-object registry.
+        pub(crate) model: TrainedBert4Rec,
+        #[pyo3(get)]
+        num_items: usize,
+        #[pyo3(get)]
+        embedding_dim: usize,
+        #[pyo3(get)]
+        max_seq_len: usize,
+        #[pyo3(get)]
+        num_position_buckets: usize,
+    }
+
+    impl Bert4RecModel {
+        fn wrap(model: TrainedBert4Rec) -> Self {
+            let num_items = RecModel::num_items(&model);
+            let embedding_dim = model.embedding_dim();
+            let max_seq_len = model.config_max_seq_len();
+            let num_position_buckets = model.num_position_buckets();
+            Self {
+                model,
+                num_items,
+                embedding_dim,
+                max_seq_len,
+                num_position_buckets,
+            }
+        }
+
+        /// Translate a Python `history` (+ optional parallel `days_ago`)
+        /// into catalog indices and recency buckets, skipping unknown ids.
+        fn resolve_history(
+            &self,
+            history: &Bound<'_, PyList>,
+            days_ago: Option<&Vec<f64>>,
+        ) -> PyResult<(Vec<usize>, Vec<usize>)> {
+            if let Some(d) = days_ago
+                && d.len() != history.len()
+            {
+                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                    "days_ago has {} entries but history has {}",
+                    d.len(),
+                    history.len()
+                )));
+            }
+            let map = self.model.item_mapping();
+            let mut hist_idx = Vec::with_capacity(history.len());
+            let mut positions = Vec::with_capacity(history.len());
+            for (k, obj) in history.iter().enumerate() {
+                let id: String = obj.extract()?;
+                if let Some(&idx) = map.item_to_idx.get(&id) {
+                    hist_idx.push(idx);
+                    positions.push(days_ago.map(|d| days_ago_to_log2_bucket(d[k])).unwrap_or(0));
+                }
+            }
+            Ok((hist_idx, positions))
+        }
+    }
+
+    #[pymethods]
+    impl Bert4RecModel {
+        /// Score recommendations from a user's history.
+        ///
+        /// Args:
+        ///     history (list[str]): Item ids, oldest first. Unknown ids
+        ///         are skipped.
+        ///     days_ago (list[float], optional): Parallel to `history`;
+        ///         converted to the same log2 recency buckets the model
+        ///         trained on. Omit to treat every item as "now".
+        ///     top_k (int): Number of recommendations to return.
+        ///
+        /// Returns:
+        ///     list[tuple[str, float]]: (item_id, score), descending,
+        ///     excluding items already in `history`.
+        #[pyo3(signature = (history, days_ago=None, top_k=100))]
+        fn predict<'py>(
+            &self,
+            py: Python<'py>,
+            history: &Bound<'_, PyList>,
+            days_ago: Option<Vec<f64>>,
+            top_k: usize,
+        ) -> PyResult<Bound<'py, PyList>> {
+            let (hist_idx, positions) = self.resolve_history(history, days_ago.as_ref())?;
+
+            let scores = self
+                .model
+                .predict_scores(ModelInput::MaskedHistory {
+                    history: &hist_idx,
+                    positions: &positions,
+                })
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+
+            let seen: HashSet<usize> = hist_idx.iter().copied().collect();
+            let mut ranked: Vec<(usize, f32)> = scores
+                .into_iter()
+                .enumerate()
+                .filter(|(idx, _)| !seen.contains(idx))
+                .collect();
+            ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+            let out = PyList::empty(py);
+            let map = self.model.item_mapping();
+            for (idx, score) in ranked.into_iter().take(top_k) {
+                if let Some(guid) = map.idx_to_item.get(idx) {
+                    out.append((PyString::new(py, guid), PyFloat::new(py, score as f64)))?;
+                }
+            }
+            Ok(out)
+        }
+
+        /// Dense user embedding for one history: the unmasked history
+        /// is encoded and the hidden states mean-pooled over real
+        /// (non-pad) positions. Returns `embedding_dim` floats; an
+        /// empty / fully-unknown history returns all zeros.
+        #[pyo3(signature = (history, days_ago=None))]
+        fn embed_user(
+            &self,
+            history: &Bound<'_, PyList>,
+            days_ago: Option<Vec<f64>>,
+        ) -> PyResult<Vec<f32>> {
+            let (hist_idx, positions) = self.resolve_history(history, days_ago.as_ref())?;
+            Ok(self.model.embed_user(&hist_idx, &positions))
+        }
+
+        /// Batch user-embedding extraction from an interactions file
+        /// (`user_id`, `item_id`, **`days_ago`** — Parquet or CSV).
+        ///
+        /// Returns:
+        ///     dict[str, list[float]]: `user_id -> embedding_dim floats`
+        ///     for every user with at least one in-catalog interaction.
+        fn embed_users<'py>(
+            &self,
+            py: Python<'py>,
+            interactions_path: &str,
+        ) -> PyResult<Bound<'py, PyDict>> {
+            let embeddings = self
+                .model
+                .embed_users_batch(interactions_path)
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?;
+            let out = PyDict::new(py);
+            for (user, vec) in embeddings {
+                out.set_item(user, vec)?;
+            }
+            Ok(out)
+        }
+
+        /// The learned item-embedding table.
+        ///
+        /// Returns:
+        ///     dict[str, list[float]]: `item_id -> embedding_dim floats`.
+        fn embed_items<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+            let out = PyDict::new(py);
+            let map = self.model.item_mapping();
+            for (idx, row) in self.model.embed_items().into_iter().enumerate() {
+                if let Some(guid) = map.idx_to_item.get(idx) {
+                    out.set_item(guid, row)?;
+                }
+            }
+            Ok(out)
+        }
+
+        /// Top-K items most similar to `item_id` by item-embedding cosine.
+        #[pyo3(signature = (item_id, top_k=20))]
+        fn predict_similar_items<'py>(
+            &self,
+            py: Python<'py>,
+            item_id: &str,
+            top_k: usize,
+        ) -> PyResult<Bound<'py, PyList>> {
+            let out = PyList::empty(py);
+            let map = self.model.item_mapping();
+            let Some(&idx) = map.item_to_idx.get(item_id) else {
+                return Ok(out);
+            };
+            let sim = self
+                .model
+                .predict_similar_items(idx, top_k)
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            for (i, score) in sim {
+                if let Some(guid) = map.idx_to_item.get(i) {
+                    out.append((PyString::new(py, guid), PyFloat::new(py, score as f64)))?;
+                }
+            }
+            Ok(out)
+        }
+
+        /// Self-check the model state. Returns `(passed, messages)`.
+        fn validate<'py>(&self, py: Python<'py>) -> PyResult<(bool, Bound<'py, PyList>)> {
+            let report = self.model.validate();
+            Ok((report.passed, PyList::new(py, &report.messages)?))
+        }
+
+        /// Evaluate against test interactions via the generalized
+        /// `&dyn RecModel` harness (same metrics dict as `FeaseModel`).
+        /// The train file must carry `days_ago` so each user's history
+        /// can be ordered and bucketed.
+        #[pyo3(signature = (test_interactions_path, train_interactions_path, k_values=None))]
+        fn evaluate<'py>(
+            &self,
+            py: Python<'py>,
+            test_interactions_path: &str,
+            train_interactions_path: &str,
+            k_values: Option<Vec<usize>>,
+        ) -> PyResult<Bound<'py, PyDict>> {
+            let config = evaluation::EvalConfig {
+                k_values: k_values.unwrap_or_else(|| vec![5, 10, 20, 50]),
+            };
+            let report = evaluation::evaluate_model(
+                &self.model,
+                test_interactions_path,
+                train_interactions_path,
+                None,
+                &config,
+            )
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+
+            let result = PyDict::new(py);
+            result.set_item("num_users", report.num_users)?;
+            result.set_item("num_interactions", report.num_interactions)?;
+            result.set_item("coverage", report.coverage)?;
+            let metrics_list = PyList::empty(py);
+            for m in &report.metrics_at_k {
+                let d = PyDict::new(py);
+                d.set_item("k", m.k)?;
+                d.set_item("precision", m.precision)?;
+                d.set_item("recall", m.recall)?;
+                d.set_item("ndcg", m.ndcg)?;
+                d.set_item("map", m.map)?;
+                d.set_item("hit_rate", m.hit_rate)?;
+                metrics_list.append(d)?;
+            }
+            result.set_item("metrics", metrics_list)?;
+            Ok(result)
+        }
+
+        /// Persist the model to `path` (framed `FB4R` format).
+        fn save(&self, path: String) -> PyResult<()> {
+            self.model
+                .save(Path::new(&path))
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))
+        }
+    }
+
+    /// Train a BERT4Rec model from a long-format interactions file.
+    ///
+    /// The interactions file must carry a numeric `days_ago` column:
+    /// it orders each user's history and is log2-bucketed into the
+    /// model's relative-recency positions (the data path fails loudly
+    /// otherwise).
+    ///
+    /// Args:
+    ///     interactions_path (str): Parquet/CSV with `user_id`,
+    ///         `item_id`, `value`, `days_ago`.
+    ///     embedding_dim, num_heads, num_layers, dropout: architecture
+    ///         (`embedding_dim` must be divisible by `num_heads`).
+    ///     max_seq_len: history length.
+    ///     num_position_buckets: size of the log2 `days_ago` table.
+    ///     mask_ratio: share of positions masked per training sequence.
+    ///     num_epochs, batch_size, learning_rate, patience, seed: training.
+    ///
+    /// Returns:
+    ///     Bert4RecModel
+    #[pyfunction]
+    #[pyo3(signature = (
+        interactions_path,
+        embedding_dim = 64,
+        max_seq_len = 200,
+        num_position_buckets = 32,
+        num_heads = 4,
+        num_layers = 2,
+        dropout = 0.1,
+        mask_ratio = 0.2,
+        num_epochs = 50,
+        batch_size = 64,
+        learning_rate = 1e-3,
+        patience = 5,
+        seed = 42
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_and_train_bert4rec(
+        interactions_path: String,
+        embedding_dim: usize,
+        max_seq_len: usize,
+        num_position_buckets: usize,
+        num_heads: usize,
+        num_layers: usize,
+        dropout: f64,
+        mask_ratio: f64,
+        num_epochs: usize,
+        batch_size: usize,
+        learning_rate: f64,
+        patience: usize,
+        seed: u64,
+    ) -> PyResult<Bert4RecModel> {
+        let mappings = data_pipeline::build_interaction_mappings(&interactions_path)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?;
+
+        // vocab = catalog items + reserved PAD + MASK (see data::masked_sequences).
+        let vocab_size = mappings.idx_to_item.len() + 2;
+        let model_config = Bert4RecConfig::new(vocab_size, max_seq_len, num_heads, num_layers)
+            .with_embedding_dim(embedding_dim)
+            .with_num_position_buckets(num_position_buckets)
+            .with_dropout(dropout)
+            .with_mask_ratio(mask_ratio);
+        model_config
+            .check()
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?;
+
+        let dataset = build_masked_sequences(
+            &interactions_path,
+            &mappings,
+            max_seq_len,
+            mask_ratio,
+            num_position_buckets,
+            seed,
+        )
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?;
+
+        let train_config = Bert4RecTrainingConfig::new()
+            .with_num_epochs(num_epochs)
+            .with_batch_size(batch_size)
+            .with_learning_rate(learning_rate)
+            .with_patience(patience)
+            .with_seed(seed);
+
+        let device = NdArrayDevice::default();
+        let fitted = train_bert4rec::<Autodiff<NdArray<f32>>>(
+            &model_config,
+            &train_config,
+            &dataset,
+            &device,
+        )
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+
+        let trained = TrainedBert4Rec::new(fitted, model_config, mappings);
+        let report = trained.validate();
+        if !report.passed {
+            let msg = format!(
+                "BERT4Rec model validation failed:\n{}",
+                report.messages.join("\n")
+            );
+            return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(msg));
+        }
+        Ok(Bert4RecModel::wrap(trained))
+    }
+
+    /// Load a BERT4Rec model previously written by `Bert4RecModel.save`.
+    #[pyfunction]
+    pub fn load_bert4rec_model(path: String) -> PyResult<Bert4RecModel> {
+        let model = TrainedBert4Rec::load_from(Path::new(&path))
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyIOError, _>(e.to_string()))?;
+        let report = model.validate();
+        if !report.passed {
+            let msg = format!(
+                "Loaded BERT4Rec model failed validation:\n{}",
+                report.messages.join("\n")
+            );
+            return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(msg));
+        }
+        Ok(Bert4RecModel::wrap(model))
+    }
+}
+
 /// Two-Tower Python wrapper. Compiled only with the `ml-models` feature
 /// because the underlying model depends on `burn`.
 ///
@@ -2394,6 +2815,9 @@ fn _native(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
         )?)?;
         m.add_function(wrap_pyfunction!(two_tower_py::load_two_tower_model, m)?)?;
         m.add_class::<two_tower_py::TwoTowerModel>()?;
+        m.add_function(wrap_pyfunction!(bert4rec_py::build_and_train_bert4rec, m)?)?;
+        m.add_function(wrap_pyfunction!(bert4rec_py::load_bert4rec_model, m)?)?;
+        m.add_class::<bert4rec_py::Bert4RecModel>()?;
     }
 
     Ok(())

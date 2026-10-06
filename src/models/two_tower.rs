@@ -1183,6 +1183,9 @@ impl RecModel for TrainedTwoTower {
             ModelInput::Sequence { .. } => Err(anyhow!(
                 "Two-Tower does not support ModelInput::Sequence; expected ModelInput::TowerUser"
             )),
+            ModelInput::MaskedHistory { .. } => Err(anyhow!(
+                "Two-Tower does not support ModelInput::MaskedHistory; expected ModelInput::TowerUser"
+            )),
         }
     }
 
