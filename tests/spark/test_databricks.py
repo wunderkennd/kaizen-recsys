@@ -90,3 +90,21 @@ def test_feature_engineering_preserves_optional_columns(spark):
     # empty feature columns should return the correct schema
     assert users.columns == ["user_id", "feature_name", "value"]
     assert users.count() == 0
+
+
+def test_make_synthetic_covers_non_divisible_catalog_and_cold_users(spark):
+    # 30 items over 4 personas: floor-sized slices would leave items 28-29
+    # without any interactions. The slices must tile the whole catalog.
+    inter, users, items = make_synthetic(spark, n_users=40, n_items=30,
+                                         n_personas=4, avg_interactions=10,
+                                         n_cold_users=3, seed=3)
+    interacted = {r.item_id for r in inter.select("item_id").distinct().collect()}
+    catalog = {r.item_id for r in items.select("item_id").distinct().collect()}
+    assert interacted == catalog
+
+    # cold-start users carry a persona feature but no interactions
+    warm = {r.user_id for r in inter.select("user_id").distinct().collect()}
+    featured = {r.user_id for r in users.select("user_id").distinct().collect()}
+    assert len(warm) == 40
+    assert len(featured) == 43
+    assert featured - warm == {"user_00040", "user_00041", "user_00042"}

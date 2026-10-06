@@ -1,6 +1,6 @@
 # Databricks Spark Notebooks Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Progress is tracked in GitHub Issues, not in this file.
 
 **Goal:** Ship an end-to-end Databricks Asset Bundle that runs the pure-Python `kzn_recsys.spark` EASE pipeline (ingest → feature-engineer → train → tune → evaluate → predict) as a 4-task Job, with MLflow logging and a Delta predictions sink.
 

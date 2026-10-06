@@ -35,31 +35,41 @@ _GENRES = ["action", "drama", "comedy", "romance", "thriller", "slice_of_life"]
 
 def make_synthetic(spark: SparkSession, *, n_users: int = 200, n_items: int = 60,
                    n_personas: int = 4, avg_interactions: int = 15,
+                   n_cold_users: int = 0,
                    seed: int = 42) -> tuple[DataFrame, DataFrame, DataFrame]:
     """Generate deterministic synthetic long-format tables with persona structure.
 
     Each persona prefers a contiguous slice of the catalog, so EASE has real
-    co-occurrence signal to learn. All randomness is seeded in Python and
-    handed to spark.createDataFrame for determinism.
+    co-occurrence signal to learn. The persona slices tile the whole catalog,
+    so every item can receive interactions even when ``n_items`` is not a
+    multiple of ``n_personas``. ``n_cold_users`` appends feature-only users
+    (a persona feature, no interactions) to exercise the cold-start path.
+    All randomness is seeded in Python and handed to spark.createDataFrame
+    for determinism.
     """
     rng = random.Random(seed)
 
     # Assign each item a genre and each persona a preferred item slice.
     item_ids = [f"item_{i:04d}" for i in range(n_items)]
     item_genre = {iid: _GENRES[i % len(_GENRES)] for i, iid in enumerate(item_ids)}
-    slice_size = max(1, n_items // n_personas)
+
+    def _pool(persona: int) -> list:
+        lo = persona * n_items // n_personas
+        hi = (persona + 1) * n_items // n_personas
+        return item_ids[lo:hi] or item_ids
 
     inter_rows, user_rows = [], []
     for u in range(n_users):
         uid = f"user_{u:05d}"
         persona = u % n_personas
         user_rows.append((uid, f"persona={persona}", 1.0))
-        lo = persona * slice_size
-        hi = min(n_items, lo + slice_size)
-        pool = item_ids[lo:hi] or item_ids
+        pool = _pool(persona)
         k = min(len(pool), max(1, avg_interactions))
         for iid in rng.sample(pool, k):
             inter_rows.append((uid, iid, 1.0))
+    for c in range(n_cold_users):
+        uid = f"user_{n_users + c:05d}"
+        user_rows.append((uid, f"persona={c % n_personas}", 1.0))
 
     item_rows = [(iid, f"genre={item_genre[iid]}", 1.0) for iid in item_ids]
 

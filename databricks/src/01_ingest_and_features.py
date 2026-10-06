@@ -19,16 +19,26 @@ schema = dbutils.widgets.get("schema")
 data_mode = dbutils.widgets.get("data_mode")
 
 # COMMAND ----------
+import re
 from kzn_recsys.spark import make_synthetic, feature_engineering
 
-spark.sql(f"CREATE CATALOG IF NOT EXISTS {catalog}")
-spark.sql(f"CREATE SCHEMA IF NOT EXISTS {catalog}.{schema}")
+# catalog/schema are interpolated into SQL below: accept plain identifiers only.
+_IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+for name, value in (("catalog", catalog), ("schema", schema)):
+    if not _IDENT.match(value):
+        raise ValueError(f"{name}={value!r} is not a plain SQL identifier")
+
+spark.sql(f"CREATE CATALOG IF NOT EXISTS `{catalog}`")
+spark.sql(f"CREATE SCHEMA IF NOT EXISTS `{catalog}`.`{schema}`")
 
 if data_mode == "synthetic":
+    n_users = int(dbutils.widgets.get("n_users"))
     interactions, users, items = make_synthetic(
         spark,
-        n_users=int(dbutils.widgets.get("n_users")),
+        n_users=n_users,
         n_items=int(dbutils.widgets.get("n_items")),
+        # a few feature-only users so the predict task exercises cold-start
+        n_cold_users=max(1, n_users // 100),
         seed=int(dbutils.widgets.get("seed")),
     )
 else:
@@ -37,9 +47,13 @@ else:
     # Adjust these column names to your raw schema. Documented contract:
     #   engagement: user_id, item_id, value (+ optional event_type, days_ago) + user feature cols
     #   metadata:   item_id + item feature cols
+    # Optional columns pass through when present: event_type feeds weighting,
+    # days_ago enables the temporal split in the evaluate task.
     interactions, users, items = feature_engineering(
         engagement, metadata,
         user_col="user_id", item_col="item_id", value_col="value",
+        event_type_col="event_type" if "event_type" in engagement.columns else None,
+        days_ago_col="days_ago" if "days_ago" in engagement.columns else None,
         user_feature_cols=[c for c in engagement.columns
                            if c.startswith("user_") and c != "user_id"],
         item_feature_cols=[c for c in metadata.columns if c != "item_id"],

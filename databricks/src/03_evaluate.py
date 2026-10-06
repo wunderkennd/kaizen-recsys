@@ -57,6 +57,12 @@ else:
     with mlflow.start_run():
         mlflow.log_metrics(metrics)
 
+# An empty holdout reports NDCG 0.0 over zero users; that is "not evaluated",
+# not "passed", so fail before the threshold comparison.
+assert report["num_users"] > 0 and report["num_interactions"] > 0, (
+    f"empty holdout (num_users={report['num_users']}, "
+    f"num_interactions={report['num_interactions']}); nothing evaluated, failing task."
+)
 assert row["ndcg"] >= ndcg_gate, (
     f"NDCG@{k}={row['ndcg']:.4f} below gate {ndcg_gate}; failing task."
 )

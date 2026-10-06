@@ -26,7 +26,18 @@ run_id = _tv("train", "mlflow_run_id", "")
 
 # COMMAND ----------
 from pyspark.sql import Row
+from pyspark.sql.types import (
+    DoubleType, IntegerType, StringType, StructField, StructType,
+)
 from kzn_recsys.spark import load_model
+
+PREDICTIONS_SCHEMA = StructType([
+    StructField("user_id", StringType(), False),
+    StructField("rank", IntegerType(), False),
+    StructField("item_id", StringType(), False),
+    StructField("score", DoubleType(), False),
+    StructField("run_id", StringType(), True),
+])
 
 model = load_model(model_path)
 interactions = spark.table(f"{catalog}.{schema}.kzn_interactions")
@@ -47,7 +58,9 @@ for uid in sorted(set(hist) | set(feats)):
         rows.append(Row(user_id=uid, rank=rank, item_id=item_id, score=float(score), run_id=run_id))
 
 # COMMAND ----------
-preds = spark.createDataFrame(rows)
+# Explicit schema: Spark cannot infer one from an empty list, and every
+# recommendation can legitimately be empty (e.g. all users saw the whole catalog).
+preds = spark.createDataFrame(rows, PREDICTIONS_SCHEMA)
 sink = f"{catalog}.{schema}.kzn_predictions"
 preds.write.mode("overwrite").option("overwriteSchema", "true").saveAsTable(sink)
 print(f"wrote {sink}: {preds.count()} recommendations")
