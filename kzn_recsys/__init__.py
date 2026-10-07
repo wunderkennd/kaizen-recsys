@@ -23,10 +23,12 @@ try:  # The compiled Rust extension is absent in pure-Python (e.g. Spark) instal
         random_split,
         temporal_split,
         leave_k_out_split,
+        leave_last_k_out_split,
     )
     from kzn_recsys.fease_wrapper import (
         SplitResult,
         leave_k_out_split_safe,
+        leave_last_k_out_split_safe,
         random_split_safe,
         temporal_split_safe,
     )
@@ -97,10 +99,12 @@ if _HAS_NATIVE:
         "random_split",
         "temporal_split",
         "leave_k_out_split",
+        "leave_last_k_out_split",
         "SplitResult",
         "random_split_safe",
         "temporal_split_safe",
         "leave_k_out_split_safe",
+        "leave_last_k_out_split_safe",
     ]
 
 if _HAS_ML_MODELS:

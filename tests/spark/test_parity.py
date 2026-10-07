@@ -103,3 +103,56 @@ def test_pyspark_saved_model_loads_in_native(spark, tmp_path):
     for item_id in py_recs:
         if item_id in shared:
             assert abs(py_recs[item_id] - native_recs[item_id]) < 1e-5
+
+
+def test_availability_report_matches_native(spark, tmp_path):
+    """Rust and Spark harnesses agree on an availability-filtered report."""
+    import polars as pl
+    train_rows = [("u1", "A", 1.0, 50.0), ("u2", "A", 1.0, 50.0),
+                  ("u3", "A", 1.0, 50.0), ("u3", "B", 1.0, 40.0), ("u3", "C", 1.0, 30.0),
+                  ("u4", "A", 1.0, 50.0), ("u4", "B", 1.0, 40.0)]
+    test_rows = [("u1", "C", 1.0, 5.0), ("u2", "B", 1.0, 0.5), ("u2", "C", 1.0, 3.0)]
+    av_rows = [("A", "*", 100.0, None), ("B", "*", 1.0, None), ("C", "US", 400.0, 300.0), ("C", "US", 20.0, None)]
+    uf_rows = [("u1", "region_US", 1.0), ("u2", "region_EMEA", 1.0)]
+    icols = {"user_id": pl.String, "item_id": pl.String, "value": pl.Float64, "days_ago": pl.Float64}
+    acols = {"item_id": pl.String, "territory": pl.String,
+             "available_from_days_ago": pl.Float64, "available_to_days_ago": pl.Float64}
+    train_p = _write_long_parquet(train_rows, icols, tmp_path, "train.parquet")
+    test_p = _write_long_parquet(test_rows, icols, tmp_path, "test.parquet")
+    av_p = _write_long_parquet(av_rows, acols, tmp_path, "av.parquet")
+    uf_p = _write_long_parquet(uf_rows, ["user_id", "feature_name", "value"], tmp_path, "uf.parquet")
+    t_p = _write_long_parquet([], ["item_id", "feature_name", "value"], tmp_path, "t.parquet")
+
+    native = _native.build_and_train(interactions_path=train_p, user_features_path=uf_p,
+                                     item_features_path=t_p, alpha=1.0, beta=1.0, lambda_=1.0)
+    native_report = native.evaluate(test_p, train_p, user_features_path=uf_p, k_values=[1, 2],
+                                    availability_path=av_p, user_territory_feature="region")
+
+    from kzn_recsys.spark import build_and_train as spark_train
+    ischema = "user_id string, item_id string, value double, days_ago double"
+    train_df = spark.createDataFrame(train_rows, ischema)
+    test_df = spark.createDataFrame(test_rows, ischema)
+    av_df = spark.createDataFrame(
+        av_rows, "item_id string, territory string, available_from_days_ago double, available_to_days_ago double")
+    uf_df = spark.createDataFrame(uf_rows, ["user_id", "feature_name", "value"])
+    t_df = spark.createDataFrame([], "item_id string, feature_name string, value double")
+    spark_model = spark_train(train_df, uf_df, t_df, alpha=1.0, beta=1.0, lambda_=1.0)
+    spark_report = spark_model.evaluate(test_df, train_df, uf_df, k_values=[1, 2],
+                                        availability_df=av_df, user_territory_feature="region")
+
+    for key in ("num_users", "num_interactions"):
+        assert native_report[key] == spark_report[key], key
+    assert abs(native_report["coverage"] - spark_report["coverage"]) < 1e-9
+    for n, s in zip(native_report["metrics"], spark_report["metrics"]):
+        assert n["k"] == s["k"]
+        for name in ("precision", "recall", "ndcg", "map", "hit_rate"):
+            assert abs(n[name] - s[name]) < 1e-6, (n["k"], name)
+    na, sa = native_report["availability"], spark_report["availability"]
+    for key in ("reference_days_ago", "num_eligible_items", "num_items_without_availability",
+                "num_test_interactions_dropped", "num_users_skipped"):
+        assert na[key] == sa[key], key
+    assert [b["label"] for b in na["item_age_buckets"]] == [b["label"] for b in sa["item_age_buckets"]]
+    for nb, sb in zip(na["item_age_buckets"], sa["item_age_buckets"]):
+        assert nb["num_users"] == sb["num_users"], nb["label"]
+        for n, s in zip(nb["metrics"], sb["metrics"]):
+            assert abs(n["ndcg"] - s["ndcg"]) < 1e-6

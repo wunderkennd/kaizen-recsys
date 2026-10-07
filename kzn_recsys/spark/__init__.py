@@ -7,7 +7,13 @@ from kzn_recsys.spark.ease_core import EaseParams
 from kzn_recsys.spark.feas_codec import WeightingConfig
 from kzn_recsys.spark.model import SparkEaseModel, build_and_train, load_model
 from kzn_recsys.spark.tuning import grid_search, random_search
-from kzn_recsys.spark.splits import random_split, temporal_split, leave_k_out_split
+from kzn_recsys.spark.splits import (
+    random_split,
+    temporal_split,
+    leave_k_out_split,
+    leave_last_k_out_split,
+)
+from kzn_recsys.spark.availability import AvailabilityTable
 from kzn_recsys.spark.metrics import (
     precision_at_k,
     recall_at_k,
@@ -29,6 +35,8 @@ __all__ = [
     "random_split",
     "temporal_split",
     "leave_k_out_split",
+    "leave_last_k_out_split",
+    "AvailabilityTable",
     "precision_at_k",
     "recall_at_k",
     "ndcg_at_k",

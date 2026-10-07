@@ -14,6 +14,10 @@ variables:
   strategy:     { default: collect }     # collect | distributed
   do_tune:      { default: "false" }
   days_ago_cutoff: { default: "7.0" }
+  split:        { default: temporal }    # temporal | leave_last_k | random
+  holdout_k:    { default: "1" }         # leave_last_k only
+  availability_table:     { default: "" }  # optional: availability-aware evaluation (#101)
+  user_territory_feature: { default: "" }  # optional: one-hot user-feature column for territory
   raw_engagement_table: { default: "" }  # used when data_mode=delta
   raw_metadata_table:   { default: "" }
 

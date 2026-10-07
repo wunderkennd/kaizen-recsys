@@ -99,8 +99,10 @@ src/weighting.rs     — Event-type weights, temporal decay, IPS reweighting con
     ↓
 src/model.rs         — Core EASE algorithm: block Gram matrix, inversion, S-matrix, sparsity pruning
     ↓
-src/evaluation.rs    — Train/test splitting (random, temporal, leave-K-out),
-                       generic evaluate_model harness over &dyn RecModel
+src/evaluation.rs    — Train/test splitting (random, temporal, leave-K-out,
+                       leave-last-K-out), generic evaluate_model harness over
+                       &dyn RecModel; evaluation/availability.rs holds the
+                       availability table + per-user eligible-set logic (#101)
 src/tuning.rs        — SearchSpace + FoldEvaluator traits; strategy-driven `tune_with`
                        runner (grid / random / TPE) generic over any model's params;
                        per-model schemas (HyperParams / SasRecParams / TwoTowerParams /
@@ -133,7 +135,7 @@ src/data_validation.rs — GaussianAnomalyDetector for pre-training data quality
 - **`data/triples.rs`**: Load `(user_idx, item_idx)` positive pairs (`TripleData`) and `FeatureTable` (categorical + dense per entity) for Two-Tower. Reserves a cold-start user row at index 0.
 - **`data_pipeline.rs`**: Long-format Parquet/CSV → sparse CSR matrices + string↔index mappings (EASE path). Hooks for weighting transforms.
 - **`weighting.rs`**: `WeightingConfig` struct + functions: `apply_event_weights()`, `apply_temporal_decay()`, `apply_ips()`.
-- **`evaluation.rs`**: `random_split()`, `temporal_split()`, `leave_k_out_split()` for data splitting; `evaluate_model()` harness generic over `&dyn RecModel`. Per-user input construction routes through the `EvalAdapter` trait (`EaseEvalAdapter` → `Sparse`; `SasRecEvalAdapter` → chronologically-sorted `Sequence`, requires `days_ago` in the train file; `TwoTowerEvalAdapter` → `TowerUser`; `Bert4RecEvalAdapter` → chronologically-sorted `MaskedHistory` with log₂ recency buckets, requires `days_ago`). `evaluate_with_adapter()` is the lower-level entrypoint used by tuning's per-fold scorer (#51).
+- **`evaluation.rs`**: `random_split()`, `temporal_split()`, `leave_k_out_split()`, `leave_last_k_out_split()` (each user's K most recently interacted distinct items, every row of each; deterministic, requires `days_ago`) for data splitting; `evaluate_model()` harness generic over `&dyn RecModel`. `EvalConfig.availability` (`AvailabilityConfig`, #101) restricts each user's ranking to items eligible at their reference time (global `reference_days_ago`, else per user the oldest held-out interaction over all of the user's test rows, from the test file's `days_ago`), drops ineligible relevants, scopes coverage to the eligible union, and adds an `AvailabilityReport` with item-age buckets; `None` is byte-identical to the legacy path. `evaluation/availability.rs`: `AvailabilityTable` (item → territory → windows in `days_ago` units, `*` = global, unlisted items ineligible), `load_user_territories` (one-hot `<column>=<value>` Spark-ingest and `<column>_<value>` `fease_train.py` conventions, `=` first). Per-user input construction routes through the `EvalAdapter` trait (`EaseEvalAdapter` → `Sparse`; `SasRecEvalAdapter` → chronologically-sorted `Sequence`, requires `days_ago` in the train file; `TwoTowerEvalAdapter` → `TowerUser`; `Bert4RecEvalAdapter` → chronologically-sorted `MaskedHistory` with log₂ recency buckets, requires `days_ago`). `evaluate_with_adapter()` is the lower-level entrypoint used by tuning's per-fold scorer (#51).
 - **`tuning.rs`**: `SearchSpace` (named `axes()` + `decode` / `encode` codecs; `combinations` / `sample_one` derived) and `FoldEvaluator<P>` traits; `ParamSchema` impls (`EaseSchema`, `SasRecSchema`, `TwoTowerSchema`, `Bert4RecSchema`) shared by the typed `*ParamGrid`s and the dict-driven `DynSpace<Schema>` (`EaseSpace`, …). `tune_with(evaluator, space, strategy, TuneConfig, warm_start)` is the one runner: folds once, then ask → parallel batch → observe (ADR-0005). `grid_search_with` / `random_search_with` are thin wrappers over it and stay byte-identical to their pre-#97 output. EASE keeps `grid_search()` / `random_search()` for callers. Per-model fold evaluators: `EaseFoldEvaluator`, `SasRecFoldEvaluator`, `TwoTowerFoldEvaluator`, `Bert4RecFoldEvaluator`; the sequence models score held-out users leave-last-out on their own history (`score_sequence_model_leave_last_out`) because folds are user-disjoint. Parallelized via rayon (ADR-0002).
 - **`tuning/space.rs`**: `Axis` (`Choice`, `Uniform`, `LogUniform`, `Int`, `LogInt`), `AxisSpec`, `ParamSpace` (validated, ordered; `combinations()` first-axis-outermost, `combinations_take(max_n, skip)` lazy enumeration, `contains()`, `sample_one()` axis-ordered `choose`), `Value`, `Assignment`.
 - **`tuning/strategy.rs`**: `SearchStrategy::propose(space, history, max_n, rng)`; `GridStrategy`, `RandomStrategy`, `TpeStrategy` (Parzen estimators per axis, Optuna-style bandwidths, Laplace-smoothed categoricals, `batch_size` proposals per round, dedup on finite spaces).
@@ -236,8 +238,12 @@ reads its logits; `predict(history, days_ago=None)` treats a missing
   with the learned cold-start prior instead of falling back to the bare
   prior. Unknown feature names are silently skipped.
 
-**Evaluation pipeline.** Three split strategies (random, temporal,
-leave-K-out) produce train/test Parquet files. The evaluation harness is
+**Evaluation pipeline.** Four split strategies (random, temporal,
+leave-K-out, leave-last-K-out) produce train/test Parquet files. With an
+availability table (`availability_path` on every model's `evaluate`,
+`availability_df` on the Spark mirror) the harness ranks only items
+eligible for the user at their reference time; a random split has no
+reference time and must not be combined with it. The evaluation harness is
 generic over `&dyn RecModel` and computes precision, recall, NDCG, MAP,
 hit rate at multiple K values, plus catalog coverage. All splits use
 sorted key iteration before RNG consumption to ensure deterministic

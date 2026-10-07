@@ -1,8 +1,18 @@
 //! Evaluation pipeline: train/test data splitting and model evaluation harness.
 //!
 //! Provides functions to split interaction data into train/test sets using various
-//! strategies (random, temporal, leave-K-out), and an evaluation harness that
-//! computes standard recommendation metrics on held-out data.
+//! strategies (random, temporal, leave-K-out, leave-last-K-out), and an evaluation
+//! harness that computes standard recommendation metrics on held-out data.
+//! With an availability table ([`availability`], issue #101) the harness ranks
+//! only the items each user could have been shown at their reference time.
+
+pub mod availability;
+
+pub use availability::{
+    AvailabilityConfig, AvailabilityReport, AvailabilityTable, AvailabilityWindow, ItemAgeBucket,
+};
+
+use availability::{age_bucket, bucket_bounds, load_user_territories};
 
 use crate::data_pipeline::Mappings;
 use crate::metrics;
@@ -18,6 +28,7 @@ use std::collections::HashSet;
 use std::fs::File;
 use std::ops::Not;
 use std::path::Path;
+use std::rc::Rc;
 
 /// Statistics returned by every split function.
 #[derive(Debug, Clone)]
@@ -33,6 +44,19 @@ pub struct SplitStats {
 pub struct EvalConfig {
     /// K values to evaluate at (e.g., [5, 10, 20, 50]).
     pub k_values: Vec<usize>,
+    /// Availability-aware evaluation (#101). `None` ranks the full
+    /// catalog (legacy behavior, byte-identical output).
+    pub availability: Option<AvailabilityConfig>,
+}
+
+impl EvalConfig {
+    /// Full-catalog evaluation at `k_values`.
+    pub fn new(k_values: Vec<usize>) -> Self {
+        Self {
+            k_values,
+            availability: None,
+        }
+    }
 }
 
 /// Results of evaluating a model on test data.
@@ -46,6 +70,10 @@ pub struct EvalReport {
     pub num_users: usize,
     /// Number of test interactions.
     pub num_interactions: usize,
+    /// Availability section (#101). `None` unless an availability table
+    /// was supplied, so reports without one serialize exactly as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub availability: Option<AvailabilityReport>,
 }
 
 /// Metrics computed at a specific K value.
@@ -292,9 +320,240 @@ pub fn leave_k_out_split(
     Ok(stats)
 }
 
+/// Leave-last-K-out: for each user, holds out the `k` most recently
+/// interacted **distinct items** (an item's recency is its most recent
+/// row) for test, moving *every* row of a held-out item to test. Users
+/// with fewer than `k + 1` distinct items go entirely to train.
+///
+/// This is the time-aware counterpart of [`leave_k_out_split`]: no RNG, no
+/// future interactions in a user's train context, and a well-defined
+/// per-user reference time (the oldest held-out interaction) for
+/// availability-aware evaluation (#101). Items rather than rows are held
+/// out because the harness excludes every train item from a user's
+/// candidate list: with event-level data, holding out only the latest row
+/// of a repeated item would leave that item in train and turn the hold-out
+/// into an impossible miss. Ties on `days_ago` are broken by file order
+/// (earlier row first). Requires a non-null numeric `days_ago` column and
+/// fails loudly without one.
+pub fn leave_last_k_out_split(
+    interactions_path: &str,
+    train_output: &str,
+    test_output: &str,
+    k: usize,
+) -> Result<SplitStats> {
+    if k == 0 {
+        return Err(anyhow!("leave_last_k_out_split: k must be >= 1"));
+    }
+    let df = read_interactions_df(interactions_path)?;
+    let n = df.height();
+    let user_col = df.column("user_id")?.str()?;
+    let item_col = df.column("item_id")?.str()?;
+    let days_col = df
+        .column("days_ago")
+        .map_err(|_| {
+            anyhow!(
+                "leave_last_k_out_split requires a `days_ago` column in {} to order each \
+                 user's history; it is absent. Use leave_k_out_split for a random hold-out.",
+                interactions_path
+            )
+        })?
+        .cast(&DataType::Float64)?;
+    let days_col = days_col.f64()?;
+
+    // Per user, per item: (most recent days_ago, first row index, all rows).
+    type ItemRows = (f64, usize, Vec<usize>);
+    let mut user_items: AHashMap<String, AHashMap<String, ItemRows>> = AHashMap::new();
+    for i in 0..n {
+        let (Some(uid), Some(iid)) = (user_col.get(i), item_col.get(i)) else {
+            continue;
+        };
+        let Some(d) = days_col.get(i) else {
+            return Err(anyhow!(
+                "leave_last_k_out_split: row {} of {} has a null days_ago",
+                i,
+                interactions_path
+            ));
+        };
+        let entry = user_items
+            .entry(uid.to_string())
+            .or_default()
+            .entry(iid.to_string())
+            .or_insert((d, i, Vec::new()));
+        if d < entry.0 {
+            entry.0 = d;
+        }
+        entry.2.push(i);
+    }
+
+    let mut train_mask = vec![true; n];
+    let mut sorted_uids: Vec<&String> = user_items.keys().collect();
+    sorted_uids.sort();
+    for uid in sorted_uids {
+        let items = &user_items[uid];
+        if items.len() < k + 1 {
+            continue;
+        }
+        let mut ordered: Vec<&ItemRows> = items.values().collect();
+        // Most recently interacted item first; file order on ties.
+        ordered.sort_by(|a, b| {
+            a.0.partial_cmp(&b.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.1.cmp(&b.1))
+        });
+        for (_, _, rows) in ordered.iter().take(k) {
+            for &idx in rows {
+                train_mask[idx] = false;
+            }
+        }
+    }
+
+    let mask_series = BooleanChunked::from_slice("mask".into(), &train_mask);
+    let not_mask: BooleanChunked = mask_series.clone().not();
+
+    let mut train_df = df.filter(&mask_series)?;
+    let mut test_df = df.filter(&not_mask)?;
+
+    let train_users = count_unique_users(&train_df)?;
+    let test_users = count_unique_users(&test_df)?;
+
+    let stats = SplitStats {
+        train_interactions: train_df.height(),
+        test_interactions: test_df.height(),
+        train_users,
+        test_users,
+    };
+
+    write_parquet(&mut train_df, train_output)?;
+    write_parquet(&mut test_df, test_output)?;
+
+    log::info!(
+        "Leave-last-{}-out split: train={} test={}",
+        k,
+        stats.train_interactions,
+        stats.test_interactions,
+    );
+
+    Ok(stats)
+}
+
 // ---------------------------------------------------------------------------
 // Evaluation harness
 // ---------------------------------------------------------------------------
+
+/// Per-K metric sums over users, finalized to means. Shared by the main
+/// report and the item-age buckets so both use identical arithmetic.
+struct MetricAccumulator {
+    precision: Vec<f64>,
+    recall: Vec<f64>,
+    ndcg: Vec<f64>,
+    map: Vec<f64>,
+    hit_rate: Vec<f64>,
+    num_users: usize,
+}
+
+impl MetricAccumulator {
+    fn new(num_k: usize) -> Self {
+        Self {
+            precision: vec![0.0; num_k],
+            recall: vec![0.0; num_k],
+            ndcg: vec![0.0; num_k],
+            map: vec![0.0; num_k],
+            hit_rate: vec![0.0; num_k],
+            num_users: 0,
+        }
+    }
+
+    fn add(&mut self, recommended: &[usize], relevant: &HashSet<usize>, k_values: &[usize]) {
+        for (ki, &k) in k_values.iter().enumerate() {
+            self.precision[ki] += metrics::precision_at_k(recommended, relevant, k);
+            self.recall[ki] += metrics::recall_at_k(recommended, relevant, k);
+            self.ndcg[ki] += metrics::ndcg_at_k(recommended, relevant, k);
+            self.map[ki] +=
+                metrics::mean_average_precision(&recommended[..k.min(recommended.len())], relevant);
+            self.hit_rate[ki] += metrics::hit_rate_at_k(recommended, relevant, k);
+        }
+        self.num_users += 1;
+    }
+
+    fn finish(&self, k_values: &[usize]) -> Vec<MetricsAtK> {
+        let n = self.num_users as f64;
+        k_values
+            .iter()
+            .enumerate()
+            .map(|(ki, &k)| MetricsAtK {
+                k,
+                precision: self.precision[ki] / n,
+                recall: self.recall[ki] / n,
+                ndcg: self.ndcg[ki] / n,
+                map: self.map[ki] / n,
+                hit_rate: self.hit_rate[ki] / n,
+            })
+            .collect()
+    }
+}
+
+/// Availability state for one evaluation run (#101): the parsed table,
+/// user territories, per-user reference times and a cache of eligible
+/// sets keyed by `(territory, reference time)` — under a global reference
+/// time that is one set per territory for the whole run.
+struct AvailabilityCtx<'a> {
+    cfg: &'a AvailabilityConfig,
+    table: AvailabilityTable,
+    territories: AHashMap<String, String>,
+    per_user_reference: AHashMap<String, f64>,
+    cache: AHashMap<(Option<String>, u64), Rc<HashSet<usize>>>,
+}
+
+impl<'a> AvailabilityCtx<'a> {
+    fn new(
+        cfg: &'a AvailabilityConfig,
+        mappings: &Mappings,
+        user_features_path: Option<&str>,
+        per_user_reference: AHashMap<String, f64>,
+    ) -> Result<Self> {
+        cfg.check()?;
+        let table = AvailabilityTable::load(&cfg.path, mappings)?;
+        let territories = match (&cfg.user_territory_feature, user_features_path) {
+            (Some(col), Some(path)) => load_user_territories(path, col)?,
+            (Some(col), None) => {
+                return Err(anyhow!(
+                    "availability.user_territory_feature = `{}` requires a user_features_path",
+                    col
+                ));
+            }
+            (None, _) => AHashMap::new(),
+        };
+        Ok(Self {
+            cfg,
+            table,
+            territories,
+            per_user_reference,
+            cache: AHashMap::new(),
+        })
+    }
+
+    /// Eligible set and reference time for `uid`.
+    fn eligible_for(&mut self, uid: &str) -> Result<(Rc<HashSet<usize>>, f64)> {
+        let reference = match self.cfg.reference_days_ago {
+            Some(r) => r,
+            None => *self.per_user_reference.get(uid).ok_or_else(|| {
+                anyhow!(
+                    "availability: no reference time for test user `{}` (no test row with a \
+                     non-null days_ago on a known item)",
+                    uid
+                )
+            })?,
+        };
+        let territory = self.territories.get(uid).cloned();
+        let key = (territory.clone(), reference.to_bits());
+        if let Some(set) = self.cache.get(&key) {
+            return Ok((Rc::clone(set), reference));
+        }
+        let set = Rc::new(self.table.eligible_set(territory.as_deref(), reference));
+        self.cache.insert(key, Rc::clone(&set));
+        Ok((set, reference))
+    }
+}
 
 // ---------------------------------------------------------------------------
 // EvalAdapter — per-model input construction (issue #51)
@@ -586,9 +845,61 @@ pub fn evaluate_with_adapter(
     let test_user_col = test_df.column("user_id")?.str()?;
     let test_item_col = test_df.column("item_id")?.str()?;
 
+    // Per-user reference time for availability filtering when no global
+    // one is configured: the oldest held-out interaction (#101). Needs a
+    // non-null `days_ago` in the test file; fails loudly otherwise.
+    let needs_user_reference = config
+        .availability
+        .as_ref()
+        .is_some_and(|a| a.reference_days_ago.is_none());
+    let test_days_col_opt = if needs_user_reference {
+        let col = test_df
+            .column("days_ago")
+            .map_err(|_| {
+                anyhow!(
+                    "availability filtering without `reference_days_ago` needs a `days_ago` \
+                     column in the test file {} (the per-user reference time is the oldest \
+                     held-out interaction); it is absent",
+                    test_interactions_path
+                )
+            })?
+            .cast(&DataType::Float64)?;
+        Some(col)
+    } else {
+        None
+    };
+    let test_days_col_opt = match test_days_col_opt.as_ref() {
+        Some(c) => Some(c.f64()?),
+        None => None,
+    };
+
     let mut test_user_items: AHashMap<String, HashSet<usize>> = AHashMap::new();
+    let mut test_user_reference: AHashMap<String, f64> = AHashMap::new();
     for i in 0..test_df.height() {
-        if let (Some(uid), Some(iid)) = (test_user_col.get(i), test_item_col.get(i))
+        let Some(uid) = test_user_col.get(i) else {
+            continue;
+        };
+        // The reference time is a property of the user's held-out window,
+        // so every test row counts — including items the model does not
+        // know, which only drop out of the relevant set below.
+        if let Some(days_col) = test_days_col_opt {
+            let Some(d) = days_col.get(i) else {
+                return Err(anyhow!(
+                    "availability: test file {} row {} has a null days_ago",
+                    test_interactions_path,
+                    i
+                ));
+            };
+            test_user_reference
+                .entry(uid.to_string())
+                .and_modify(|cur| {
+                    if d > *cur {
+                        *cur = d;
+                    }
+                })
+                .or_insert(d);
+        }
+        if let Some(iid) = test_item_col.get(i)
             && let Some(&item_idx) = mappings.item_to_idx.get(iid)
         {
             test_user_items
@@ -652,26 +963,71 @@ pub fn evaluate_with_adapter(
         }
     }
 
+    // Availability (#101): per-user eligible candidate set. `None` keeps
+    // the legacy full-catalog ranking and a byte-identical report.
+    let mut availability_ctx = match config.availability.as_ref() {
+        Some(av_cfg) => Some(AvailabilityCtx::new(
+            av_cfg,
+            mappings,
+            user_features_path,
+            test_user_reference,
+        )?),
+        None => None,
+    };
+    let bucket_bounds = availability_ctx
+        .as_ref()
+        .map(|c| bucket_bounds(&c.cfg.item_age_bucket_edges))
+        .unwrap_or_default();
+
     let max_k = config.k_values.iter().copied().max().unwrap_or(10);
 
     // Accumulators for per-K metrics
     let num_k = config.k_values.len();
-    let mut sum_precision = vec![0.0; num_k];
-    let mut sum_recall = vec![0.0; num_k];
-    let mut sum_ndcg = vec![0.0; num_k];
-    let mut sum_map = vec![0.0; num_k];
-    let mut sum_hit_rate = vec![0.0; num_k];
+    let mut main_acc = MetricAccumulator::new(num_k);
+    let mut bucket_accs: Vec<MetricAccumulator> = bucket_bounds
+        .iter()
+        .map(|_| MetricAccumulator::new(num_k))
+        .collect();
 
     let mut all_recs: Vec<Vec<usize>> = Vec::new();
-    let mut num_users_evaluated = 0usize;
     let mut total_test_interactions = 0usize;
+    let mut eligible_union: HashSet<usize> = HashSet::new();
+    let mut dropped_ineligible = 0usize;
+    let mut users_skipped_ineligible = 0usize;
 
-    for (uid, relevant_items) in &test_user_items {
+    for (uid, relevant_all) in &test_user_items {
         // The user must exist in the model's mappings
         let user_idx_opt = mappings.user_to_idx.get(uid.as_str()).copied();
         if user_idx_opt.is_none() {
             continue;
         }
+
+        // Eligible candidate set + reference time for this user, and the
+        // relevant set restricted to it (an ineligible test item is a data
+        // error, dropped and counted, not a miss).
+        let mut eligible: Option<Rc<HashSet<usize>>> = None;
+        let mut reference_days_ago = 0.0_f64;
+        let filtered_relevant: Option<HashSet<usize>> = match availability_ctx.as_mut() {
+            Some(ctx) => {
+                let (set, reference) = ctx.eligible_for(uid)?;
+                let kept: HashSet<usize> = relevant_all
+                    .iter()
+                    .copied()
+                    .filter(|i| set.contains(i))
+                    .collect();
+                dropped_ineligible += relevant_all.len() - kept.len();
+                if kept.is_empty() {
+                    users_skipped_ineligible += 1;
+                    continue;
+                }
+                eligible_union.extend(set.iter().copied());
+                eligible = Some(set);
+                reference_days_ago = reference;
+                Some(kept)
+            }
+            None => None,
+        };
+        let relevant_items: &HashSet<usize> = filtered_relevant.as_ref().unwrap_or(relevant_all);
 
         let user_interactions = train_user_interactions
             .get(uid.as_str())
@@ -709,61 +1065,99 @@ pub fn evaluate_with_adapter(
         let train_item_set: HashSet<usize> =
             user_interactions.iter().map(|(idx, _)| *idx).collect();
 
-        // Rank items, excluding train items
+        // Rank items, excluding train items and (with availability)
+        // anything the user could not have been shown.
         let mut ranked: Vec<(usize, f32)> = scores
             .into_iter()
             .enumerate()
-            .filter(|(idx, _)| !train_item_set.contains(idx))
+            .filter(|(idx, _)| {
+                !train_item_set.contains(idx) && eligible.as_ref().is_none_or(|e| e.contains(idx))
+            })
             .collect();
         ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
         let recommended: Vec<usize> = ranked.iter().take(max_k).map(|(idx, _)| *idx).collect();
 
         // Compute metrics at each K
-        for (ki, &k) in config.k_values.iter().enumerate() {
-            sum_precision[ki] += metrics::precision_at_k(&recommended, relevant_items, k);
-            sum_recall[ki] += metrics::recall_at_k(&recommended, relevant_items, k);
-            sum_ndcg[ki] += metrics::ndcg_at_k(&recommended, relevant_items, k);
-            sum_map[ki] += metrics::mean_average_precision(
-                &recommended[..k.min(recommended.len())],
-                relevant_items,
-            );
-            sum_hit_rate[ki] += metrics::hit_rate_at_k(&recommended, relevant_items, k);
+        main_acc.add(&recommended, relevant_items, &config.k_values);
+
+        // Item-age breakdown: same ranked list, relevants restricted to
+        // the bucket of their age at the reference time.
+        if let Some(ctx) = availability_ctx.as_ref()
+            && !bucket_bounds.is_empty()
+        {
+            let mut per_bucket: Vec<HashSet<usize>> = vec![HashSet::new(); bucket_bounds.len()];
+            for &item in relevant_items {
+                if let Some(age) = ctx.table.item_age_days(item, reference_days_ago) {
+                    per_bucket[age_bucket(age, &ctx.cfg.item_age_bucket_edges)].insert(item);
+                }
+            }
+            for (acc, rel) in bucket_accs.iter_mut().zip(per_bucket.iter()) {
+                if !rel.is_empty() {
+                    acc.add(&recommended, rel, &config.k_values);
+                }
+            }
         }
 
         all_recs.push(recommended);
-        num_users_evaluated += 1;
         total_test_interactions += relevant_items.len();
     }
 
+    let num_users_evaluated = main_acc.num_users;
     if num_users_evaluated == 0 {
         return Err(anyhow!(
-            "No test users could be evaluated (no overlap between test users and model mappings)"
+            "No test users could be evaluated (no overlap between test users and model mappings{})",
+            if users_skipped_ineligible > 0 {
+                format!(
+                    ", or every test item was ineligible at its user's reference time: {} users skipped",
+                    users_skipped_ineligible
+                )
+            } else {
+                String::new()
+            }
         ));
     }
 
-    let n = num_users_evaluated as f64;
-    let metrics_at_k: Vec<MetricsAtK> = config
-        .k_values
-        .iter()
-        .enumerate()
-        .map(|(ki, &k)| MetricsAtK {
-            k,
-            precision: sum_precision[ki] / n,
-            recall: sum_recall[ki] / n,
-            ndcg: sum_ndcg[ki] / n,
-            map: sum_map[ki] / n,
-            hit_rate: sum_hit_rate[ki] / n,
-        })
-        .collect();
+    let metrics_at_k = main_acc.finish(&config.k_values);
 
-    let cov = metrics::coverage(&all_recs, model.num_items());
+    let (cov, availability_report) = match availability_ctx.as_ref() {
+        None => (metrics::coverage(&all_recs, model.num_items()), None),
+        Some(ctx) => {
+            let item_age_buckets = bucket_bounds
+                .iter()
+                .zip(bucket_accs.iter())
+                .map(|((label, min_age, max_age), acc)| ItemAgeBucket {
+                    label: label.clone(),
+                    min_age_days: *min_age,
+                    max_age_days: *max_age,
+                    num_users: acc.num_users,
+                    metrics_at_k: if acc.num_users == 0 {
+                        Vec::new()
+                    } else {
+                        acc.finish(&config.k_values)
+                    },
+                })
+                .collect();
+            (
+                metrics::coverage(&all_recs, eligible_union.len()),
+                Some(AvailabilityReport {
+                    reference_days_ago: ctx.cfg.reference_days_ago,
+                    num_eligible_items: eligible_union.len(),
+                    num_items_without_availability: ctx.table.num_items_unlisted(),
+                    num_test_interactions_dropped: dropped_ineligible,
+                    num_users_skipped: users_skipped_ineligible,
+                    item_age_buckets,
+                }),
+            )
+        }
+    };
 
     let report = EvalReport {
         metrics_at_k,
         coverage: cov,
         num_users: num_users_evaluated,
         num_interactions: total_test_interactions,
+        availability: availability_report,
     };
 
     log::info!(
@@ -772,6 +1166,15 @@ pub fn evaluate_with_adapter(
         report.num_interactions,
         report.coverage
     );
+    if let Some(av) = &report.availability {
+        log::info!(
+            "Availability: {} eligible items, {} unlisted, {} test interactions dropped, {} users skipped",
+            av.num_eligible_items,
+            av.num_items_without_availability,
+            av.num_test_interactions_dropped,
+            av.num_users_skipped
+        );
+    }
 
     Ok(report)
 }
@@ -991,6 +1394,7 @@ mod tests {
     fn test_eval_report_structure() -> Result<()> {
         let config = EvalConfig {
             k_values: vec![5, 10, 20],
+            availability: None,
         };
 
         let report = EvalReport {
@@ -1009,6 +1413,7 @@ mod tests {
             coverage: 0.75,
             num_users: 100,
             num_interactions: 500,
+            availability: None,
         };
 
         assert_eq!(report.metrics_at_k.len(), 3);
@@ -1210,6 +1615,7 @@ mod tests {
             coverage: metrics::coverage(&all_recs, model.num_items),
             num_users: num_users_evaluated,
             num_interactions: total_test_interactions,
+            availability: None,
         })
     }
 
@@ -1234,6 +1640,7 @@ mod tests {
 
         let config = EvalConfig {
             k_values: vec![1, 2, 3],
+            availability: None,
         };
 
         let model = regression_model();
@@ -1449,6 +1856,319 @@ mod tests {
             "score vectors should differ between chronological and reversed days_ago; \
              max abs diff was {max_abs_diff}"
         );
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------
+    // #101: availability-aware evaluation + leave-last-K-out split
+    // -----------------------------------------------------------------
+
+    fn write_df(dir: &TempDir, name: &str, df: &mut DataFrame) -> String {
+        let p = dir.path().join(name);
+        create_test_parquet(df, p.to_str().unwrap()).unwrap();
+        p.to_str().unwrap().to_string()
+    }
+
+    /// Catalog i1..i5 from `regression_model`: S(i1,i2)=0.9, S(i1,i4)=0.7,
+    /// S(i1,i3)=0.4. Train u1 on i1 so its ranking is i2, i4, i3.
+    fn availability_fixture(dir: &TempDir) -> (String, String, String) {
+        let mut train = df!(
+            "user_id" => ["u1", "u2"],
+            "item_id" => ["i1", "i1"],
+            "value" =>   [1.0_f64, 1.0],
+            "days_ago" => [50.0_f64, 50.0],
+        )
+        .unwrap();
+        let mut test = df!(
+            "user_id" => ["u1"],
+            "item_id" => ["i3"],
+            "value" =>   [1.0_f64],
+            "days_ago" => [5.0_f64],
+        )
+        .unwrap();
+        // i2 / i4 released 1 day ago (after u1's reference time of 5 days
+        // ago); i1 / i3 long available; i5 unlisted.
+        let mut av = df!(
+            "item_id" => ["i1", "i2", "i3", "i4"],
+            "territory" => ["*", "*", "*", "*"],
+            "available_from_days_ago" => [100.0_f64, 1.0, 100.0, 1.0],
+        )
+        .unwrap();
+        (
+            write_df(dir, "train.parquet", &mut train),
+            write_df(dir, "test.parquet", &mut test),
+            write_df(dir, "availability.parquet", &mut av),
+        )
+    }
+
+    #[test]
+    fn availability_filters_late_releases_and_scopes_coverage() -> Result<()> {
+        let dir = TempDir::new()?;
+        let (train, test, av) = availability_fixture(&dir);
+        let adapter = EaseAdapter::new(regression_model());
+        let model: &dyn RecModel = &adapter;
+
+        // Full catalog: the two late releases outrank the relevant item.
+        let plain = evaluate_model(model, &test, &train, None, &EvalConfig::new(vec![1, 3]))?;
+        assert!(plain.availability.is_none());
+        assert_eq!(
+            plain.metrics_at_k[0].precision, 0.0,
+            "precision@1 full catalog"
+        );
+        assert_eq!(plain.metrics_at_k[1].hit_rate, 1.0, "hit@3 full catalog");
+        assert!((plain.coverage - 3.0 / 5.0).abs() < 1e-12);
+
+        // Availability on, per-user reference time from the test file.
+        let mut config = EvalConfig::new(vec![1, 3]);
+        config.availability = Some(AvailabilityConfig::new(av.clone()));
+        let report = evaluate_model(model, &test, &train, None, &config)?;
+        assert_eq!(report.num_users, 1);
+        assert_eq!(report.num_interactions, 1);
+        assert_eq!(
+            report.metrics_at_k[0].precision, 1.0,
+            "late releases filtered"
+        );
+        assert_eq!(report.metrics_at_k[0].ndcg, 1.0);
+        // Eligible union for u1 = {i1, i3}; one recommendation (i3).
+        assert!(
+            (report.coverage - 0.5).abs() < 1e-12,
+            "coverage={}",
+            report.coverage
+        );
+
+        let a = report.availability.as_ref().expect("availability section");
+        assert_eq!(a.reference_days_ago, None);
+        assert_eq!(a.num_eligible_items, 2);
+        assert_eq!(a.num_items_without_availability, 1); // i5
+        assert_eq!(a.num_test_interactions_dropped, 0);
+        assert_eq!(a.num_users_skipped, 0);
+        // Age buckets: i3 first available 100 days ago, reference 5 -> 95d.
+        let labels: Vec<&str> = a
+            .item_age_buckets
+            .iter()
+            .map(|b| b.label.as_str())
+            .collect();
+        assert_eq!(labels, ["<30d", "30-365d", ">=365d"]);
+        assert_eq!(a.item_age_buckets[0].num_users, 0);
+        assert!(a.item_age_buckets[0].metrics_at_k.is_empty());
+        assert_eq!(a.item_age_buckets[1].num_users, 1);
+        assert_eq!(a.item_age_buckets[1].metrics_at_k[0].ndcg, 1.0);
+        assert_eq!(a.item_age_buckets[2].num_users, 0);
+
+        // JSON keeps the legacy shape when the section is absent.
+        let json = serde_json::to_string(&plain)?;
+        assert!(!json.contains("availability"));
+        let json = serde_json::to_string(&report)?;
+        assert!(json.contains("\"item_age_buckets\""));
+        Ok(())
+    }
+
+    #[test]
+    fn availability_drops_ineligible_relevants_and_skips_users() -> Result<()> {
+        let dir = TempDir::new()?;
+        let (train, _, av) = availability_fixture(&dir);
+        // u1: i3 (eligible) + i2 (late); u2: only i4 (late) -> skipped.
+        let mut test = df!(
+            "user_id" => ["u1", "u1", "u2"],
+            "item_id" => ["i3", "i2", "i4"],
+            "value" =>   [1.0_f64, 1.0, 1.0],
+            "days_ago" => [5.0_f64, 0.5, 5.0],
+        )?;
+        let test = write_df(&dir, "test2.parquet", &mut test);
+        let adapter = EaseAdapter::new(regression_model());
+        let mut config = EvalConfig::new(vec![1]);
+        config.availability = Some(AvailabilityConfig::new(av));
+        let report = evaluate_model(&adapter, &test, &train, None, &config)?;
+        assert_eq!(report.num_users, 1);
+        assert_eq!(report.num_interactions, 1);
+        let a = report.availability.unwrap();
+        assert_eq!(a.num_test_interactions_dropped, 2);
+        assert_eq!(a.num_users_skipped, 1);
+
+        // Every user skipped -> loud error naming the cause.
+        let mut only_late = df!(
+            "user_id" => ["u1"],
+            "item_id" => ["i2"],
+            "value" =>   [1.0_f64],
+            "days_ago" => [5.0_f64],
+        )?;
+        let only_late = write_df(&dir, "test3.parquet", &mut only_late);
+        let err = evaluate_model(&adapter, &only_late, &train, None, &config).unwrap_err();
+        assert!(err.to_string().contains("ineligible"), "{err}");
+        Ok(())
+    }
+
+    #[test]
+    fn availability_territory_rolls_up_to_the_user() -> Result<()> {
+        let dir = TempDir::new()?;
+        let (train, _, _) = availability_fixture(&dir);
+        // No days_ago in the test file: a global reference time must suffice.
+        let mut test = df!(
+            "user_id" => ["u1", "u2"],
+            "item_id" => ["i3", "i3"],
+            "value" =>   [1.0_f64, 1.0],
+        )?;
+        let test = write_df(&dir, "test_t.parquet", &mut test);
+        let mut uf = df!(
+            "user_id" => ["u1", "u1", "u2"],
+            "feature_name" => ["plan_Premium", "region_US", "region_EMEA"],
+            "value" => [1.0_f64, 1.0, 1.0],
+        )?;
+        let uf = write_df(&dir, "uf.parquet", &mut uf);
+        // i3: season 1 US-only (expired), season 2 US-only (current);
+        // nothing for EMEA. i1 global.
+        let mut av = df!(
+            "item_id" => ["i1", "i3", "i3"],
+            "season_id" => ["i1s1", "i3s1", "i3s2"],
+            "territory" => ["*", "US", "US"],
+            "available_from_days_ago" => [100.0_f64, 400.0, 20.0],
+            "available_to_days_ago" => [None, Some(300.0_f64), None],
+        )?;
+        let av = write_df(&dir, "av_t.parquet", &mut av);
+
+        let adapter = EaseAdapter::new(regression_model());
+        let mut config = EvalConfig::new(vec![1]);
+        let mut av_cfg = AvailabilityConfig::new(av);
+        av_cfg.user_territory_feature = Some("region".to_string());
+        av_cfg.reference_days_ago = Some(5.0);
+        config.availability = Some(av_cfg);
+
+        let report = evaluate_model(&adapter, &test, &train, Some(&uf), &config)?;
+        assert_eq!(
+            report.num_users, 1,
+            "only the US user has an eligible relevant"
+        );
+        assert_eq!(report.metrics_at_k[0].hit_rate, 1.0);
+        let a = report.availability.unwrap();
+        assert_eq!(a.reference_days_ago, Some(5.0));
+        assert_eq!(a.num_users_skipped, 1);
+        assert_eq!(a.num_test_interactions_dropped, 1);
+        // Age uses the *first* availability (season 1, 400 days ago).
+        assert_eq!(a.item_age_buckets[2].num_users, 1);
+
+        // Territory feature without a user-features file is an error.
+        let err = evaluate_model(&adapter, &test, &train, None, &config).unwrap_err();
+        assert!(err.to_string().contains("user_features_path"), "{err}");
+
+        // Per-user reference time needs days_ago in the test file.
+        config.availability.as_mut().unwrap().reference_days_ago = None;
+        let err = evaluate_model(&adapter, &test, &train, Some(&uf), &config).unwrap_err();
+        assert!(err.to_string().contains("days_ago"), "{err}");
+        Ok(())
+    }
+
+    #[test]
+    fn availability_reference_time_counts_unknown_test_items() -> Result<()> {
+        let dir = TempDir::new()?;
+        let (train, _, _) = availability_fixture(&dir);
+        // u1's oldest held-out interaction is an item the model never saw
+        // (50 days ago). The reference time must still be 50, so i2
+        // (released 20 days ago) is ineligible and dropped; i3 remains.
+        let mut test = df!(
+            "user_id" => ["u1", "u1", "u1"],
+            "item_id" => ["zz", "i2", "i3"],
+            "value" =>   [1.0_f64, 1.0, 1.0],
+            "days_ago" => [50.0_f64, 5.0, 5.0],
+        )?;
+        let test = write_df(&dir, "test_unknown.parquet", &mut test);
+        let mut av = df!(
+            "item_id" => ["i1", "i2", "i3"],
+            "available_from_days_ago" => [100.0_f64, 20.0, 100.0],
+        )?;
+        let av = write_df(&dir, "av_unknown.parquet", &mut av);
+        let adapter = EaseAdapter::new(regression_model());
+        let mut config = EvalConfig::new(vec![1]);
+        config.availability = Some(AvailabilityConfig::new(av));
+        let report = evaluate_model(&adapter, &test, &train, None, &config)?;
+        assert_eq!(report.num_users, 1);
+        assert_eq!(report.num_interactions, 1);
+        let a = report.availability.unwrap();
+        assert_eq!(a.num_test_interactions_dropped, 1);
+        assert_eq!(a.num_eligible_items, 2); // {i1, i3} at reference 50
+        Ok(())
+    }
+
+    #[test]
+    fn leave_last_k_out_holds_out_most_recent() -> Result<()> {
+        let dir = TempDir::new()?;
+        let mut df = df!(
+            "user_id" => ["u1", "u1", "u1", "u2", "u2", "u3"],
+            "item_id" => ["a", "b", "c", "a", "b", "a"],
+            "value" => [1.0_f64; 6],
+            // u1: c is most recent; u2: tie -> file order (a first); u3 too short.
+            "days_ago" => [30.0_f64, 10.0, 1.0, 5.0, 5.0, 1.0],
+        )?;
+        let src = write_df(&dir, "i.parquet", &mut df);
+        let train = dir.path().join("train.parquet");
+        let test = dir.path().join("test.parquet");
+        let stats =
+            leave_last_k_out_split(&src, train.to_str().unwrap(), test.to_str().unwrap(), 1)?;
+        assert_eq!(stats.test_interactions, 2);
+        assert_eq!(stats.train_interactions, 4);
+        assert_eq!(stats.test_users, 2);
+        let test_df = read_interactions_df(test.to_str().unwrap())?;
+        let users: Vec<&str> = test_df
+            .column("user_id")?
+            .str()?
+            .into_iter()
+            .flatten()
+            .collect();
+        let items: Vec<&str> = test_df
+            .column("item_id")?
+            .str()?
+            .into_iter()
+            .flatten()
+            .collect();
+        assert_eq!(users, ["u1", "u2"]);
+        assert_eq!(items, ["c", "a"]);
+
+        // k=2: u1 loses b and c; u2 (2 rows) goes entirely to train.
+        let stats =
+            leave_last_k_out_split(&src, train.to_str().unwrap(), test.to_str().unwrap(), 2)?;
+        assert_eq!(stats.test_interactions, 2);
+        assert_eq!(stats.test_users, 1);
+
+        assert!(
+            leave_last_k_out_split(&src, train.to_str().unwrap(), test.to_str().unwrap(), 0)
+                .is_err()
+        );
+
+        // Repeated items: the item's recency is its latest row, and every
+        // row of a held-out item moves to test (else the harness would
+        // exclude it as a train item and the hold-out could never be hit).
+        let mut repeats = df!(
+            "user_id" => ["u1", "u1", "u1", "u2", "u2"],
+            "item_id" => ["a", "b", "a", "a", "a"],
+            "value" => [1.0_f64; 5],
+            "days_ago" => [30.0_f64, 10.0, 1.0, 5.0, 2.0],
+        )?;
+        let src3 = write_df(&dir, "repeats.parquet", &mut repeats);
+        let stats =
+            leave_last_k_out_split(&src3, train.to_str().unwrap(), test.to_str().unwrap(), 1)?;
+        // u1: a (latest 1d) held out with both of its rows; b stays in train.
+        // u2: a single distinct item -> entirely train.
+        assert_eq!(stats.test_interactions, 2);
+        assert_eq!(stats.train_interactions, 3);
+        assert_eq!(stats.test_users, 1);
+        let test_df = read_interactions_df(test.to_str().unwrap())?;
+        let items: Vec<&str> = test_df
+            .column("item_id")?
+            .str()?
+            .into_iter()
+            .flatten()
+            .collect();
+        assert_eq!(items, ["a", "a"]);
+
+        // Without days_ago the split refuses rather than guessing.
+        let mut no_days = df!(
+            "user_id" => ["u1", "u1"],
+            "item_id" => ["a", "b"],
+            "value" => [1.0_f64, 1.0],
+        )?;
+        let src2 = write_df(&dir, "nodays.parquet", &mut no_days);
+        let err = leave_last_k_out_split(&src2, train.to_str().unwrap(), test.to_str().unwrap(), 1)
+            .unwrap_err();
+        assert!(err.to_string().contains("days_ago"), "{err}");
         Ok(())
     }
 }

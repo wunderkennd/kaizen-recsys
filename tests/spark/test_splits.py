@@ -53,3 +53,36 @@ def test_random_split_is_exact_complement(spark):
     all_rows = set((r["user_id"], r["item_id"]) for r in df.collect())
     assert train_rows | test_rows == all_rows      # nothing lost
     assert train_rows & test_rows == set()         # nothing duplicated
+
+
+def test_leave_last_k_out_holds_out_most_recent(spark):
+    from kzn_recsys.spark.splits import leave_last_k_out_split
+    rows = [("u1", "a", 1.0, 30.0), ("u1", "b", 1.0, 10.0), ("u1", "c", 1.0, 1.0),
+            ("u2", "a", 1.0, 5.0), ("u2", "b", 1.0, 5.0), ("u3", "a", 1.0, 1.0)]
+    df = spark.createDataFrame(rows, ["user_id", "item_id", "value", "days_ago"])
+    train, test = leave_last_k_out_split(df, k=1)
+    held = {(r["user_id"], r["item_id"]) for r in test.collect()}
+    # u1 -> most recent (c); u2 tie -> first row (a); u3 too short.
+    assert held == {("u1", "c"), ("u2", "a")}
+    assert train.count() == 4
+    train2, test2 = leave_last_k_out_split(df, k=2)
+    assert {r["user_id"] for r in test2.collect()} == {"u1"}
+    assert test2.count() == 2
+    with pytest.raises(ValueError, match="days_ago"):
+        leave_last_k_out_split(df.drop("days_ago"), k=1)
+    with pytest.raises(ValueError):
+        leave_last_k_out_split(df, k=0)
+
+
+def test_leave_last_k_out_holds_out_whole_items(spark):
+    from kzn_recsys.spark.splits import leave_last_k_out_split
+    # u1 watched a twice (30d, 1d) and b once (10d): a is the most recent
+    # item, and both of its rows must leave train. u2 has one distinct item.
+    rows = [("u1", "a", 1.0, 30.0), ("u1", "b", 1.0, 10.0), ("u1", "a", 1.0, 1.0),
+            ("u2", "a", 1.0, 5.0), ("u2", "a", 1.0, 2.0)]
+    df = spark.createDataFrame(rows, ["user_id", "item_id", "value", "days_ago"])
+    train, test = leave_last_k_out_split(df, k=1)
+    assert sorted((r["user_id"], r["item_id"], r["days_ago"]) for r in test.collect()) == [
+        ("u1", "a", 1.0), ("u1", "a", 30.0)]
+    assert sorted((r["user_id"], r["item_id"]) for r in train.collect()) == [
+        ("u1", "b"), ("u2", "a"), ("u2", "a")]

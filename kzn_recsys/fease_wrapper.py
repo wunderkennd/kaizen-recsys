@@ -187,3 +187,26 @@ def build_and_train_safe(
         meta_weight=meta_weight,
         **kwargs,
     )
+
+
+def leave_last_k_out_split_safe(
+    interactions_path: str,
+    train_output: Optional[str] = None,
+    test_output: Optional[str] = None,
+    k: int = 1,
+    output_dir: Optional[str] = None,
+) -> SplitResult:
+    """Leave-last-K-out split: hold out each user's `k` most recently
+    interacted distinct items (every row of a held-out item moves to test).
+
+    Deterministic (no seed); requires a `days_ago` column. Same path-allocation
+    behavior as `random_split_safe`.
+    """
+    train_out, test_out = _resolve_split_paths(train_output, test_output, output_dir)
+    train_n, test_n, train_u, test_u = fease.leave_last_k_out_split(
+        interactions_path,
+        train_out,
+        test_out,
+        k=k,
+    )
+    return SplitResult(train_out, test_out, train_n, test_n, train_u, test_u)
