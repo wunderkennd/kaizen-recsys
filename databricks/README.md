@@ -36,3 +36,33 @@ databricks bundle run kzn_recsys_spark_job -t dev \
 Outputs: Delta tables `kzn_interactions` / `kzn_user_features` /
 `kzn_item_features` / `kzn_predictions`, a FEAS artifact in the Volume, and an
 MLflow run with params + metrics.
+
+## Series-grain interactions table (issue #102)
+
+`fease_interactions_agg` holds one row per profile × series × day
+(`user_id`, `item_id`, `view_date`, `value = sum(ln(seconds + 1))`,
+`num_views`), built from the gold viewership table. `days_ago` is derived at
+read time, so temporal decay stays tunable and the table never bakes in a
+reference date. The SQL in `sql/` is parametrized with `${...}` and run by
+`src/00_refresh_interactions_agg.py`:
+
+```bash
+# one-time backfill (replaces the table), then validate and record on #102
+databricks bundle run fease_interactions_agg_refresh -t dev --params mode=backfill
+databricks bundle run fease_interactions_agg_refresh -t dev --params mode=validate
+# daily MERGE of the last `agg_lookback_days` complete days (the scheduled default;
+# the schedule ships PAUSED — unpause it after the backfill)
+databricks bundle run fease_interactions_agg_refresh -t dev
+```
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `agg_catalog` / `agg_schema` / `agg_table` | `dsml_recs` / `dev` / `fease_interactions_agg` | target table |
+| `viewership_table` | `cr_prod.gold_db.ds_viewership` | gold source |
+| `agg_lookback_days` | `3` | days the MERGE recomputes; must cover the source's late-arrival window |
+
+The MERGE recomputes the window rather than adding deltas, updates changed
+rows, inserts new ones and deletes rows that vanished from the source in the
+window, so re-running it is a no-op. Consumers: `kzn_recsys/fease_train.py`
+(`INTERACTIONS_SOURCE="agg"`) and the helpers in
+`kzn_recsys.spark.interactions_agg`.

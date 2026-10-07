@@ -20,6 +20,12 @@ variables:
   user_territory_feature: { default: "" }  # optional: one-hot user-feature column for territory
   raw_engagement_table: { default: "" }  # used when data_mode=delta
   raw_metadata_table:   { default: "" }
+  # Series-grain interactions table (issue #102; fease_interactions_agg_job.yml)
+  agg_catalog:        { default: dsml_recs }
+  agg_schema:         { default: dev }
+  agg_table:          { default: fease_interactions_agg }
+  viewership_table:   { default: cr_prod.gold_db.ds_viewership }
+  agg_lookback_days:  { default: "3" }
 
 artifacts:
   spark_wheel:

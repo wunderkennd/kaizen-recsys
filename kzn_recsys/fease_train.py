@@ -2,7 +2,8 @@
 #
 # This notebook shows the end-to-end workflow for:
 # 1. Installing the custom Rust library (`.whl` file)
-# 2. Loading Databricks tables (Engagement & Metadata)
+# 2. Loading Databricks tables (the series-grain interactions table from
+#    issue #102, or raw engagement events; plus content metadata)
 # 3. Performing Feature Engineering in PySpark to create the three
 #    "long-format" tables (interactions, user_features, item_features).
 # 4. Exporting these three tables to temporary Parquet files on DBFS.
@@ -32,13 +33,20 @@
 
 import os
 import time
-from pyspark.sql import SparkSession, DataFrame
+from pyspark.sql import SparkSession, DataFrame, Window
 import pyspark.sql.functions as F
-from pyspark.sql.types import StringType
 
 # Import our library! `kzn_recsys` re-exports the compiled Rust extension
 # (`kzn_recsys._native`) plus Python helpers (SplitResult, schemas, wrappers).
 import kzn_recsys as fease
+from kzn_recsys import cr_config as cfg
+from kzn_recsys.spark.interactions_agg import (
+    active_users,
+    aggregate_viewership_daily,
+    daily_to_pairs,
+    filter_activity_window,
+    with_days_ago,
+)
 
 print("Successfully imported 'kzn_recsys'")
 
@@ -49,9 +57,39 @@ print("Successfully imported 'kzn_recsys'")
 # --
 
 # --- Spark Table Configuration ---
-# Point these to your actual tables in Databricks
-ENGAGEMENT_TABLE = "your_db.engagement"
+# Point these to your actual tables in Databricks.
+#
+# Interactions come from one of two sources (issue #102):
+#   "agg": the series-grain daily table `cfg.INTERACTIONS_AGG_TABLE`
+#          (one row per profile x series x day, built by
+#          databricks/sql/*.sql). The path for multi-year history.
+#   "raw": ENGAGEMENT_TABLE events aggregated to the same daily grain on
+#          the fly. For small windows and ad-hoc experiments; identical
+#          downstream code.
+INTERACTIONS_SOURCE = "agg"
+ENGAGEMENT_TABLE = cfg.VIEWERSHIP_TABLE        # used by the "raw" source and user features
 METADATA_TABLE = "your_db.content_metadata"
+# Columns of ENGAGEMENT_TABLE. The user id must be the same id space the
+# agg table was built with (profile id), or user features will not join.
+USER_ID_COL = cfg.VIEWERSHIP_USER_COL          # "view_profile_id"
+ITEM_ID_COL = cfg.VIEWERSHIP_ITEM_COL          # "catalog_show_id" (series grain)
+WATCH_SECONDS_COL = cfg.VIEWERSHIP_SECONDS_COL
+SUBSIDIARY_COL = cfg.VIEWERSHIP_SUBSIDIARY_COL
+SUBSIDIARY = cfg.VIEWERSHIP_SUBSIDIARY
+# Only interactions with days_ago <= this many days are used. None = all
+# history in the source. days_ago is derived at read time from view_date.
+ACTIVITY_WINDOW_DAYS = None
+
+# --- Training Backend ---
+#   "rust":  pair-grain Parquet handoff + the native extension. The whole
+#            interactions frame is read on one node.
+#   "spark": kzn_recsys.spark.build_and_train(strategy="distributed"): the
+#            Gram blocks are Spark aggregations and only the (M+K)^2 matrix
+#            reaches the driver, so history length never bottlenecks the
+#            driver. Needs numpy/scipy on the cluster. The trained model is
+#            saved in the FEAS format the native extension loads, so the
+#            prediction / evaluation steps below are unchanged.
+TRAINING_BACKEND = "rust"
 
 # --- DBFS Temporary Path Configuration ---
 # The Rust library will read from these /dbfs/ paths.
@@ -84,28 +122,28 @@ BETA = 1.0    # Weight for user features
 LAMBDA = 150.0  # L2 regularization
 
 # --- Advanced Weighting Parameters ---
-# Set to 0.0 to disable (backward-compatible defaults).
-# Values below are from the original EaseConfig in db_pipeline.ipynb.
-DECAY_RATE = 0.0          # Exponential temporal decay on interactions (e.g., 0.005)
+# Set to 0.0 to disable (backward-compatible defaults). Prefer setting these
+# from a `tune_ease` run (strategy="tpe") rather than by hand.
+DECAY_RATE = 0.0          # Exponential temporal decay per day (e.g., 0.005)
 IPS_ALPHA = 0.0           # Inverse propensity scoring strength (e.g., 0.5)
 SPARSITY_THRESHOLD = 0.0  # Prune S-matrix entries below this value (e.g., 0.001)
+# DECAY_RATE is applied in Spark when the daily rows are collapsed to
+# (user, item) pairs (`daily_to_pairs`), per day, before summing. It is
+# therefore never passed to the training backend; passing it as well would
+# decay twice. IPS and sparsity are applied by the backend on the pair
+# frame, so IPS propensities count users per item, not view events.
 
-# Event-type weight multipliers. Set to None to disable event weighting.
-# Keys must match the values in the `event_type` column of the interactions table.
-# Example: {"click": 1.0, "cart": 3.0, "purchase": 5.0, "negative": -2.0}
+# Event-type weight multipliers. The series-grain table carries no
+# event_type column (issue #102), so this only applies to a source that
+# does; leave None.
 EVENT_WEIGHTS = None
 
 # --- Feature Engineering Configuration ---
-MIN_WATCH_SECONDS = 30.0
+MIN_WATCH_SECONDS = cfg.MIN_WATCH_SECONDS
 
-# --- Engagement Column Names ---
-# Column in the engagement table that contains the event type (e.g., "click", "purchase").
-# Set to None if the column does not exist or event weighting is not needed.
-EVENT_TYPE_COL = None      # e.g., "event_type" or "engagement_type"
-
-# Column in the engagement table that contains the event timestamp.
-# Used to compute `days_ago` for temporal decay. Set to None to skip.
-TIMESTAMP_COL = "view_ts"  # e.g., "view_ts", "event_timestamp"
+# Timestamp / date column of ENGAGEMENT_TABLE; the "raw" source derives
+# view_date from it, and user features take each user's latest row by it.
+TIMESTAMP_COL = cfg.VIEWERSHIP_DATE_COL  # a DATE or TIMESTAMP column
 
 # COMMAND ----------
 
@@ -128,37 +166,36 @@ df_meta = spark.table(METADATA_TABLE)
 # ---
 # A. Create Interactions DataFrame
 # ---
-# Base schema: ["user_id", "item_id", "value"]
-# Optional columns for advanced weighting: "event_type" (str), "days_ago" (float)
-print("Building Interactions table...")
+# Daily grain (issue #102): ["user_id", "item_id", "view_date", "value",
+# "num_views"] + "days_ago" derived at read time. value is
+# sum(ln(seconds + 1)) over a day's views of a series.
+#
+# `df_interactions_daily` keeps one row per profile x series x day and is
+# what the sequence models (SASRec, BERT4Rec) consume. `df_interactions`
+# collapses it to one row per (user, item) for EASE, applying DECAY_RATE per
+# day before summing and keeping days_ago of the most recent day. Both
+# backends would compute the same Gram from the daily rows; the pair frame
+# just ships far fewer rows and avoids a quadratic self-join.
+print(f"Building Interactions table from source={INTERACTIONS_SOURCE!r}...")
 
-# Start with the base columns
-_interaction_cols = [
-    F.col("anonymous_id").alias("user_id"),
-    F.col("view_media_id").alias("item_id"),
-    # We use log-transform for watch time. Add 1 to avoid log(0).
-    (F.log(F.col("view_seconds_watched") + 1.0)).alias("value"),
-]
-
-# Add event_type column if configured (required for event_weights in Rust)
-if EVENT_TYPE_COL is not None:
-    _interaction_cols.append(F.col(EVENT_TYPE_COL).cast(StringType()).alias("event_type"))
-
-# Add days_ago column if configured (required for decay_rate in Rust)
-if TIMESTAMP_COL is not None and DECAY_RATE > 0.0:
-    _interaction_cols.append(
-        F.datediff(F.current_date(), F.to_date(F.col(TIMESTAMP_COL)))
-        .cast("double")
-        .alias("days_ago")
+if INTERACTIONS_SOURCE == "agg":
+    df_daily = spark.table(cfg.INTERACTIONS_AGG_TABLE)
+elif INTERACTIONS_SOURCE == "raw":
+    df_daily = aggregate_viewership_daily(
+        df_eng,
+        user_col=USER_ID_COL,
+        item_col=ITEM_ID_COL,
+        date_col=TIMESTAMP_COL,
+        seconds_col=WATCH_SECONDS_COL,
+        min_watch_seconds=MIN_WATCH_SECONDS,
+        subsidiary_col=SUBSIDIARY_COL,
+        subsidiary=SUBSIDIARY,
     )
+else:
+    raise ValueError(f"INTERACTIONS_SOURCE={INTERACTIONS_SOURCE!r}; expected 'agg' or 'raw'")
 
-df_interactions = (
-    df_eng
-    .filter(F.col("view_seconds_watched") >= MIN_WATCH_SECONDS)
-    .select(*_interaction_cols)
-    .filter(F.col("user_id").isNotNull() & F.col("item_id").isNotNull())
-    .distinct() # Or group by user/item and sum/avg value
-)
+df_interactions_daily = filter_activity_window(with_days_ago(df_daily), ACTIVITY_WINDOW_DAYS)
+df_interactions = daily_to_pairs(df_interactions_daily, decay_rate=DECAY_RATE)
 
 # ---
 # B. Create User Features DataFrame
@@ -192,25 +229,6 @@ def to_long_format(df: DataFrame, id_col: str, feature_cols: list) -> DataFrame:
 
     return final_df.distinct()
 
-# Select only the user features we want from the engagement table
-# We take the most recent record for each user to get their "current" state
-df_user_base = (
-    df_eng
-    .select(
-        "anonymous_id",
-        "view_ts",
-        "view_subscription_plan",
-        "account_country_code_account",
-        "account_tenure_days",
-        "region_major_account",
-        "subscription_status"
-    )
-    .filter(F.col("anonymous_id").isNotNull())
-    # Get the latest row for each user
-    .orderBy(F.col("view_ts").desc())
-    .dropDuplicates(["anonymous_id"])
-)
-
 # ---
 # Experiment here! Add or remove columns from this list.
 # ---
@@ -221,12 +239,36 @@ categorical_user_features = [
     "subscription_status"
 ]
 
-df_user_categorical = to_long_format(df_user_base, "anonymous_id", categorical_user_features)
+# Each user's most recent engagement row gives their "current" state. Only
+# users present in the interactions frame are kept, so the full engagement
+# table is scanned once for features and the user mapping matches the
+# interactions exactly. row_number() over an explicit window is
+# deterministic; orderBy + dropDuplicates is not.
+df_user_base = (
+    df_eng
+    .filter(F.col(SUBSIDIARY_COL) == F.lit(SUBSIDIARY))
+    .filter(F.nullif(F.trim(F.col(USER_ID_COL)), F.lit("")).isNotNull())
+    .join(
+        active_users(df_interactions_daily).withColumnRenamed("user_id", "_active_uid"),
+        F.col(USER_ID_COL) == F.col("_active_uid"),
+        "inner",
+    )
+    .drop("_active_uid")
+    .select(USER_ID_COL, TIMESTAMP_COL, "account_tenure_days", *categorical_user_features)
+    .withColumn(
+        "_rn",
+        F.row_number().over(Window.partitionBy(USER_ID_COL).orderBy(F.col(TIMESTAMP_COL).desc())),
+    )
+    .filter(F.col("_rn") == 1)
+    .drop("_rn")
+)
+
+df_user_categorical = to_long_format(df_user_base, USER_ID_COL, categorical_user_features)
 
 # Example of a numerical feature (bucketizing tenure)
 df_user_tenure = (
     df_user_base
-    .select("anonymous_id", "account_tenure_days")
+    .select(USER_ID_COL, "account_tenure_days")
     .withColumn("feature_name",
                 F.when(F.col("account_tenure_days").isNull(), F.lit("tenure_unknown"))
                 .when(F.col("account_tenure_days") <= 0, F.lit("tenure_0d"))
@@ -236,14 +278,14 @@ df_user_tenure = (
                 .otherwise(F.lit("tenure_90d+"))
                 )
     .withColumn("value", F.lit(1.0))
-    .select("anonymous_id", "feature_name", "value")
+    .select(USER_ID_COL, "feature_name", "value")
 )
 
 # Combine all user feature tables
 df_user_features = (
     df_user_categorical
     .unionByName(df_user_tenure)
-    .withColumnRenamed("anonymous_id", "user_id")
+    .withColumnRenamed(USER_ID_COL, "user_id")
     .distinct()
 )
 
@@ -307,8 +349,27 @@ df_item_features = (
 # We coalesce to 1 partition to write a *single* Parquet file.
 # This is VASTLY faster for the single-threaded Polars reader in Rust
 # than reading a directory of 200+ sharded Parquet files.
+#
+# The pair-grain frame is written for EASE (both backends; the "rust"
+# backend trains from it, and evaluation / tuning read it either way). Set
+# WRITE_DAILY_INTERACTIONS to also write the daily grain for SASRec /
+# BERT4Rec, which need per-event days_ago.
+WRITE_DAILY_INTERACTIONS = False
+SPARK_I_DAILY_PATH = SPARK_I_PATH.replace("interactions.parquet", "interactions_daily.parquet")
+TEMP_I_DAILY_PATH = TEMP_I_PATH.replace("interactions.parquet", "interactions_daily.parquet")
 
 try:
+    if WRITE_DAILY_INTERACTIONS:
+        print(f"Writing daily-grain Interactions data to {SPARK_I_DAILY_PATH}...")
+        (
+            df_interactions_daily
+            .select("user_id", "item_id", "value", "days_ago")
+            .coalesce(1)
+            .write
+            .mode("overwrite")
+            .parquet(SPARK_I_DAILY_PATH)
+        )
+
     print(f"Writing Interactions data to {SPARK_I_PATH}...")
     start_write = time.time()
     (
@@ -353,17 +414,18 @@ except Exception as e:
 # Step 5: Train the Rust Model
 # --
 
-# This one-time step loads data from the Parquet files,
-# builds all matrices, and trains the model in Rust.
-print("Starting model training (calling Rust library)...")
+# "rust": load the Parquet files, build all matrices and train in Rust.
+# "spark": compute the Gram blocks in Spark and solve on the driver, then
+# save the FEAS file and load it with the native extension so Steps 6+ are
+# backend-agnostic.
+print(f"Starting model training (backend={TRAINING_BACKEND!r})...")
 start_train = time.time()
 
 try:
-    # Build keyword arguments for optional weighting params.
-    # Only pass non-default values so the Rust API stays backward-compatible.
+    # Keyword arguments for the optional weighting params. Only non-default
+    # values are passed so the Rust API stays backward-compatible. DECAY_RATE
+    # is deliberately absent: it was applied in Spark by daily_to_pairs.
     _train_kwargs = {}
-    if DECAY_RATE > 0.0:
-        _train_kwargs["decay_rate"] = DECAY_RATE
     if IPS_ALPHA > 0.0:
         _train_kwargs["ips_alpha"] = IPS_ALPHA
     if SPARSITY_THRESHOLD > 0.0:
@@ -371,15 +433,42 @@ try:
     if EVENT_WEIGHTS is not None:
         _train_kwargs["event_weights"] = EVENT_WEIGHTS
 
-    model = fease.build_and_train(
-        interactions_path=TEMP_I_PATH,
-        user_features_path=TEMP_U_PATH,
-        item_features_path=TEMP_T_PATH,
-        alpha=ALPHA,
-        beta=BETA,
-        lambda_=LAMBDA,  # Note the trailing underscore
-        **_train_kwargs,
-    )
+    if TRAINING_BACKEND == "rust":
+        model = fease.build_and_train(
+            interactions_path=TEMP_I_PATH,
+            user_features_path=TEMP_U_PATH,
+            item_features_path=TEMP_T_PATH,
+            alpha=ALPHA,
+            beta=BETA,
+            lambda_=LAMBDA,  # Note the trailing underscore
+            **_train_kwargs,
+        )
+    elif TRAINING_BACKEND == "spark":
+        from kzn_recsys.spark import WeightingConfig
+        from kzn_recsys.spark import build_and_train as spark_build_and_train
+
+        _weighting = None
+        if _train_kwargs:
+            _weighting = WeightingConfig(
+                event_weights=EVENT_WEIGHTS,
+                decay_rate=0.0,  # already applied per day in daily_to_pairs
+                ips_alpha=IPS_ALPHA,
+                sparsity_threshold=SPARSITY_THRESHOLD,
+            )
+        spark_model = spark_build_and_train(
+            df_interactions,
+            df_user_features,
+            df_item_features,
+            alpha=ALPHA,
+            beta=BETA,
+            lambda_=LAMBDA,
+            weighting=_weighting,
+            strategy="distributed",  # only the (M+K)^2 Gram reaches the driver
+        )
+        spark_model.save(MODEL_SAVE_PATH)
+        model = fease.load_model(MODEL_SAVE_PATH)
+    else:
+        raise ValueError(f"TRAINING_BACKEND={TRAINING_BACKEND!r}; expected 'rust' or 'spark'")
 
     print(f"Training complete in {time.time() - start_train:.2f}s")
     print(f"Model trained on {model.num_items} items and {model.num_user_features} user features.")
@@ -462,7 +551,10 @@ print(
     f"({train_users} train users, {test_users} test users)"
 )
 
-# Train a model on the training split for evaluation.
+# Train a model on the training split for evaluation. This retrains with the
+# native extension on the split regardless of TRAINING_BACKEND; for
+# multi-year history use the bundle's 03_evaluate notebook (Spark backend,
+# availability-aware) instead.
 # Reuse the same _train_kwargs pattern so disabled weighting stays backward-compatible.
 eval_model = fease.build_and_train(
     interactions_path=train_split,

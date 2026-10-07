@@ -156,3 +156,42 @@ def test_availability_report_matches_native(spark, tmp_path):
         assert nb["num_users"] == sb["num_users"], nb["label"]
         for n, s in zip(nb["metrics"], sb["metrics"]):
             assert abs(n["ndcg"] - s["ndcg"]) < 1e-6
+
+
+def test_pair_frame_matches_native_decay_on_daily_rows(spark, tmp_path):
+    """Decay applied per day in Spark (daily_to_pairs) then Rust with no
+    decay == Rust applying decay per row on the daily grain (#102)."""
+    import datetime as dt
+    import polars as pl
+    from kzn_recsys.spark.interactions_agg import daily_to_pairs, with_days_ago
+
+    as_of = dt.date(2026, 10, 7)
+    daily_rows = [("p1", "S1", dt.date(2026, 10, 1), 2.0, 2), ("p1", "S1", dt.date(2026, 10, 5), 1.0, 1),
+                  ("p1", "S2", dt.date(2026, 10, 6), 0.5, 1), ("p2", "S1", dt.date(2026, 9, 30), 3.0, 1),
+                  ("p2", "S2", dt.date(2026, 10, 3), 1.5, 1)]
+    daily = spark.createDataFrame(
+        daily_rows, "user_id string, item_id string, view_date date, value double, num_views long")
+    daily = with_days_ago(daily, as_of=as_of)
+    rate = 0.05
+    pairs = daily_to_pairs(daily, decay_rate=rate).collect()
+
+    icols = {"user_id": pl.String, "item_id": pl.String, "value": pl.Float64, "days_ago": pl.Float64}
+    pair_p = _write_long_parquet([(r["user_id"], r["item_id"], r["value"], r["days_ago"]) for r in pairs],
+                                 icols, tmp_path, "pairs.parquet")
+    daily_p = _write_long_parquet(
+        [(r["user_id"], r["item_id"], r["value"], r["days_ago"])
+         for r in daily.select("user_id", "item_id", "value", "days_ago").collect()],
+        icols, tmp_path, "daily.parquet")
+    u_p = _write_long_parquet([], ["user_id", "feature_name", "value"], tmp_path, "u.parquet")
+    t_p = _write_long_parquet([], ["item_id", "feature_name", "value"], tmp_path, "t.parquet")
+
+    from_pairs = _native.build_and_train(interactions_path=pair_p, user_features_path=u_p,
+                                         item_features_path=t_p, lambda_=5.0)
+    from_daily = _native.build_and_train(interactions_path=daily_p, user_features_path=u_p,
+                                         item_features_path=t_p, lambda_=5.0, decay_rate=rate)
+    for user_hist in ({"S1": 1.0}, {"S2": 1.0}):
+        a = dict(from_pairs.predict(user_hist, {}, top_k=5))
+        b = dict(from_daily.predict(user_hist, {}, top_k=5))
+        assert set(a) == set(b)
+        for k in a:
+            assert abs(a[k] - b[k]) < 1e-6
