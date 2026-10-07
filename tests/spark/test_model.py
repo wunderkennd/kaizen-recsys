@@ -129,3 +129,71 @@ def test_ips_weighting_changes_the_model(spark):
                                                     ips_alpha=0.7, sparsity_threshold=0.0))
     # IPS reweights interaction values by item popularity, so the learned S differs.
     assert not np.allclose(plain.s_matrix, ips.s_matrix)
+
+
+def _availability_frames(spark):
+    """u1/u2 trained on A only; B co-watched with A by u3/u4 so it outranks C.
+    B released 1 day ago -> ineligible at u1's reference time (5 days ago)."""
+    train = spark.createDataFrame(
+        [("u1", "A", 1.0, 50.0), ("u2", "A", 1.0, 50.0),
+         ("u3", "A", 1.0, 50.0), ("u3", "B", 1.0, 40.0), ("u3", "C", 1.0, 30.0),
+         ("u4", "A", 1.0, 50.0), ("u4", "B", 1.0, 40.0)],
+        ["user_id", "item_id", "value", "days_ago"],
+    )
+    test = spark.createDataFrame([("u1", "C", 1.0, 5.0)], ["user_id", "item_id", "value", "days_ago"])
+    av = spark.createDataFrame(
+        [("A", "A1", "*", 100.0, None), ("B", "B1", "*", 1.0, None), ("C", "C1", "*", 100.0, None)],
+        "item_id string, season_id string, territory string, "
+        "available_from_days_ago double, available_to_days_ago double",
+    )
+    users = spark.createDataFrame(
+        [("u1", "region_US", 1.0), ("u2", "region_EMEA", 1.0)],
+        ["user_id", "feature_name", "value"],
+    )
+    empty_t = spark.createDataFrame([], "item_id string, feature_name string, value double")
+    return train, test, av, users, empty_t
+
+
+def test_evaluate_with_availability_filters_late_release(spark):
+    train, test, av, users, empty_t = _availability_frames(spark)
+    model = build_and_train(train, users, empty_t, alpha=1.0, beta=1.0, lambda_=1.0)
+    plain = model.evaluate(test, train, users, k_values=[1, 2])
+    assert "availability" not in plain
+    assert plain["metrics"][0]["precision"] == 0.0  # B outranks C on the full catalog
+
+    report = model.evaluate(test, train, users, k_values=[1, 2], availability_df=av)
+    assert report["num_users"] == 1
+    assert report["metrics"][0]["precision"] == 1.0
+    a = report["availability"]
+    assert a["reference_days_ago"] is None
+    assert a["num_eligible_items"] == 2
+    assert a["num_items_without_availability"] == 0
+    assert a["num_test_interactions_dropped"] == 0 and a["num_users_skipped"] == 0
+    assert report["coverage"] == 0.5
+    assert [b["label"] for b in a["item_age_buckets"]] == ["<30d", "30-365d", ">=365d"]
+    assert a["item_age_buckets"][1]["num_users"] == 1
+    assert a["item_age_buckets"][1]["metrics"][0]["ndcg"] == 1.0
+    assert a["item_age_buckets"][0]["metrics"] == []
+
+    with pytest.raises(ValueError, match="availability_df"):
+        model.evaluate(test, train, users, k_values=[1], reference_days_ago=5.0)
+    with pytest.raises(ValueError, match="days_ago"):
+        model.evaluate(test.drop("days_ago"), train, users, k_values=[1], availability_df=av)
+
+
+def test_evaluate_with_availability_territory_rollup(spark):
+    train, _, _, users, empty_t = _availability_frames(spark)
+    test = spark.createDataFrame([("u1", "C", 1.0), ("u2", "C", 1.0)], ["user_id", "item_id", "value"])
+    av = spark.createDataFrame(
+        [("A", "*", 100.0, None), ("C", "US", 400.0, 300.0), ("C", "US", 20.0, None)],
+        "item_id string, territory string, available_from_days_ago double, available_to_days_ago double",
+    )
+    model = build_and_train(train, users, empty_t, alpha=1.0, beta=1.0, lambda_=1.0)
+    report = model.evaluate(test, train, users, k_values=[1], availability_df=av,
+                            user_territory_feature="region", reference_days_ago=5.0)
+    assert report["num_users"] == 1
+    assert report["availability"]["num_users_skipped"] == 1
+    assert report["availability"]["num_test_interactions_dropped"] == 1
+    assert report["availability"]["num_items_without_availability"] == 1  # B
+    assert report["metrics"][0]["hit_rate"] == 1.0
+    assert report["availability"]["item_age_buckets"][2]["num_users"] == 1  # first season, 400d

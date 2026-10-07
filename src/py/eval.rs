@@ -182,3 +182,38 @@ pub fn leave_k_out_split(
         stats.test_users,
     ))
 }
+
+/// Leave-last-K-out split: holds out each user's `k` most recent
+/// interactions (smallest `days_ago`) for test.
+///
+/// The time-aware counterpart of `leave_k_out_split`: deterministic, no
+/// future interactions in a user's train context, and a per-user
+/// reference time (the oldest held-out interaction) for availability-
+/// aware evaluation. Users with fewer than k+1 interactions go entirely
+/// to train. The file must carry a non-null numeric `days_ago` column.
+///
+/// Args:
+///     interactions_path (str): Path to interactions Parquet/CSV file.
+///     train_output (str): Output path for the train split.
+///     test_output (str): Output path for the test split.
+///     k (int): Number of most-recent interactions to hold out per user.
+///
+/// Returns:
+///     tuple[int, int, int, int]: (train_interactions, test_interactions, train_users, test_users)
+#[pyfunction]
+#[pyo3(signature = (interactions_path, train_output, test_output, k=1))]
+pub fn leave_last_k_out_split(
+    interactions_path: &str,
+    train_output: &str,
+    test_output: &str,
+    k: usize,
+) -> PyResult<(usize, usize, usize, usize)> {
+    let stats = evaluation::leave_last_k_out_split(interactions_path, train_output, test_output, k)
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+    Ok((
+        stats.train_interactions,
+        stats.test_interactions,
+        stats.train_users,
+        stats.test_users,
+    ))
+}

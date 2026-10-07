@@ -525,20 +525,35 @@ result = temporal_split_safe(
     output_dir="/path/to/workspace",
 )
 
-# Leave-K-out (hold out K items per user)
+# Leave-K-out (hold out K random items per user)
 result = leave_k_out_split_safe(
     "interactions.parquet",
     k=1,
     seed=42,
     output_dir="/path/to/workspace",
 )
+
+# Leave-last-K-out (hold out each user's K most recent items; needs `days_ago`)
+result = leave_last_k_out_split_safe(
+    "interactions.parquet",
+    k=1,
+    output_dir="/path/to/workspace",
+)
 ```
 
 For full control over the file paths, the underlying Rust functions
-(`fease.random_split`, `fease.temporal_split`, `fease.leave_k_out_split`) take
-explicit `train_output` / `test_output` arguments and return a flat
+(`fease.random_split`, `fease.temporal_split`, `fease.leave_k_out_split`,
+`fease.leave_last_k_out_split`) take explicit `train_output` / `test_output`
+arguments and return a flat
 `(train_interactions, test_interactions, train_users, test_users)` 4-tuple of
 counts.
+
+Leave-last-K-out is the time-aware counterpart of leave-K-out: it is
+deterministic, never puts a *later* interaction in a user's train context
+than the one held out, and gives each user a well-defined reference time
+(their oldest held-out interaction), which availability-aware evaluation
+below relies on. Random leave-K-out has no reference time and is best kept
+for sanity checks.
 
 ### Model Evaluation
 
@@ -555,6 +570,69 @@ for m in report["metrics"]:
 print(f"  Coverage: {report['coverage']:.4f}")
 print(f"  Users evaluated: {report['num_users']}, interactions: {report['num_interactions']}")
 ```
+
+### Availability-aware evaluation
+
+Over a multi-year window not every title was available to every user at
+every time: it may not have been released yet, it may have left the
+catalog, or it may be licensed only in some territories. The plain harness
+ranks the whole catalog, so it charges the model for recommending titles
+the user could not have watched and measures coverage against items nobody
+could have been shown. Passing an **availability table** restricts each
+user's ranking to the items eligible for them at their **reference time**:
+
+```python
+report = model.evaluate(
+    test_interactions_path="test.parquet",
+    train_interactions_path="train.parquet",
+    user_features_path="user_features.parquet",
+    k_values=[10],
+    availability_path="availability.parquet",
+    user_territory_feature="region",   # optional: one-hot `region_<value>` user feature
+    reference_days_ago=30.0,           # optional: the temporal split's cutoff
+    item_age_bucket_edges=[30, 365],   # optional: default
+)
+a = report["availability"]
+print(a["num_eligible_items"], a["num_test_interactions_dropped"], a["num_users_skipped"])
+for bucket in a["item_age_buckets"]:
+    print(bucket["label"], bucket["num_users"], bucket["metrics"])
+```
+
+- **Table** (long format, Parquet or CSV): `item_id` (series id, same id
+  space as the interactions), optional `territory` (`"*"` or absent =
+  global), `available_from_days_ago`, optional nullable
+  `available_to_days_ago` (null = still available). Several rows per item
+  roll up to the item, so season-level windows (`season_id` is carried but
+  ignored) make the series eligible whenever any season is. A window
+  contains reference time `r` when `from >= r` and (`to` is null or
+  `to < r`). Items with no row are never eligible and are counted in
+  `num_items_without_availability`.
+- **Territory**: `user_territory_feature` names the categorical user-feature
+  *column*; the long-format file names one-hot categoricals
+  `<column>_<value>`, so a user's territory is the `<value>` suffix of the
+  first such feature with a positive value. Users without one see global
+  rows only. Requires `user_features_path`.
+- **Reference time**: `reference_days_ago` when given (the temporal split's
+  cutoff); otherwise per user, the oldest held-out interaction (largest
+  `days_ago` in that user's test rows), which is what leave-last-K-out
+  produces. The per-user form requires a non-null `days_ago` column in the
+  test file. A random split has no reference time, so do not combine it
+  with availability filtering.
+- **Report**: relevant items that were ineligible are dropped and counted
+  (`num_test_interactions_dropped`), users left with no eligible relevant
+  item are skipped (`num_users_skipped`), `coverage` divides by the union
+  of evaluated users' eligible sets (`num_eligible_items`), and
+  `item_age_buckets` repeats the metrics with the relevant set restricted
+  to items whose age at the reference time falls in each bucket, so a
+  freshly launched series (cold-start for everyone) does not read as a
+  regression. Without `availability_path` the report is byte-identical to
+  before and has no `availability` key.
+
+All four models' `evaluate` methods accept the same arguments, and the
+PySpark `SparkEaseModel.evaluate` mirrors them with `availability_df`
+(a Spark DataFrame) in place of the path. The ONNX serving graph's
+eligibility `mask` input applies the same semantics at serving time, so
+offline metrics measure the ranking the serving stack actually produces.
 
 ### Ranking Metrics (standalone)
 

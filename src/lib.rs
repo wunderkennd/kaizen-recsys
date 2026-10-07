@@ -33,6 +33,105 @@ mod transform;
 pub mod tuning;
 mod weighting;
 
+// ---------------------------------------------------------------------------
+// Shared evaluate() plumbing (#101): every model's `evaluate` builds the
+// same EvalConfig from the same optional availability kwargs and renders
+// the same report dict, so the Python surface stays identical across
+// EASE / SASRec / Two-Tower / BERT4Rec.
+// ---------------------------------------------------------------------------
+
+fn build_eval_config(
+    k_values: Option<Vec<usize>>,
+    availability_path: Option<String>,
+    user_territory_feature: Option<String>,
+    reference_days_ago: Option<f64>,
+    item_age_bucket_edges: Option<Vec<f64>>,
+) -> PyResult<evaluation::EvalConfig> {
+    let mut config = evaluation::EvalConfig::new(k_values.unwrap_or_else(|| vec![5, 10, 20, 50]));
+    match availability_path {
+        Some(path) => {
+            let mut av = evaluation::AvailabilityConfig::new(path);
+            av.user_territory_feature = user_territory_feature;
+            av.reference_days_ago = reference_days_ago;
+            if let Some(edges) = item_age_bucket_edges {
+                av.item_age_bucket_edges = edges;
+            }
+            config.availability = Some(av);
+        }
+        None => {
+            if user_territory_feature.is_some()
+                || reference_days_ago.is_some()
+                || item_age_bucket_edges.is_some()
+            {
+                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                    "user_territory_feature / reference_days_ago / item_age_bucket_edges \
+                     require availability_path",
+                ));
+            }
+        }
+    }
+    Ok(config)
+}
+
+fn metrics_at_k_to_py<'py>(
+    py: Python<'py>,
+    metrics: &[evaluation::MetricsAtK],
+) -> PyResult<Bound<'py, PyList>> {
+    let list = PyList::empty(py);
+    for m in metrics {
+        let d = PyDict::new(py);
+        d.set_item("k", m.k)?;
+        d.set_item("precision", m.precision)?;
+        d.set_item("recall", m.recall)?;
+        d.set_item("ndcg", m.ndcg)?;
+        d.set_item("map", m.map)?;
+        d.set_item("hit_rate", m.hit_rate)?;
+        list.append(d)?;
+    }
+    Ok(list)
+}
+
+/// Report dict: `num_users`, `num_interactions`, `coverage`, `metrics`,
+/// plus an `availability` sub-dict only when an availability table was
+/// supplied (so existing callers see exactly the keys they always did).
+fn eval_report_to_py<'py>(
+    py: Python<'py>,
+    report: &evaluation::EvalReport,
+) -> PyResult<Bound<'py, PyDict>> {
+    let result = PyDict::new(py);
+    result.set_item("num_users", report.num_users)?;
+    result.set_item("num_interactions", report.num_interactions)?;
+    result.set_item("coverage", report.coverage)?;
+    result.set_item("metrics", metrics_at_k_to_py(py, &report.metrics_at_k)?)?;
+    if let Some(av) = &report.availability {
+        let a = PyDict::new(py);
+        a.set_item("reference_days_ago", av.reference_days_ago)?;
+        a.set_item("num_eligible_items", av.num_eligible_items)?;
+        a.set_item(
+            "num_items_without_availability",
+            av.num_items_without_availability,
+        )?;
+        a.set_item(
+            "num_test_interactions_dropped",
+            av.num_test_interactions_dropped,
+        )?;
+        a.set_item("num_users_skipped", av.num_users_skipped)?;
+        let buckets = PyList::empty(py);
+        for b in &av.item_age_buckets {
+            let d = PyDict::new(py);
+            d.set_item("label", &b.label)?;
+            d.set_item("min_age_days", b.min_age_days)?;
+            d.set_item("max_age_days", b.max_age_days)?;
+            d.set_item("num_users", b.num_users)?;
+            d.set_item("metrics", metrics_at_k_to_py(py, &b.metrics_at_k)?)?;
+            buckets.append(d)?;
+        }
+        a.set_item("item_age_buckets", buckets)?;
+        result.set_item("availability", a)?;
+    }
+    Ok(result)
+}
+
 /// A Python-accessible class that holds the trained FEASE model.
 ///
 /// This struct is a thin wrapper around the internal `RustFeaseModel`,
@@ -395,7 +494,8 @@ impl FeaseModel {
     ///         - "coverage" (float)
     ///         - "metrics" (list[dict]): Per-K metrics, each with keys:
     ///           "k", "precision", "recall", "ndcg", "map", "hit_rate"
-    #[pyo3(signature = (test_interactions_path, train_interactions_path, user_features_path=None, k_values=None))]
+    #[pyo3(signature = (test_interactions_path, train_interactions_path, user_features_path=None, k_values=None, availability_path=None, user_territory_feature=None, reference_days_ago=None, item_age_bucket_edges=None))]
+    #[allow(clippy::too_many_arguments)]
     fn evaluate<'py>(
         &self,
         py: Python<'py>,
@@ -403,16 +503,19 @@ impl FeaseModel {
         train_interactions_path: &str,
         user_features_path: Option<&str>,
         k_values: Option<Vec<usize>>,
+        availability_path: Option<String>,
+        user_territory_feature: Option<String>,
+        reference_days_ago: Option<f64>,
+        item_age_bucket_edges: Option<Vec<f64>>,
     ) -> PyResult<Bound<'py, PyDict>> {
-        let config = evaluation::EvalConfig {
-            k_values: k_values.unwrap_or_else(|| vec![5, 10, 20, 50]),
-        };
-
-        // The evaluation harness is generalized over `&dyn RecModel`
-        // (Phase 4a, issue #30). Wrap the concrete EASE model in a
-        // borrowing adapter; the math is identical so PyO3 outputs stay
-        // byte-identical (only a single `as f32` score round-trip), and
-        // borrowing avoids deep-cloning the S matrix on every call.
+        let config = crate::build_eval_config(
+            k_values,
+            availability_path,
+            user_territory_feature,
+            reference_days_ago,
+            item_age_bucket_edges,
+        )?;
+        // Borrowing adapter: identical math, no deep-clone of the S matrix.
         let adapter = crate::models::EaseAdapterRef::new(&self.model);
         let report = evaluation::evaluate_model(
             &adapter,
@@ -422,26 +525,7 @@ impl FeaseModel {
             &config,
         )
         .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
-
-        let result = PyDict::new(py);
-        result.set_item("num_users", report.num_users)?;
-        result.set_item("num_interactions", report.num_interactions)?;
-        result.set_item("coverage", report.coverage)?;
-
-        let metrics_list = PyList::empty(py);
-        for m in &report.metrics_at_k {
-            let m_dict = PyDict::new(py);
-            m_dict.set_item("k", m.k)?;
-            m_dict.set_item("precision", m.precision)?;
-            m_dict.set_item("recall", m.recall)?;
-            m_dict.set_item("ndcg", m.ndcg)?;
-            m_dict.set_item("map", m.map)?;
-            m_dict.set_item("hit_rate", m.hit_rate)?;
-            metrics_list.append(m_dict)?;
-        }
-        result.set_item("metrics", metrics_list)?;
-
-        Ok(result)
+        crate::eval_report_to_py(py, &report)
     }
 
     /// Returns everything the Python ONNX exporter needs to author the graph:
@@ -2454,43 +2538,36 @@ mod sasrec_py {
 
         /// Evaluate against test interactions via the generalized
         /// `&dyn RecModel` harness (same metrics dict as `FeaseModel`).
-        #[pyo3(signature = (test_interactions_path, train_interactions_path, k_values=None))]
+        #[pyo3(signature = (test_interactions_path, train_interactions_path, user_features_path=None, k_values=None, availability_path=None, user_territory_feature=None, reference_days_ago=None, item_age_bucket_edges=None))]
+        #[allow(clippy::too_many_arguments)]
         fn evaluate<'py>(
             &self,
             py: Python<'py>,
             test_interactions_path: &str,
             train_interactions_path: &str,
+            user_features_path: Option<&str>,
             k_values: Option<Vec<usize>>,
+            availability_path: Option<String>,
+            user_territory_feature: Option<String>,
+            reference_days_ago: Option<f64>,
+            item_age_bucket_edges: Option<Vec<f64>>,
         ) -> PyResult<Bound<'py, PyDict>> {
-            let config = evaluation::EvalConfig {
-                k_values: k_values.unwrap_or_else(|| vec![5, 10, 20, 50]),
-            };
+            let config = crate::build_eval_config(
+                k_values,
+                availability_path,
+                user_territory_feature,
+                reference_days_ago,
+                item_age_bucket_edges,
+            )?;
             let report = evaluation::evaluate_model(
                 &self.model,
                 test_interactions_path,
                 train_interactions_path,
-                None,
+                user_features_path,
                 &config,
             )
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
-
-            let result = PyDict::new(py);
-            result.set_item("num_users", report.num_users)?;
-            result.set_item("num_interactions", report.num_interactions)?;
-            result.set_item("coverage", report.coverage)?;
-            let metrics_list = PyList::empty(py);
-            for m in &report.metrics_at_k {
-                let d = PyDict::new(py);
-                d.set_item("k", m.k)?;
-                d.set_item("precision", m.precision)?;
-                d.set_item("recall", m.recall)?;
-                d.set_item("ndcg", m.ndcg)?;
-                d.set_item("map", m.map)?;
-                d.set_item("hit_rate", m.hit_rate)?;
-                metrics_list.append(d)?;
-            }
-            result.set_item("metrics", metrics_list)?;
-            Ok(result)
+            crate::eval_report_to_py(py, &report)
         }
 
         /// Persist the model to `path` (framed `FSAS` format).
@@ -2831,43 +2908,36 @@ mod bert4rec_py {
         /// `&dyn RecModel` harness (same metrics dict as `FeaseModel`).
         /// The train file must carry `days_ago` so each user's history
         /// can be ordered and bucketed.
-        #[pyo3(signature = (test_interactions_path, train_interactions_path, k_values=None))]
+        #[pyo3(signature = (test_interactions_path, train_interactions_path, user_features_path=None, k_values=None, availability_path=None, user_territory_feature=None, reference_days_ago=None, item_age_bucket_edges=None))]
+        #[allow(clippy::too_many_arguments)]
         fn evaluate<'py>(
             &self,
             py: Python<'py>,
             test_interactions_path: &str,
             train_interactions_path: &str,
+            user_features_path: Option<&str>,
             k_values: Option<Vec<usize>>,
+            availability_path: Option<String>,
+            user_territory_feature: Option<String>,
+            reference_days_ago: Option<f64>,
+            item_age_bucket_edges: Option<Vec<f64>>,
         ) -> PyResult<Bound<'py, PyDict>> {
-            let config = evaluation::EvalConfig {
-                k_values: k_values.unwrap_or_else(|| vec![5, 10, 20, 50]),
-            };
+            let config = crate::build_eval_config(
+                k_values,
+                availability_path,
+                user_territory_feature,
+                reference_days_ago,
+                item_age_bucket_edges,
+            )?;
             let report = evaluation::evaluate_model(
                 &self.model,
                 test_interactions_path,
                 train_interactions_path,
-                None,
+                user_features_path,
                 &config,
             )
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
-
-            let result = PyDict::new(py);
-            result.set_item("num_users", report.num_users)?;
-            result.set_item("num_interactions", report.num_interactions)?;
-            result.set_item("coverage", report.coverage)?;
-            let metrics_list = PyList::empty(py);
-            for m in &report.metrics_at_k {
-                let d = PyDict::new(py);
-                d.set_item("k", m.k)?;
-                d.set_item("precision", m.precision)?;
-                d.set_item("recall", m.recall)?;
-                d.set_item("ndcg", m.ndcg)?;
-                d.set_item("map", m.map)?;
-                d.set_item("hit_rate", m.hit_rate)?;
-                metrics_list.append(d)?;
-            }
-            result.set_item("metrics", metrics_list)?;
-            Ok(result)
+            crate::eval_report_to_py(py, &report)
         }
 
         /// Persist the model to `path` (framed `FB4R` format).
@@ -3165,43 +3235,36 @@ mod two_tower_py {
         /// Evaluate against test interactions via the `&dyn RecModel`
         /// harness routed through `TwoTowerEvalAdapter` (same metrics
         /// dict shape as `FeaseModel.evaluate`).
-        #[pyo3(signature = (test_interactions_path, train_interactions_path, k_values=None))]
+        #[pyo3(signature = (test_interactions_path, train_interactions_path, user_features_path=None, k_values=None, availability_path=None, user_territory_feature=None, reference_days_ago=None, item_age_bucket_edges=None))]
+        #[allow(clippy::too_many_arguments)]
         fn evaluate<'py>(
             &self,
             py: Python<'py>,
             test_interactions_path: &str,
             train_interactions_path: &str,
+            user_features_path: Option<&str>,
             k_values: Option<Vec<usize>>,
+            availability_path: Option<String>,
+            user_territory_feature: Option<String>,
+            reference_days_ago: Option<f64>,
+            item_age_bucket_edges: Option<Vec<f64>>,
         ) -> PyResult<Bound<'py, PyDict>> {
-            let config = evaluation::EvalConfig {
-                k_values: k_values.unwrap_or_else(|| vec![5, 10, 20, 50]),
-            };
+            let config = crate::build_eval_config(
+                k_values,
+                availability_path,
+                user_territory_feature,
+                reference_days_ago,
+                item_age_bucket_edges,
+            )?;
             let report = evaluation::evaluate_model(
                 &self.model,
                 test_interactions_path,
                 train_interactions_path,
-                None,
+                user_features_path,
                 &config,
             )
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
-
-            let result = PyDict::new(py);
-            result.set_item("num_users", report.num_users)?;
-            result.set_item("num_interactions", report.num_interactions)?;
-            result.set_item("coverage", report.coverage)?;
-            let metrics_list = PyList::empty(py);
-            for m in &report.metrics_at_k {
-                let d = PyDict::new(py);
-                d.set_item("k", m.k)?;
-                d.set_item("precision", m.precision)?;
-                d.set_item("recall", m.recall)?;
-                d.set_item("ndcg", m.ndcg)?;
-                d.set_item("map", m.map)?;
-                d.set_item("hit_rate", m.hit_rate)?;
-                metrics_list.append(d)?;
-            }
-            result.set_item("metrics", metrics_list)?;
-            Ok(result)
+            crate::eval_report_to_py(py, &report)
         }
 
         /// Persist the model to `path` (framed `FTWO` format).
@@ -3454,6 +3517,7 @@ fn _native(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py::eval::random_split, m)?)?;
     m.add_function(wrap_pyfunction!(py::eval::temporal_split, m)?)?;
     m.add_function(wrap_pyfunction!(py::eval::leave_k_out_split, m)?)?;
+    m.add_function(wrap_pyfunction!(py::eval::leave_last_k_out_split, m)?)?;
     m.add_function(wrap_pyfunction!(grid_search_py, m)?)?;
     m.add_function(wrap_pyfunction!(random_search_py, m)?)?;
     m.add_function(wrap_pyfunction!(grid_search_ease, m)?)?;

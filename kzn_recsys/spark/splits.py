@@ -82,3 +82,35 @@ def leave_k_out_split(interactions_df, k: int, seed: int):
         held_out.update(positions[:k])
 
     return _rebuild_from(interactions_df, rows, held_out)
+
+
+def leave_last_k_out_split(interactions_df, k: int):
+    """Hold out each user's k most recent rows (smallest days_ago). Mirrors
+    evaluation.rs::leave_last_k_out_split: deterministic (no RNG), ties on
+    days_ago broken by row order, users with < k+1 rows go entirely to train.
+    Requires a non-null `days_ago` column and raises without one.
+    """
+    if k < 1:
+        raise ValueError("k must be >= 1")
+    if "days_ago" not in interactions_df.columns:
+        raise ValueError(
+            "leave_last_k_out_split requires a `days_ago` column to order each user's "
+            "history; use leave_k_out_split for a random hold-out"
+        )
+    rows = interactions_df.collect()
+    by_user = {}
+    for idx, r in enumerate(rows):
+        d = r["days_ago"]
+        if d is None:
+            raise ValueError(f"leave_last_k_out_split: row {idx} has a null days_ago")
+        by_user.setdefault(r["user_id"], []).append((float(d), idx))
+
+    held_out = set()
+    for uid in sorted(by_user):
+        pairs = by_user[uid]
+        if len(pairs) < k + 1:
+            continue
+        pairs.sort()  # (days_ago, row index): most recent first, file order on ties
+        held_out.update(idx for _, idx in pairs[:k])
+
+    return _rebuild_from(interactions_df, rows, held_out)

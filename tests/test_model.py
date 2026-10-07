@@ -985,3 +985,151 @@ def test_leave_k_out_split_safe(evaluation_data):
     user_counts = test_df.group_by("user_id").agg(pl.col("item_id").count().alias("n"))
     for row in user_counts.iter_rows(named=True):
         assert row["n"] == 2, f"User {row['user_id']} has {row['n']} test items, expected 2"
+
+
+# ---------------------------------------------------------------------------
+# #101: leave-last-K-out split + availability-aware evaluation
+# ---------------------------------------------------------------------------
+
+
+def test_leave_last_k_out_split(evaluation_data):
+    """Holds out each user's most recent interaction; requires days_ago."""
+    i_path, _, _, tmpdir = evaluation_data
+    train_out = str(Path(tmpdir) / "llko_train.parquet")
+    test_out = str(Path(tmpdir) / "llko_test.parquet")
+
+    train_n, test_n, train_u, test_u = fease.leave_last_k_out_split(i_path, train_out, test_out, k=1)
+    assert test_n == 5 and test_u == 5  # every user has >= 2 rows
+    assert train_n == 19 - 5
+    test_df = pl.read_parquet(test_out)
+    # Per user the held-out row is the smallest days_ago in the fixture.
+    held = dict(zip(test_df["user_id"].to_list(), test_df["days_ago"].to_list()))
+    assert held == {"u0": 2.0, "u1": 1.0, "u2": 1.0, "u3": 2.0, "u4": 1.0}
+    # Deterministic: a second call is identical.
+    again = fease.leave_last_k_out_split(i_path, train_out, test_out, k=1)
+    assert again == (train_n, test_n, train_u, test_u)
+
+    # Safe wrapper returns a SplitResult.
+    result = fease.leave_last_k_out_split_safe(i_path, k=2, output_dir=str(Path(tmpdir) / "llko"))
+    # u0 4 rows -> 2 held; u1 3 -> 2; u2 4 -> 2; u3 3 -> 2; u4 5 -> 2 = 10
+    assert result.test_interactions == 10
+
+    no_days = str(Path(tmpdir) / "no_days.parquet")
+    pl.read_parquet(i_path).drop("days_ago").write_parquet(no_days)
+    with pytest.raises(RuntimeError, match="days_ago"):
+        fease.leave_last_k_out_split(no_days, train_out, test_out, k=1)
+
+
+def _availability_fixture(tmpdir):
+    """Train u1/u2 on A only; S from a 3-user EASE fit makes B the top
+    recommendation after A. B is released 1 day ago, so at u1's reference
+    time (5 days ago) it must not be ranked; C is long available; D unlisted."""
+    rows = {
+        "user_id": ["u1", "u2", "u3", "u3", "u3", "u4", "u4"],
+        "item_id": ["A", "A", "A", "B", "C", "A", "B"],
+        "value": [1.0] * 7,
+        "days_ago": [50.0, 50.0, 50.0, 40.0, 30.0, 50.0, 40.0],
+    }
+    train = Path(tmpdir) / "av_train.parquet"
+    pl.DataFrame(rows).write_parquet(train)
+    test = Path(tmpdir) / "av_test.parquet"
+    pl.DataFrame({"user_id": ["u1"], "item_id": ["C"], "value": [1.0], "days_ago": [5.0]}).write_parquet(test)
+    av = Path(tmpdir) / "av.parquet"
+    pl.DataFrame(
+        {
+            "item_id": ["A", "B", "C"],
+            "season_id": ["A1", "B1", "C1"],
+            "territory": ["*", "*", "*"],
+            "available_from_days_ago": [100.0, 1.0, 100.0],
+            "available_to_days_ago": [None, None, None],
+        }
+    ).write_parquet(av)
+    uf = Path(tmpdir) / "av_uf.parquet"
+    pl.DataFrame({"user_id": ["u1", "u2"], "feature_name": ["region_US", "region_EMEA"], "value": [1.0, 1.0]}).write_parquet(uf)
+    empty_uf = Path(tmpdir) / "av_uf_empty.parquet"
+    pl.DataFrame({"user_id": [], "feature_name": [], "value": []}, schema={"user_id": pl.String, "feature_name": pl.String, "value": pl.Float64}).write_parquet(empty_uf)
+    empty_t = Path(tmpdir) / "av_t_empty.parquet"
+    pl.DataFrame({"item_id": [], "feature_name": [], "value": []}, schema={"item_id": pl.String, "feature_name": pl.String, "value": pl.Float64}).write_parquet(empty_t)
+    return str(train), str(test), str(av), str(uf), str(empty_uf), str(empty_t)
+
+
+def test_evaluate_with_availability_filters_late_release(evaluation_data):
+    *_, tmpdir = evaluation_data
+    train, test, av, _, empty_uf, empty_t = _availability_fixture(tmpdir)
+    model = fease.build_and_train(
+        interactions_path=train, user_features_path=empty_uf, item_features_path=empty_t,
+        alpha=1.0, beta=1.0, lambda_=1.0,
+    )
+
+    plain = model.evaluate(test, train, k_values=[1, 2])
+    assert "availability" not in plain
+    top_plain = plain["metrics"][0]
+    # B (co-watched with A by two users) outranks C for u1 on the full catalog.
+    assert top_plain["precision"] == 0.0
+
+    report = model.evaluate(test, train, k_values=[1, 2], availability_path=av)
+    assert report["num_users"] == 1
+    assert report["metrics"][0]["precision"] == 1.0  # B filtered -> C is top
+    a = report["availability"]
+    assert a["reference_days_ago"] is None  # per-user from the test file
+    assert a["num_eligible_items"] == 2  # {A, C}
+    assert a["num_items_without_availability"] == 0  # catalog is A, B, C (D never appears)
+    assert a["num_test_interactions_dropped"] == 0
+    assert a["num_users_skipped"] == 0
+    assert report["coverage"] == 0.5  # 1 recommended item of 2 eligible
+    labels = [b["label"] for b in a["item_age_buckets"]]
+    assert labels == ["<30d", "30-365d", ">=365d"]
+    assert a["item_age_buckets"][1]["num_users"] == 1
+    assert a["item_age_buckets"][1]["metrics"][0]["ndcg"] == 1.0
+    assert a["item_age_buckets"][0]["metrics"] == []
+
+    # Global reference time + custom buckets.
+    custom = model.evaluate(
+        test, train, k_values=[1], availability_path=av, reference_days_ago=5.0,
+        item_age_bucket_edges=[10.0],
+    )
+    assert custom["availability"]["reference_days_ago"] == 5.0
+    assert [b["label"] for b in custom["availability"]["item_age_buckets"]] == ["<10d", ">=10d"]
+
+    # Availability kwargs without a table are a ValueError.
+    with pytest.raises(ValueError, match="availability_path"):
+        model.evaluate(test, train, k_values=[1], reference_days_ago=5.0)
+
+
+def test_evaluate_with_availability_territory_rollup(evaluation_data):
+    *_, tmpdir = evaluation_data
+    train, _, _, uf, _, empty_t = _availability_fixture(tmpdir)
+    test = Path(tmpdir) / "av_test_t.parquet"
+    pl.DataFrame({"user_id": ["u1", "u2"], "item_id": ["C", "C"], "value": [1.0, 1.0]}).write_parquet(test)
+    av = Path(tmpdir) / "av_t.parquet"
+    # C: two US seasons (one expired); nothing for EMEA.
+    pl.DataFrame(
+        {
+            "item_id": ["A", "C", "C"],
+            "territory": ["*", "US", "US"],
+            "available_from_days_ago": [100.0, 400.0, 20.0],
+            "available_to_days_ago": [None, 300.0, None],
+        }
+    ).write_parquet(av)
+    model = fease.build_and_train(
+        interactions_path=train, user_features_path=uf, item_features_path=empty_t,
+        alpha=1.0, beta=1.0, lambda_=1.0,
+    )
+
+    report = model.evaluate(
+        str(test), train, user_features_path=uf, k_values=[1],
+        availability_path=str(av), user_territory_feature="region", reference_days_ago=5.0,
+    )
+    assert report["num_users"] == 1  # EMEA user has no eligible relevant
+    assert report["availability"]["num_users_skipped"] == 1
+    assert report["availability"]["num_test_interactions_dropped"] == 1
+    assert report["availability"]["num_items_without_availability"] == 1  # B
+    assert report["metrics"][0]["hit_rate"] == 1.0
+
+    # Territory feature needs the user-features file.
+    with pytest.raises(RuntimeError, match="user_features_path"):
+        model.evaluate(str(test), train, k_values=[1], availability_path=str(av),
+                       user_territory_feature="region", reference_days_ago=5.0)
+    # Per-user reference time needs days_ago in the test file.
+    with pytest.raises(RuntimeError, match="days_ago"):
+        model.evaluate(str(test), train, user_features_path=uf, k_values=[1], availability_path=str(av))

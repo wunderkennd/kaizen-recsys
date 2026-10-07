@@ -53,6 +53,10 @@ resources:
               ndcg_gate: ${var.ndcg_gate}
               seed: ${var.seed}
               days_ago_cutoff: ${var.days_ago_cutoff}
+              split: ${var.split}
+              holdout_k: ${var.holdout_k}
+              availability_table: ${var.availability_table}
+              user_territory_feature: ${var.user_territory_feature}
           libraries:
             - whl: ../../packaging/pure-python/dist/*.whl
         - task_key: predict
