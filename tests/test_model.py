@@ -1045,7 +1045,9 @@ def _availability_fixture(tmpdir):
         }
     ).write_parquet(av)
     uf = Path(tmpdir) / "av_uf.parquet"
-    pl.DataFrame({"user_id": ["u1", "u2"], "feature_name": ["region_US", "region_EMEA"], "value": [1.0, 1.0]}).write_parquet(uf)
+    # One user per one-hot naming convention (`region_US` from fease_train.py,
+    # `region=EMEA` from the Spark ingest); both must resolve to a territory.
+    pl.DataFrame({"user_id": ["u1", "u2"], "feature_name": ["region_US", "region=EMEA"], "value": [1.0, 1.0]}).write_parquet(uf)
     empty_uf = Path(tmpdir) / "av_uf_empty.parquet"
     pl.DataFrame({"user_id": [], "feature_name": [], "value": []}, schema={"user_id": pl.String, "feature_name": pl.String, "value": pl.Float64}).write_parquet(empty_uf)
     empty_t = Path(tmpdir) / "av_t_empty.parquet"

@@ -15,10 +15,11 @@ Window semantics in ``days_ago`` units (larger = older): a window contains
 reference time ``r`` when ``from >= r`` and (``to`` is null or ``to < r``).
 
 Territory: rows tagged ``"*"`` apply to everyone. A user's territory is the
-``<value>`` suffix of the first user feature named ``<column>_<value>`` with
-a positive value (the ingest's one-hot convention). Users without one see
-global rows only. Items with no row are never eligible and are counted in
-``num_items_without_availability``.
+``<value>`` suffix of their first positive-valued user feature named
+``<column>=<value>`` (the Spark ingest's ``_one_hot_long``) or
+``<column>_<value>`` (``fease_train.py``'s ``to_long_format``); ``=`` is
+checked first. Users without one see global rows only. Items with no row are
+never eligible and are counted in ``num_items_without_availability``.
 """
 from __future__ import annotations
 
@@ -110,15 +111,26 @@ class AvailabilityTable:
         return None if first is None else first - reference_days_ago
 
 
+def one_hot_value(feature_name, feature_col):
+    """``<value>`` of a one-hot feature named ``<feature_col>=<value>`` or
+    ``<feature_col>_<value>`` (``=`` first), else ``None``."""
+    if not feature_name.startswith(feature_col):
+        return None
+    rest = feature_name[len(feature_col):]
+    if rest[:1] in ("=", "_") and len(rest) > 1:
+        return rest[1:]
+    return None
+
+
 def user_territories(feats_by_user, feature_col):
-    """``{user_id: territory}`` from ``{user_id: {feature_name: value}}``
-    using the ``<feature_col>_<value>`` one-hot convention."""
-    prefix = f"{feature_col}_"
+    """``{user_id: territory}`` from ``{user_id: {feature_name: value}}``:
+    the first positive-valued feature matching ``one_hot_value``."""
     out = {}
     for uid, feats in feats_by_user.items():
         for name, value in feats.items():
-            if value > 0.0 and name.startswith(prefix) and len(name) > len(prefix):
-                out[uid] = name[len(prefix):]
+            territory = one_hot_value(name, feature_col)
+            if value > 0.0 and territory is not None:
+                out[uid] = territory
                 break
     return out
 

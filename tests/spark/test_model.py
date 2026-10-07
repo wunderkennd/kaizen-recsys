@@ -146,8 +146,10 @@ def _availability_frames(spark):
         "item_id string, season_id string, territory string, "
         "available_from_days_ago double, available_to_days_ago double",
     )
+    # One user in each one-hot naming convention: fease_train.py's
+    # `region_US` and the Spark ingest's (`_one_hot_long`) `region=EMEA`.
     users = spark.createDataFrame(
-        [("u1", "region_US", 1.0), ("u2", "region_EMEA", 1.0)],
+        [("u1", "region_US", 1.0), ("u2", "region=EMEA", 1.0)],
         ["user_id", "feature_name", "value"],
     )
     empty_t = spark.createDataFrame([], "item_id string, feature_name string, value double")
@@ -179,6 +181,25 @@ def test_evaluate_with_availability_filters_late_release(spark):
         model.evaluate(test, train, users, k_values=[1], reference_days_ago=5.0)
     with pytest.raises(ValueError, match="days_ago"):
         model.evaluate(test.drop("days_ago"), train, users, k_values=[1], availability_df=av)
+
+
+def test_evaluate_reference_time_counts_unknown_test_items(spark):
+    train, _, _, users, empty_t = _availability_frames(spark)
+    # u1's oldest held-out row is an item the model never saw (50d). The
+    # reference time must still be 50, so B (released 20d ago) is dropped.
+    test = spark.createDataFrame(
+        [("u1", "ZZ", 1.0, 50.0), ("u1", "B", 1.0, 5.0), ("u1", "C", 1.0, 5.0)],
+        ["user_id", "item_id", "value", "days_ago"],
+    )
+    av = spark.createDataFrame(
+        [("A", "*", 100.0, None), ("B", "*", 20.0, None), ("C", "*", 100.0, None)],
+        "item_id string, territory string, available_from_days_ago double, available_to_days_ago double",
+    )
+    model = build_and_train(train, users, empty_t, alpha=1.0, beta=1.0, lambda_=1.0)
+    report = model.evaluate(test, train, users, k_values=[1], availability_df=av)
+    assert report["num_users"] == 1 and report["num_interactions"] == 1
+    assert report["availability"]["num_test_interactions_dropped"] == 1
+    assert report["availability"]["num_eligible_items"] == 2
 
 
 def test_evaluate_with_availability_territory_rollup(spark):

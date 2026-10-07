@@ -320,16 +320,21 @@ pub fn leave_k_out_split(
     Ok(stats)
 }
 
-/// Leave-last-K-out: for each user, holds out the `k` most recent
-/// interactions (smallest `days_ago`) for test. Users with fewer than
-/// `k + 1` interactions go entirely to train.
+/// Leave-last-K-out: for each user, holds out the `k` most recently
+/// interacted **distinct items** (an item's recency is its most recent
+/// row) for test, moving *every* row of a held-out item to test. Users
+/// with fewer than `k + 1` distinct items go entirely to train.
 ///
 /// This is the time-aware counterpart of [`leave_k_out_split`]: no RNG, no
 /// future interactions in a user's train context, and a well-defined
 /// per-user reference time (the oldest held-out interaction) for
-/// availability-aware evaluation (#101). Ties on `days_ago` are broken by
-/// file order (earlier row held out first). Requires a non-null numeric
-/// `days_ago` column and fails loudly without one.
+/// availability-aware evaluation (#101). Items rather than rows are held
+/// out because the harness excludes every train item from a user's
+/// candidate list: with event-level data, holding out only the latest row
+/// of a repeated item would leave that item in train and turn the hold-out
+/// into an impossible miss. Ties on `days_ago` are broken by file order
+/// (earlier row first). Requires a non-null numeric `days_ago` column and
+/// fails loudly without one.
 pub fn leave_last_k_out_split(
     interactions_path: &str,
     train_output: &str,
@@ -342,6 +347,7 @@ pub fn leave_last_k_out_split(
     let df = read_interactions_df(interactions_path)?;
     let n = df.height();
     let user_col = df.column("user_id")?.str()?;
+    let item_col = df.column("item_id")?.str()?;
     let days_col = df
         .column("days_ago")
         .map_err(|_| {
@@ -354,10 +360,11 @@ pub fn leave_last_k_out_split(
         .cast(&DataType::Float64)?;
     let days_col = days_col.f64()?;
 
-    // Group (days_ago, row) by user.
-    let mut user_rows: AHashMap<String, Vec<(f64, usize)>> = AHashMap::new();
+    // Per user, per item: (most recent days_ago, first row index, all rows).
+    type ItemRows = (f64, usize, Vec<usize>);
+    let mut user_items: AHashMap<String, AHashMap<String, ItemRows>> = AHashMap::new();
     for i in 0..n {
-        let Some(uid) = user_col.get(i) else {
+        let (Some(uid), Some(iid)) = (user_col.get(i), item_col.get(i)) else {
             continue;
         };
         let Some(d) = days_col.get(i) else {
@@ -367,26 +374,36 @@ pub fn leave_last_k_out_split(
                 interactions_path
             ));
         };
-        user_rows.entry(uid.to_string()).or_default().push((d, i));
+        let entry = user_items
+            .entry(uid.to_string())
+            .or_default()
+            .entry(iid.to_string())
+            .or_insert((d, i, Vec::new()));
+        if d < entry.0 {
+            entry.0 = d;
+        }
+        entry.2.push(i);
     }
 
     let mut train_mask = vec![true; n];
-    let mut sorted_uids: Vec<&String> = user_rows.keys().collect();
+    let mut sorted_uids: Vec<&String> = user_items.keys().collect();
     sorted_uids.sort();
     for uid in sorted_uids {
-        let rows = &user_rows[uid];
-        if rows.len() < k + 1 {
+        let items = &user_items[uid];
+        if items.len() < k + 1 {
             continue;
         }
-        let mut ordered = rows.clone();
-        // Most recent first; stable on file order for equal days_ago.
+        let mut ordered: Vec<&ItemRows> = items.values().collect();
+        // Most recently interacted item first; file order on ties.
         ordered.sort_by(|a, b| {
             a.0.partial_cmp(&b.0)
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then(a.1.cmp(&b.1))
         });
-        for &(_, idx) in ordered.iter().take(k) {
-            train_mask[idx] = false;
+        for (_, _, rows) in ordered.iter().take(k) {
+            for &idx in rows {
+                train_mask[idx] = false;
+            }
         }
     }
 
@@ -859,30 +876,36 @@ pub fn evaluate_with_adapter(
     let mut test_user_items: AHashMap<String, HashSet<usize>> = AHashMap::new();
     let mut test_user_reference: AHashMap<String, f64> = AHashMap::new();
     for i in 0..test_df.height() {
-        if let (Some(uid), Some(iid)) = (test_user_col.get(i), test_item_col.get(i))
+        let Some(uid) = test_user_col.get(i) else {
+            continue;
+        };
+        // The reference time is a property of the user's held-out window,
+        // so every test row counts — including items the model does not
+        // know, which only drop out of the relevant set below.
+        if let Some(days_col) = test_days_col_opt {
+            let Some(d) = days_col.get(i) else {
+                return Err(anyhow!(
+                    "availability: test file {} row {} has a null days_ago",
+                    test_interactions_path,
+                    i
+                ));
+            };
+            test_user_reference
+                .entry(uid.to_string())
+                .and_modify(|cur| {
+                    if d > *cur {
+                        *cur = d;
+                    }
+                })
+                .or_insert(d);
+        }
+        if let Some(iid) = test_item_col.get(i)
             && let Some(&item_idx) = mappings.item_to_idx.get(iid)
         {
             test_user_items
                 .entry(uid.to_string())
                 .or_default()
                 .insert(item_idx);
-            if let Some(days_col) = test_days_col_opt {
-                let Some(d) = days_col.get(i) else {
-                    return Err(anyhow!(
-                        "availability: test file {} row {} has a null days_ago",
-                        test_interactions_path,
-                        i
-                    ));
-                };
-                test_user_reference
-                    .entry(uid.to_string())
-                    .and_modify(|cur| {
-                        if d > *cur {
-                            *cur = d;
-                        }
-                    })
-                    .or_insert(d);
-            }
         }
     }
 
@@ -2035,6 +2058,37 @@ mod tests {
     }
 
     #[test]
+    fn availability_reference_time_counts_unknown_test_items() -> Result<()> {
+        let dir = TempDir::new()?;
+        let (train, _, _) = availability_fixture(&dir);
+        // u1's oldest held-out interaction is an item the model never saw
+        // (50 days ago). The reference time must still be 50, so i2
+        // (released 20 days ago) is ineligible and dropped; i3 remains.
+        let mut test = df!(
+            "user_id" => ["u1", "u1", "u1"],
+            "item_id" => ["zz", "i2", "i3"],
+            "value" =>   [1.0_f64, 1.0, 1.0],
+            "days_ago" => [50.0_f64, 5.0, 5.0],
+        )?;
+        let test = write_df(&dir, "test_unknown.parquet", &mut test);
+        let mut av = df!(
+            "item_id" => ["i1", "i2", "i3"],
+            "available_from_days_ago" => [100.0_f64, 20.0, 100.0],
+        )?;
+        let av = write_df(&dir, "av_unknown.parquet", &mut av);
+        let adapter = EaseAdapter::new(regression_model());
+        let mut config = EvalConfig::new(vec![1]);
+        config.availability = Some(AvailabilityConfig::new(av));
+        let report = evaluate_model(&adapter, &test, &train, None, &config)?;
+        assert_eq!(report.num_users, 1);
+        assert_eq!(report.num_interactions, 1);
+        let a = report.availability.unwrap();
+        assert_eq!(a.num_test_interactions_dropped, 1);
+        assert_eq!(a.num_eligible_items, 2); // {i1, i3} at reference 50
+        Ok(())
+    }
+
+    #[test]
     fn leave_last_k_out_holds_out_most_recent() -> Result<()> {
         let dir = TempDir::new()?;
         let mut df = df!(
@@ -2078,6 +2132,32 @@ mod tests {
             leave_last_k_out_split(&src, train.to_str().unwrap(), test.to_str().unwrap(), 0)
                 .is_err()
         );
+
+        // Repeated items: the item's recency is its latest row, and every
+        // row of a held-out item moves to test (else the harness would
+        // exclude it as a train item and the hold-out could never be hit).
+        let mut repeats = df!(
+            "user_id" => ["u1", "u1", "u1", "u2", "u2"],
+            "item_id" => ["a", "b", "a", "a", "a"],
+            "value" => [1.0_f64; 5],
+            "days_ago" => [30.0_f64, 10.0, 1.0, 5.0, 2.0],
+        )?;
+        let src3 = write_df(&dir, "repeats.parquet", &mut repeats);
+        let stats =
+            leave_last_k_out_split(&src3, train.to_str().unwrap(), test.to_str().unwrap(), 1)?;
+        // u1: a (latest 1d) held out with both of its rows; b stays in train.
+        // u2: a single distinct item -> entirely train.
+        assert_eq!(stats.test_interactions, 2);
+        assert_eq!(stats.train_interactions, 3);
+        assert_eq!(stats.test_users, 1);
+        let test_df = read_interactions_df(test.to_str().unwrap())?;
+        let items: Vec<&str> = test_df
+            .column("item_id")?
+            .str()?
+            .into_iter()
+            .flatten()
+            .collect();
+        assert_eq!(items, ["a", "a"]);
 
         // Without days_ago the split refuses rather than guessing.
         let mut no_days = df!(

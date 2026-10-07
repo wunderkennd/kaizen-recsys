@@ -23,11 +23,13 @@
 //!   `to < r`). A window that ended exactly at `r` does not count.
 //! - **Territory**: rows tagged `"*"` apply to everyone. A user's own
 //!   territory comes from the categorical user feature named by
-//!   [`AvailabilityConfig::user_territory_feature`]; the long-format
-//!   feature file names one-hot categoricals `<column>_<value>`, so the
-//!   territory is the `<value>` suffix of the first feature whose name
-//!   starts with `<column>_` and whose value is positive. Users without
-//!   a territory see global rows only.
+//!   [`AvailabilityConfig::user_territory_feature`]. The long-format
+//!   feature file names one-hot categoricals `<column>=<value>` (the
+//!   Spark ingest, `kzn_recsys.spark.databricks._one_hot_long`) or
+//!   `<column>_<value>` (`kzn_recsys/fease_train.py`'s `to_long_format`);
+//!   both are accepted, `=` checked first, and the territory is the
+//!   `<value>` suffix of the user's first positive-valued match. Users
+//!   without a territory see global rows only.
 //! - **Unlisted items are ineligible.** The table defines availability;
 //!   an item with no row is never shown to anyone and is reported in
 //!   [`AvailabilityReport::num_items_without_availability`] so a
@@ -271,11 +273,20 @@ impl AvailabilityTable {
     }
 }
 
+/// The `<value>` of a one-hot feature named `<feature_col>=<value>` or
+/// `<feature_col>_<value>` (`=` first: it is the Spark ingest's separator
+/// and cannot occur in a column name the other convention would produce).
+pub(crate) fn one_hot_value<'a>(feature_name: &'a str, feature_col: &str) -> Option<&'a str> {
+    let rest = feature_name.strip_prefix(feature_col)?;
+    let value = rest.strip_prefix('=').or_else(|| rest.strip_prefix('_'))?;
+    (!value.is_empty()).then_some(value)
+}
+
 /// Read `user_id -> territory` from a long-format user-features file.
 ///
-/// A user's territory is the `<value>` suffix of the first feature named
-/// `<feature_col>_<value>` with a positive value (one-hot convention of
-/// the ingest's `to_long_format`).
+/// A user's territory is the `<value>` suffix of their first positive-
+/// valued feature named `<feature_col>=<value>` or `<feature_col>_<value>`
+/// (see [`one_hot_value`]).
 pub fn load_user_territories(
     user_features_path: &str,
     feature_col: &str,
@@ -285,7 +296,6 @@ pub fn load_user_territories(
     let feat_col = df.column("feature_name")?.str()?;
     let val_col = df.column("value")?.cast(&DataType::Float64)?;
     let val_col = val_col.f64()?;
-    let prefix = format!("{feature_col}_");
     let mut out: AHashMap<String, String> = AHashMap::new();
     for ((user, feat), val) in user_col.into_iter().zip(feat_col).zip(val_col) {
         let (Some(u), Some(f), Some(v)) = (user, feat, val) else {
@@ -294,17 +304,15 @@ pub fn load_user_territories(
         if v <= 0.0 {
             continue;
         }
-        if let Some(territory) = f.strip_prefix(&prefix)
-            && !territory.is_empty()
-        {
+        if let Some(territory) = one_hot_value(f, feature_col) {
             out.entry(u.to_string())
                 .or_insert_with(|| territory.to_string());
         }
     }
     if out.is_empty() {
         log::warn!(
-            "user features {user_features_path}: no `{prefix}<value>` feature found; \
-             every user is treated as global"
+            "user features {user_features_path}: no `{feature_col}=<value>` or \
+             `{feature_col}_<value>` feature found; every user is treated as global"
         );
     }
     Ok(out)
@@ -334,8 +342,10 @@ pub struct AvailabilityReport {
     pub num_eligible_items: usize,
     /// Catalog items with no availability row (never eligible).
     pub num_items_without_availability: usize,
-    /// Test interactions on items ineligible for their user at the
-    /// reference time; dropped from the relevant set, not counted as misses.
+    /// Unique `(user, item)` test pairs — the same unit as
+    /// `EvalReport::num_interactions` — whose item was ineligible for the
+    /// user at the reference time; dropped from the relevant set, not
+    /// counted as misses.
     pub num_test_interactions_dropped: usize,
     /// Test users with no eligible relevant item left after filtering.
     pub num_users_skipped: usize,
@@ -497,12 +507,14 @@ mod tests {
     }
 
     #[test]
-    fn user_territories_follow_one_hot_naming() {
+    fn user_territories_follow_both_one_hot_namings() {
         let dir = TempDir::new().unwrap();
+        // `region_US` is fease_train.py's convention, `region=EMEA` the
+        // Spark ingest's (_one_hot_long); both must resolve.
         let mut df = df!(
-            "user_id" => ["u1", "u1", "u2", "u3"],
-            "feature_name" => ["plan_Premium", "region_US", "region_EMEA", "region_JP"],
-            "value" => [1.0_f64, 1.0, 1.0, 0.0],
+            "user_id" => ["u1", "u1", "u2", "u3", "u4"],
+            "feature_name" => ["plan_Premium", "region_US", "region=EMEA", "region_JP", "region_"],
+            "value" => [1.0_f64, 1.0, 1.0, 0.0, 1.0],
         )
         .unwrap();
         let path = write(&mut df, &dir, "uf.parquet");
@@ -510,6 +522,13 @@ mod tests {
         assert_eq!(t.get("u1").map(String::as_str), Some("US"));
         assert_eq!(t.get("u2").map(String::as_str), Some("EMEA"));
         assert!(!t.contains_key("u3")); // zero-valued one-hot is not a territory
+        assert!(!t.contains_key("u4")); // empty value
+        assert_eq!(one_hot_value("region=US", "region"), Some("US"));
+        assert_eq!(
+            one_hot_value("region_major=EU/UK", "region_major"),
+            Some("EU/UK")
+        );
+        assert_eq!(one_hot_value("regional_US", "region"), None); // not a separator
     }
 
     #[test]

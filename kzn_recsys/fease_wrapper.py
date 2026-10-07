@@ -196,7 +196,8 @@ def leave_last_k_out_split_safe(
     k: int = 1,
     output_dir: Optional[str] = None,
 ) -> SplitResult:
-    """Leave-last-K-out split: hold out each user's `k` most recent interactions.
+    """Leave-last-K-out split: hold out each user's `k` most recently
+    interacted distinct items (every row of a held-out item moves to test).
 
     Deterministic (no seed); requires a `days_ago` column. Same path-allocation
     behavior as `random_split_safe`.

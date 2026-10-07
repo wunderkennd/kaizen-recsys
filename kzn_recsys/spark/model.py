@@ -72,9 +72,10 @@ class SparkEaseModel:
         split's cutoff), else per user the oldest held-out interaction
         (largest ``days_ago`` in the test frame, which must then carry a
         non-null ``days_ago``). Ineligible relevants are dropped and
-        counted, coverage uses the eligible catalog, and the report gains an
-        ``availability`` dict with an item-age breakdown. Without it the
-        report is exactly the legacy one.
+        counted (``num_test_interactions_dropped``: unique user-item pairs,
+        the same unit as ``num_interactions``), coverage uses the eligible
+        catalog, and the report gains an ``availability`` dict with an
+        item-age breakdown. Without it the report is exactly the legacy one.
         """
         m = self.mappings
         max_k = max(k_values)
@@ -85,7 +86,9 @@ class SparkEaseModel:
             cols = ["user_id", "item_id", "value"] + (["days_ago"] if with_days else [])
             for i, r in enumerate(df.select(*cols).collect()):
                 out.setdefault(r["user_id"], {})[r["item_id"]] = float(r["value"])
-                if with_days and r["item_id"] in m.item_to_idx:
+                # Every test row counts toward the reference time, including
+                # items the model does not know (those only leave the relevant set).
+                if with_days:
                     d = r["days_ago"]
                     if d is None:
                         raise ValueError(f"availability: test row {i} has a null days_ago")
@@ -170,8 +173,11 @@ class SparkEaseModel:
                 if key not in eligible_cache:
                     eligible_cache[key] = table.eligible_set(territory, reference)
                 eligible = eligible_cache[key]
-                kept = {i for i in relevant if i in eligible}
-                dropped += len(relevant) - len(kept)
+                # Count drops over catalog items only, as the Rust harness
+                # does (unknown ids never enter its relevant set).
+                known = {i for i in relevant if i in m.item_to_idx}
+                kept = {i for i in known if i in eligible}
+                dropped += len(known) - len(kept)
                 if not kept:
                     skipped += 1
                     continue

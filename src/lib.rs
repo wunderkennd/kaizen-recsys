@@ -494,7 +494,7 @@ impl FeaseModel {
     ///         - "coverage" (float)
     ///         - "metrics" (list[dict]): Per-K metrics, each with keys:
     ///           "k", "precision", "recall", "ndcg", "map", "hit_rate"
-    #[pyo3(signature = (test_interactions_path, train_interactions_path, user_features_path=None, k_values=None, availability_path=None, user_territory_feature=None, reference_days_ago=None, item_age_bucket_edges=None))]
+    #[pyo3(signature = (test_interactions_path, train_interactions_path, user_features_path=None, k_values=None, *, availability_path=None, user_territory_feature=None, reference_days_ago=None, item_age_bucket_edges=None))]
     #[allow(clippy::too_many_arguments)]
     fn evaluate<'py>(
         &self,
@@ -2538,15 +2538,17 @@ mod sasrec_py {
 
         /// Evaluate against test interactions via the generalized
         /// `&dyn RecModel` harness (same metrics dict as `FeaseModel`).
-        #[pyo3(signature = (test_interactions_path, train_interactions_path, user_features_path=None, k_values=None, availability_path=None, user_territory_feature=None, reference_days_ago=None, item_age_bucket_edges=None))]
+        // `k_values` keeps its historical third positional slot; everything
+        // added for #101 is keyword-only.
+        #[pyo3(signature = (test_interactions_path, train_interactions_path, k_values=None, *, user_features_path=None, availability_path=None, user_territory_feature=None, reference_days_ago=None, item_age_bucket_edges=None))]
         #[allow(clippy::too_many_arguments)]
         fn evaluate<'py>(
             &self,
             py: Python<'py>,
             test_interactions_path: &str,
             train_interactions_path: &str,
-            user_features_path: Option<&str>,
             k_values: Option<Vec<usize>>,
+            user_features_path: Option<&str>,
             availability_path: Option<String>,
             user_territory_feature: Option<String>,
             reference_days_ago: Option<f64>,
@@ -2908,15 +2910,17 @@ mod bert4rec_py {
         /// `&dyn RecModel` harness (same metrics dict as `FeaseModel`).
         /// The train file must carry `days_ago` so each user's history
         /// can be ordered and bucketed.
-        #[pyo3(signature = (test_interactions_path, train_interactions_path, user_features_path=None, k_values=None, availability_path=None, user_territory_feature=None, reference_days_ago=None, item_age_bucket_edges=None))]
+        // `k_values` keeps its historical third positional slot; everything
+        // added for #101 is keyword-only.
+        #[pyo3(signature = (test_interactions_path, train_interactions_path, k_values=None, *, user_features_path=None, availability_path=None, user_territory_feature=None, reference_days_ago=None, item_age_bucket_edges=None))]
         #[allow(clippy::too_many_arguments)]
         fn evaluate<'py>(
             &self,
             py: Python<'py>,
             test_interactions_path: &str,
             train_interactions_path: &str,
-            user_features_path: Option<&str>,
             k_values: Option<Vec<usize>>,
+            user_features_path: Option<&str>,
             availability_path: Option<String>,
             user_territory_feature: Option<String>,
             reference_days_ago: Option<f64>,
@@ -3235,15 +3239,17 @@ mod two_tower_py {
         /// Evaluate against test interactions via the `&dyn RecModel`
         /// harness routed through `TwoTowerEvalAdapter` (same metrics
         /// dict shape as `FeaseModel.evaluate`).
-        #[pyo3(signature = (test_interactions_path, train_interactions_path, user_features_path=None, k_values=None, availability_path=None, user_territory_feature=None, reference_days_ago=None, item_age_bucket_edges=None))]
+        // `k_values` keeps its historical third positional slot; everything
+        // added for #101 is keyword-only.
+        #[pyo3(signature = (test_interactions_path, train_interactions_path, k_values=None, *, user_features_path=None, availability_path=None, user_territory_feature=None, reference_days_ago=None, item_age_bucket_edges=None))]
         #[allow(clippy::too_many_arguments)]
         fn evaluate<'py>(
             &self,
             py: Python<'py>,
             test_interactions_path: &str,
             train_interactions_path: &str,
-            user_features_path: Option<&str>,
             k_values: Option<Vec<usize>>,
+            user_features_path: Option<&str>,
             availability_path: Option<String>,
             user_territory_feature: Option<String>,
             reference_days_ago: Option<f64>,

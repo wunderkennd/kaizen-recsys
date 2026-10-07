@@ -533,7 +533,8 @@ result = leave_k_out_split_safe(
     output_dir="/path/to/workspace",
 )
 
-# Leave-last-K-out (hold out each user's K most recent items; needs `days_ago`)
+# Leave-last-K-out (hold out each user's K most recently watched distinct
+# items, every row of each; needs `days_ago`)
 result = leave_last_k_out_split_safe(
     "interactions.parquet",
     k=1,
@@ -552,8 +553,11 @@ Leave-last-K-out is the time-aware counterpart of leave-K-out: it is
 deterministic, never puts a *later* interaction in a user's train context
 than the one held out, and gives each user a well-defined reference time
 (their oldest held-out interaction), which availability-aware evaluation
-below relies on. Random leave-K-out has no reference time and is best kept
-for sanity checks.
+below relies on. It holds out *items*, not rows: an item's recency is its
+latest row and every row of a held-out item moves to test, because the
+harness excludes train items from a user's candidates and a repeated item
+split across train and test could never be hit. Random leave-K-out has no
+reference time and is best kept for sanity checks.
 
 ### Model Evaluation
 
@@ -608,18 +612,21 @@ for bucket in a["item_age_buckets"]:
   `to < r`). Items with no row are never eligible and are counted in
   `num_items_without_availability`.
 - **Territory**: `user_territory_feature` names the categorical user-feature
-  *column*; the long-format file names one-hot categoricals
-  `<column>_<value>`, so a user's territory is the `<value>` suffix of the
-  first such feature with a positive value. Users without one see global
-  rows only. Requires `user_features_path`.
+  *column*. One-hot categoricals are named `<column>=<value>` by the Spark
+  ingest and `<column>_<value>` by `fease_train.py`; both are accepted (`=`
+  first), and a user's territory is the `<value>` of their first such
+  feature with a positive value. Users without one see global rows only.
+  Requires `user_features_path`.
 - **Reference time**: `reference_days_ago` when given (the temporal split's
   cutoff); otherwise per user, the oldest held-out interaction (largest
-  `days_ago` in that user's test rows), which is what leave-last-K-out
-  produces. The per-user form requires a non-null `days_ago` column in the
-  test file. A random split has no reference time, so do not combine it
-  with availability filtering.
+  `days_ago` over *all* of that user's test rows, including items the model
+  does not know), which is what leave-last-K-out produces. The per-user
+  form requires a non-null `days_ago` column in the test file. A random
+  split has no reference time, so do not combine it with availability
+  filtering.
 - **Report**: relevant items that were ineligible are dropped and counted
-  (`num_test_interactions_dropped`), users left with no eligible relevant
+  (`num_test_interactions_dropped`, in unique user–item pairs like
+  `num_interactions`), users left with no eligible relevant
   item are skipped (`num_users_skipped`), `coverage` divides by the union
   of evaluated users' eligible sets (`num_eligible_items`), and
   `item_age_buckets` repeats the metrics with the relevant set restricted

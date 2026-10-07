@@ -183,20 +183,21 @@ pub fn leave_k_out_split(
     ))
 }
 
-/// Leave-last-K-out split: holds out each user's `k` most recent
-/// interactions (smallest `days_ago`) for test.
+/// Leave-last-K-out split: holds out each user's `k` most recently
+/// interacted distinct items (an item's recency is its latest row) for
+/// test, moving every row of a held-out item to test.
 ///
 /// The time-aware counterpart of `leave_k_out_split`: deterministic, no
 /// future interactions in a user's train context, and a per-user
 /// reference time (the oldest held-out interaction) for availability-
-/// aware evaluation. Users with fewer than k+1 interactions go entirely
+/// aware evaluation. Users with fewer than k+1 distinct items go entirely
 /// to train. The file must carry a non-null numeric `days_ago` column.
 ///
 /// Args:
 ///     interactions_path (str): Path to interactions Parquet/CSV file.
 ///     train_output (str): Output path for the train split.
 ///     test_output (str): Output path for the test split.
-///     k (int): Number of most-recent interactions to hold out per user.
+///     k (int): Number of most-recent distinct items to hold out per user.
 ///
 /// Returns:
 ///     tuple[int, int, int, int]: (train_interactions, test_interactions, train_users, test_users)

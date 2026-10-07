@@ -85,10 +85,16 @@ def leave_k_out_split(interactions_df, k: int, seed: int):
 
 
 def leave_last_k_out_split(interactions_df, k: int):
-    """Hold out each user's k most recent rows (smallest days_ago). Mirrors
-    evaluation.rs::leave_last_k_out_split: deterministic (no RNG), ties on
-    days_ago broken by row order, users with < k+1 rows go entirely to train.
-    Requires a non-null `days_ago` column and raises without one.
+    """Hold out each user's k most recently interacted *distinct items* (an
+    item's recency is its latest row); every row of a held-out item moves to
+    test. Mirrors evaluation.rs::leave_last_k_out_split: deterministic (no
+    RNG), ties on days_ago broken by row order, users with < k+1 distinct
+    items go entirely to train. Requires a non-null `days_ago` column and
+    raises without one.
+
+    Items rather than rows are held out because evaluation excludes every
+    train item from a user's candidates: holding out only the latest row of a
+    repeated item would make that hold-out an impossible miss.
     """
     if k < 1:
         raise ValueError("k must be >= 1")
@@ -98,19 +104,27 @@ def leave_last_k_out_split(interactions_df, k: int):
             "history; use leave_k_out_split for a random hold-out"
         )
     rows = interactions_df.collect()
-    by_user = {}
+    by_user = {}  # user -> item -> [min_days_ago, first_idx, [row idx...]]
     for idx, r in enumerate(rows):
         d = r["days_ago"]
         if d is None:
             raise ValueError(f"leave_last_k_out_split: row {idx} has a null days_ago")
-        by_user.setdefault(r["user_id"], []).append((float(d), idx))
+        d = float(d)
+        items = by_user.setdefault(r["user_id"], {})
+        entry = items.get(r["item_id"])
+        if entry is None:
+            items[r["item_id"]] = [d, idx, [idx]]
+        else:
+            entry[0] = min(entry[0], d)
+            entry[2].append(idx)
 
     held_out = set()
     for uid in sorted(by_user):
-        pairs = by_user[uid]
-        if len(pairs) < k + 1:
+        items = by_user[uid]
+        if len(items) < k + 1:
             continue
-        pairs.sort()  # (days_ago, row index): most recent first, file order on ties
-        held_out.update(idx for _, idx in pairs[:k])
+        ordered = sorted(items.values(), key=lambda e: (e[0], e[1]))
+        for _, _, idxs in ordered[:k]:
+            held_out.update(idxs)
 
     return _rebuild_from(interactions_df, rows, held_out)
