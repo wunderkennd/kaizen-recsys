@@ -75,6 +75,20 @@ def test_with_days_ago_and_activity_window(spark):
     assert filter_activity_window(daily, None).count() == daily.count()
 
 
+def test_as_of_backtest_never_sees_the_future(spark):
+    # as_of before the latest views: those rows did not exist yet and must
+    # be dropped, not kept with negative days_ago (which decay would amplify).
+    daily = with_days_ago(_daily(spark), as_of=dt.date(2026, 10, 4))
+    rows = {(r["user_id"], r["item_id"], r["view_date"]): r["days_ago"] for r in daily.collect()}
+    assert set(rows) == {("p1", "S1", dt.date(2026, 10, 1)), ("p2", "S1", dt.date(2026, 9, 30))}
+    assert min(rows.values()) >= 0.0
+    # The window filter guards the lower bound too, for frames built elsewhere.
+    from pyspark.sql import functions as F
+    tampered = daily.withColumn("days_ago", F.col("days_ago") - F.lit(10.0))
+    assert filter_activity_window(tampered, None).count() == 0
+    assert filter_activity_window(tampered, 30).count() == 0
+
+
 def test_daily_to_pairs_sums_per_day_with_decay_and_keeps_latest_day(spark):
     daily = with_days_ago(_daily(spark), as_of=AS_OF)
 

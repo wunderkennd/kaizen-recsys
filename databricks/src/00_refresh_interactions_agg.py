@@ -52,8 +52,11 @@ for key in ("catalog", "schema", "table", "user_col", "item_col", "date_col",
         raise ValueError(f"{key}={params[key]!r} is not a plain identifier")
 if not re.fullmatch(r"[A-Za-z0-9_.]+", params["source_table"]):
     raise ValueError(f"source_table={params['source_table']!r} is not a table name")
-if "'" in params["subsidiary"]:
-    raise ValueError("subsidiary must not contain quotes")
+# `subsidiary` is spliced inside a single-quoted SQL literal: allow only
+# characters that cannot start an escape or end the literal (no quotes, no
+# backslashes, nothing outside [A-Za-z0-9_ -]).
+if not re.fullmatch(r"[A-Za-z0-9_ -]+", params["subsidiary"]):
+    raise ValueError(f"subsidiary={params['subsidiary']!r} must match [A-Za-z0-9_ -]+")
 
 # COMMAND ----------
 # The bundle syncs the whole `databricks/` folder, so the SQL lives next to

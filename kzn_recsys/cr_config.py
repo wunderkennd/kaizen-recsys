@@ -49,6 +49,10 @@ VIEWERSHIP_TABLE = "cr_prod.gold_db.ds_viewership"
 VIEWERSHIP_USER_COL = "view_profile_id"      # profile grain
 VIEWERSHIP_ITEM_COL = "catalog_show_id"      # series grain
 VIEWERSHIP_DATE_COL = "view_date"
+VIEWERSHIP_TS_COL = "view_ts"                # event timestamp; orders user-feature rows
+# Content metadata is media-grain; this column maps each media row to its
+# series so item features land on the same ids as the interactions.
+METADATA_SERIES_COL = "catalog_show_id"
 VIEWERSHIP_SECONDS_COL = "view_seconds_watched"
 VIEWERSHIP_SUBSIDIARY_COL = "view_subsidiary"
 VIEWERSHIP_SUBSIDIARY = "crunchyroll"

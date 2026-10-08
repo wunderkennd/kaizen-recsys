@@ -86,18 +86,24 @@ def aggregate_viewership_daily(
 def with_days_ago(daily_df: DataFrame, *, as_of=None) -> DataFrame:
     """Add ``days_ago`` (double) = days between ``view_date`` and ``as_of``
     (default: today). Pass a fixed ``as_of`` (``datetime.date`` or ISO
-    string) to make a backtest reproducible."""
+    string) to make a backtest reproducible: rows dated *after* ``as_of``
+    did not exist at that point in time and are dropped, so a backtest
+    never sees the future (or decays it upward)."""
     ref = F.current_date() if as_of is None else F.to_date(F.lit(str(as_of)))
-    return daily_df.withColumn(
-        "days_ago", F.datediff(ref, F.col("view_date")).cast("double")
+    return (
+        daily_df.withColumn("days_ago", F.datediff(ref, F.col("view_date")).cast("double"))
+        .where(F.col("days_ago") >= F.lit(0.0))
     )
 
 
 def filter_activity_window(daily_df: DataFrame, window_days: Optional[int]) -> DataFrame:
-    """Keep rows with ``days_ago <= window_days``; ``None`` keeps everything."""
+    """Keep rows with ``0 <= days_ago <= window_days``; ``None`` keeps
+    everything with ``days_ago >= 0`` (the lower bound is a belt-and-braces
+    guard for frames whose ``days_ago`` did not come from ``with_days_ago``)."""
+    df = daily_df.where(F.col("days_ago") >= F.lit(0.0))
     if window_days is None:
-        return daily_df
-    return daily_df.where(F.col("days_ago") <= F.lit(float(window_days)))
+        return df
+    return df.where(F.col("days_ago") <= F.lit(float(window_days)))
 
 
 def daily_to_pairs(daily_df: DataFrame, *, decay_rate: float = 0.0) -> DataFrame:

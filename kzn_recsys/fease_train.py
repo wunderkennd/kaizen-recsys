@@ -73,6 +73,11 @@ METADATA_TABLE = "your_db.content_metadata"
 # agg table was built with (profile id), or user features will not join.
 USER_ID_COL = cfg.VIEWERSHIP_USER_COL          # "view_profile_id"
 ITEM_ID_COL = cfg.VIEWERSHIP_ITEM_COL          # "catalog_show_id" (series grain)
+# Column of METADATA_TABLE carrying the *series* id. Item features must be
+# keyed by the same ids as the interactions: keyed by media/episode ids the
+# series would have no side features and every episode would enter the
+# catalog as a feature-only item.
+METADATA_SERIES_COL = cfg.METADATA_SERIES_COL  # "catalog_show_id"
 WATCH_SECONDS_COL = cfg.VIEWERSHIP_SECONDS_COL
 SUBSIDIARY_COL = cfg.VIEWERSHIP_SUBSIDIARY_COL
 SUBSIDIARY = cfg.VIEWERSHIP_SUBSIDIARY
@@ -141,9 +146,11 @@ EVENT_WEIGHTS = None
 # --- Feature Engineering Configuration ---
 MIN_WATCH_SECONDS = cfg.MIN_WATCH_SECONDS
 
-# Timestamp / date column of ENGAGEMENT_TABLE; the "raw" source derives
-# view_date from it, and user features take each user's latest row by it.
+# Date column of ENGAGEMENT_TABLE: the "raw" source derives view_date from it.
 TIMESTAMP_COL = cfg.VIEWERSHIP_DATE_COL  # a DATE or TIMESTAMP column
+# Event timestamp used to pick each user's latest row for user features.
+# Must be finer than a day, or same-day rows tie.
+USER_FEATURE_TS_COL = cfg.VIEWERSHIP_TS_COL
 
 # COMMAND ----------
 
@@ -243,7 +250,10 @@ categorical_user_features = [
 # users present in the interactions frame are kept, so the full engagement
 # table is scanned once for features and the user mapping matches the
 # interactions exactly. row_number() over an explicit window is
-# deterministic; orderBy + dropDuplicates is not.
+# deterministic; orderBy + dropDuplicates is not. Rows with the same
+# timestamp are ordered by the feature values themselves, so the pick is
+# a pure function of the data.
+_user_feature_cols = [*categorical_user_features, "account_tenure_days"]
 df_user_base = (
     df_eng
     .filter(F.col(SUBSIDIARY_COL) == F.lit(SUBSIDIARY))
@@ -254,10 +264,15 @@ df_user_base = (
         "inner",
     )
     .drop("_active_uid")
-    .select(USER_ID_COL, TIMESTAMP_COL, "account_tenure_days", *categorical_user_features)
+    .select(USER_ID_COL, USER_FEATURE_TS_COL, *_user_feature_cols)
     .withColumn(
         "_rn",
-        F.row_number().over(Window.partitionBy(USER_ID_COL).orderBy(F.col(TIMESTAMP_COL).desc())),
+        F.row_number().over(
+            Window.partitionBy(USER_ID_COL).orderBy(
+                F.col(USER_FEATURE_TS_COL).desc_nulls_last(),
+                *[F.col(c).desc_nulls_last() for c in _user_feature_cols],
+            )
+        ),
     )
     .filter(F.col("_rn") == 1)
     .drop("_rn")
@@ -315,26 +330,33 @@ def split_and_explode(df: DataFrame, id_col: str, feature_col: str, prefix: str)
 # ---
 # Experiment here! Add or remove features.
 # ---
+# `media_series_title` is deliberately absent: at series grain it is one
+# feature per item (an identity column), which adds a catalog-sized block
+# to the Gram matrix and carries no information the item row lacks.
 categorical_item_features = [
     "media_type",
     "media_audio_language",
-    "media_series_title",
     "airtable_primary_genre",
     "airtable_ca_brand_grade"
 ]
 
-df_item_categorical = to_long_format(df_meta, "media_guid", categorical_item_features)
+# Metadata is media-grain; key every feature by the series id so it lands
+# on the interaction items. The trailing distinct() collapses the episodes
+# of a series into one feature row each.
+df_meta_series = df_meta.filter(F.col(METADATA_SERIES_COL).isNotNull())
+
+df_item_categorical = to_long_format(df_meta_series, METADATA_SERIES_COL, categorical_item_features)
 
 # Split/explode features
-df_item_genres = split_and_explode(df_meta, "media_guid", "media_genres", "genre_")
-df_item_tags = split_and_explode(df_meta, "media_guid", "media_tags", "tag_")
+df_item_genres = split_and_explode(df_meta_series, METADATA_SERIES_COL, "media_genres", "genre_")
+df_item_tags = split_and_explode(df_meta_series, METADATA_SERIES_COL, "media_tags", "tag_")
 
 # Combine all item feature tables
 df_item_features = (
     df_item_categorical
     .unionByName(df_item_genres)
     .unionByName(df_item_tags)
-    .withColumnRenamed("media_guid", "item_id")
+    .withColumnRenamed(METADATA_SERIES_COL, "item_id")
     .filter(F.col("feature_name").isNotNull() & (F.col("feature_name") != F.lit("")))
     .distinct()
 )
