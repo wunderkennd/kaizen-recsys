@@ -36,3 +36,27 @@ HYBRID_USER_EMBEDDING_PREFIX = "bert_emb"
 HYBRID_ITEM_EMBEDDING_PREFIX = "kg_emb"
 # Temporal hold-out used by the hybrid evaluation step.
 HYBRID_EVAL_DAYS_AGO_CUTOFF = 30.0
+
+# --- Series-grain interactions table (issue #102) --------------------------
+# Daily grain: one row per (profile, series, view_date). Items are series
+# (catalog_show_id), not episodes. `days_ago` is derived at read time
+# (`kzn_recsys.spark.interactions_agg.with_days_ago`) so decay_rate stays
+# tunable. Built / refreshed by databricks/sql/*.sql via
+# databricks/src/00_refresh_interactions_agg.py.
+INTERACTIONS_AGG_TABLE = "dsml_recs.dev.fease_interactions_agg"
+# Gold viewership source and the columns the aggregation reads from it.
+VIEWERSHIP_TABLE = "cr_prod.gold_db.ds_viewership"
+VIEWERSHIP_USER_COL = "view_profile_id"      # profile grain
+VIEWERSHIP_ITEM_COL = "catalog_show_id"      # series grain
+VIEWERSHIP_DATE_COL = "view_date"
+VIEWERSHIP_TS_COL = "view_ts"                # event timestamp; orders user-feature rows
+# Content metadata is media-grain; this column maps each media row to its
+# series so item features land on the same ids as the interactions.
+METADATA_SERIES_COL = "catalog_show_id"
+VIEWERSHIP_SECONDS_COL = "view_seconds_watched"
+VIEWERSHIP_SUBSIDIARY_COL = "view_subsidiary"
+VIEWERSHIP_SUBSIDIARY = "crunchyroll"
+# A view shorter than this does not count as an interaction.
+MIN_WATCH_SECONDS = 30.0
+# Days the daily MERGE recomputes; must cover the gold table's late-arrival window.
+INTERACTIONS_AGG_LOOKBACK_DAYS = 3

@@ -1,0 +1,29 @@
+resources:
+  jobs:
+    fease_interactions_agg_refresh:
+      name: fease_interactions_agg_refresh
+      # Daily, after the gold viewership table has refreshed; adjust to the
+      # upstream schedule. Run once with mode=backfill before enabling.
+      schedule:
+        quartz_cron_expression: "0 30 6 * * ?"
+        timezone_id: UTC
+        pause_status: PAUSED
+      job_clusters:
+        - job_cluster_key: agg_refresh
+          new_cluster:
+            spark_version: 14.3.x-scala2.12
+            node_type_id: Standard_DS3_v2
+            num_workers: 2
+            data_security_mode: SINGLE_USER
+      tasks:
+        - task_key: merge
+          job_cluster_key: agg_refresh
+          notebook_task:
+            notebook_path: ../src/00_refresh_interactions_agg.py
+            base_parameters:
+              mode: merge
+              catalog: ${var.agg_catalog}
+              schema: ${var.agg_schema}
+              table: ${var.agg_table}
+              source_table: ${var.viewership_table}
+              lookback_days: ${var.agg_lookback_days}
