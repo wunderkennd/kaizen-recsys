@@ -263,9 +263,15 @@ with continuous / log / int ranges. A search is deterministic for a fixed
 seed regardless of thread count. For the burn-backed models that relies on
 `models/burn_rng.rs` (#100): `burn-ndarray` has one process-global RNG, so
 each `train_*` takes a process-wide guard and seeds it; concurrent
-burn-model trainings (tuning trials, parallel tests) therefore run one at
-a time, each a pure function of its seed. burn-ndarray is also built
-without its `simd` feature (see `Cargo.toml`). EASE is unaffected.
+burn-model trainings (parallel tests, Python threads) therefore run one at
+a time, each a pure function of its seed. The tuning runner evaluates a
+burn evaluator's batch sequentially on the calling thread
+(`FoldEvaluator::needs_exclusive_backend`): the guard must never be waited
+on from a rayon worker, because burn's own element-wise parallelism runs
+on that pool and parked workers would deadlock the lock holder. Per-user
+metric sums iterate users in sorted order so a fold mean is bit-stable.
+burn-ndarray is also built without its `simd` feature (see `Cargo.toml`).
+EASE is unaffected.
 
 ## Key Dependencies
 

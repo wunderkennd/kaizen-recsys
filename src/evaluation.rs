@@ -995,7 +995,12 @@ pub fn evaluate_with_adapter(
     let mut dropped_ineligible = 0usize;
     let mut users_skipped_ineligible = 0usize;
 
-    for (uid, relevant_all) in &test_user_items {
+    // Sorted user order: the metric sums are order-dependent in their
+    // last ULP, and `AHashMap` iteration order changes per process (#100).
+    let mut eval_uids: Vec<&String> = test_user_items.keys().collect();
+    eval_uids.sort();
+    for uid in eval_uids {
+        let relevant_all = &test_user_items[uid];
         // The user must exist in the model's mappings
         let user_idx_opt = mappings.user_to_idx.get(uid.as_str()).copied();
         if user_idx_opt.is_none() {
@@ -1560,7 +1565,10 @@ mod tests {
         let mut num_users_evaluated = 0usize;
         let mut total_test_interactions = 0usize;
 
-        for (uid, relevant_items) in &test_user_items {
+        let mut sorted_uids: Vec<&String> = test_user_items.keys().collect();
+        sorted_uids.sort();
+        for uid in sorted_uids {
+            let relevant_items = &test_user_items[uid];
             if !model.mappings.user_to_idx.contains_key(uid.as_str()) {
                 continue;
             }

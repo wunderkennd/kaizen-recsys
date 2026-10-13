@@ -17,6 +17,19 @@
 //!    stream. Concurrent burn trainings therefore execute one after
 //!    another; EASE draws nothing from burn and keeps ADR-0002's
 //!    parallelism.
+//!
+//!    The lock must never be waited on from a rayon worker thread. burn's
+//!    element-wise parallelism (`multi-threads`) is dispatched to rayon's
+//!    global pool, so a training on an ordinary thread, holding the lock,
+//!    waits on that pool; a second training parked on the lock *inside* a
+//!    worker takes that worker away, and once every worker is parked the
+//!    holder can never finish — a deadlock. That is why the tuning runner
+//!    evaluates burn trials sequentially on the calling thread
+//!    (`FoldEvaluator::needs_exclusive_backend`). Running a training
+//!    *inside* a pool (`ThreadPool::install`) is fine on its own: the
+//!    holder then executes its own parallel work on that pool. What must
+//!    not happen is a second training parking a worker of the holder's
+//!    pool on the lock.
 //! 2. **Alignment-dependent SIMD reductions.** burn-ndarray's `simd`
 //!    feature chunks a buffer by its alignment, so the order in which
 //!    partial sums meet changes with the allocation address, and a run
