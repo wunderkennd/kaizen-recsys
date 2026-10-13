@@ -561,6 +561,21 @@ pub fn train(
     item_ft: &FeatureTable,
     params: TrainParams,
 ) -> Result<TrainedTwoTower> {
+    // Reproducible section (#100): RNG lock + seed, taken before `init` so
+    // parameter initialization replays identically for the same seed,
+    // whatever else is training (`models::burn_rng`).
+    let seed = params.seed;
+    crate::models::burn_rng::run_training::<TrainB, _, _>(&Dev::default(), seed, move || {
+        train_inner(data, user_ft, item_ft, params)
+    })
+}
+
+fn train_inner(
+    data: &TripleData,
+    user_ft: &FeatureTable,
+    item_ft: &FeatureTable,
+    params: TrainParams,
+) -> Result<TrainedTwoTower> {
     use burn::optim::{GradientsParams, Optimizer};
     type AB = TrainB;
 
@@ -591,10 +606,11 @@ pub fn train(
 
     let batches = make_batches(data, user_ft, item_ft, batch_size, &device);
 
-    // Seeded RNG so id-dropout (and thus the whole run) is reproducible.
-    // Dropout is resampled every epoch: a row that kept its id one epoch
-    // may be dropped the next, so the reserved row sees a broad slice of
-    // the population rather than a fixed subset.
+    // Seeded RNG for id-dropout, separate from burn's so the dropout
+    // pattern does not shift when the architecture (and thus the number of
+    // init draws) changes. Dropout is resampled every epoch: a row that
+    // kept its id one epoch may be dropped the next, so the reserved row
+    // sees a broad slice of the population rather than a fixed subset.
     use rand::SeedableRng;
     let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
 
@@ -693,7 +709,8 @@ fn finalize(
     let record = rec
         .load(blob, device)
         .map_err(|e| anyhow!("recorder.load failed: {e}"))?;
-    let model: TwoTower<B> = cfg.init(device).load_record(record);
+    let model: TwoTower<B> =
+        crate::models::burn_rng::load_under_rng_lock(|| cfg.init(device).load_record(record));
 
     let meta = TwoTowerMeta {
         num_users: data.num_users(),
@@ -858,7 +875,8 @@ impl TrainedTwoTower {
         let record = rec
             .load(weights, &device)
             .map_err(|e| anyhow!("recorder.load failed: {e}"))?;
-        let model: TwoTower<B> = cfg.init(&device).load_record(record);
+        let model: TwoTower<B> =
+            crate::models::burn_rng::load_under_rng_lock(|| cfg.init(&device).load_record(record));
 
         let mappings = Mappings {
             user_to_idx: meta
@@ -1550,8 +1568,8 @@ mod tests {
     /// users are *not* contaminated by the cold-start prior: each warm
     /// user still ranks its own positive first and does not collapse onto
     /// the reserved-row scores — true both with and without id-dropout.
-    /// (Cross-*training-run* bit-equality is intentionally not asserted:
-    /// burn's parameter initialization is not seeded, only id-dropout is.)
+    /// (Cross-training-run bit-equality is covered by
+    /// `two_tower_training_is_reproducible_for_a_seed`, #100.)
     #[test]
     fn warm_user_scores_match_no_dropout_baseline() {
         let (data, uft, ift) = tiny_data();
@@ -1957,5 +1975,39 @@ mod tests {
             let top = idx.retrieve(tower_input(), 1, &[]).expect("retrieve");
             assert_eq!(top.len(), 1);
         }
+    }
+
+    /// #100: same seed → bit-identical model, run after run. Before the
+    /// burn RNG guard only id-dropout was seeded; parameter init drew from
+    /// whatever burn's global RNG held.
+    #[test]
+    fn two_tower_training_is_reproducible_for_a_seed() {
+        let (data, uft, ift) = tiny_data();
+        let params = |seed: u64| TrainParams {
+            embedding_dim: 8,
+            epochs: 20,
+            batch_size: 6,
+            learning_rate: 0.05,
+            id_dropout: 0.3,
+            seed,
+            ..TrainParams::default()
+        };
+        let scores = |m: &TrainedTwoTower| -> Vec<Vec<f32>> {
+            (0..=3usize)
+                .map(|u| {
+                    m.predict_scores(ModelInput::TowerUser {
+                        user_idx: (u > 0).then_some(u),
+                        cat_features: &[],
+                        dense_features: &[],
+                    })
+                    .unwrap()
+                })
+                .collect()
+        };
+        let a = scores(&train(&data, &uft, &ift, params(42)).expect("train"));
+        let b = scores(&train(&data, &uft, &ift, params(42)).expect("train"));
+        assert_eq!(a, b, "same seed must replay bit-for-bit");
+        let c = scores(&train(&data, &uft, &ift, params(43)).expect("train"));
+        assert_ne!(a, c, "a different seed must train a different model");
     }
 }

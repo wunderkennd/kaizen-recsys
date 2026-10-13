@@ -1487,6 +1487,13 @@ where
     let n_configs = configs.len();
     let n_folds = fold_paths.len();
 
+    // Burn-backed evaluators (SASRec, Two-Tower, BERT4Rec) serialize on the
+    // process-wide RNG guard inside their `train_*` (#100,
+    // `models::burn_rng`): the pool still fans the work out, but those
+    // trials run one at a time, each with a seeded RNG stream of its own,
+    // which is what makes a burn-model search a function of its seed
+    // regardless of thread count. EASE trials are unaffected.
+    //
     // Flatten the `(trial, fold)` cartesian product into one flat work list
     // so the rayon pool sees a single even work product. A nested
     // `configs.par_iter()` → `fold_paths.par_iter()` would let the outer
@@ -3263,6 +3270,128 @@ mod tests {
             assert!((1e-3..=0.3).contains(&t.params.learning_rate));
             assert!(t.mean_score.is_finite());
         }
+        Ok(())
+    }
+
+    /// #100: a burn-model search is a function of its seed regardless of
+    /// thread count. The default rayon pool runs the `(trial, fold)` work
+    /// items concurrently; a one-thread pool runs them in sequence. The
+    /// per-trial scores must be bit-identical, not merely close: each
+    /// training holds the burn RNG guard, so no draw is shared.
+    #[cfg(feature = "ml-models")]
+    #[test]
+    fn test_sasrec_search_is_identical_across_thread_counts() -> Result<()> {
+        let (i_path, _tmp) = make_seq_dataset(12, 6, 5)?;
+        let grid = SasRecParamGrid {
+            embedding_dim: vec![8, 16],
+            num_heads: vec![2],
+            num_layers: vec![1],
+            dropout: vec![0.1],
+            learning_rate: vec![1e-2],
+            num_epochs: vec![1],
+        };
+        let evaluator = SasRecFoldEvaluator {
+            max_seq_len: 8,
+            batch_size: 8,
+            patience: 1,
+            seed: 7,
+        };
+
+        let parallel = grid_search_with(&evaluator, &i_path, &grid, 2, 5, 42)?;
+        let sequential = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()?
+            .install(|| grid_search_with(&evaluator, &i_path, &grid, 2, 5, 42))?;
+
+        assert_eq!(parallel.all_trials.len(), 2);
+        assert_eq!(parallel.all_trials.len(), sequential.all_trials.len());
+        for (p, s) in parallel.all_trials.iter().zip(sequential.all_trials.iter()) {
+            assert_eq!(p.params.embedding_dim, s.params.embedding_dim);
+            assert_eq!(
+                p.fold_scores, s.fold_scores,
+                "fold scores must be bit-identical"
+            );
+        }
+        assert_eq!(parallel.best_score, sequential.best_score);
+        assert_eq!(
+            parallel.best_params.embedding_dim,
+            sequential.best_params.embedding_dim
+        );
+        Ok(())
+    }
+
+    /// #97 acceptance, restored by #100: on the Two-Tower fixture, TPE with
+    /// half the budget matches or beats random search's best NDCG@k in a
+    /// majority of seeds. It was moved to EASE in #98 because unseeded burn
+    /// training made it flaky; with the burn RNG guard every run is a
+    /// function of its seed, so the outcome is fixed.
+    #[cfg(feature = "ml-models")]
+    #[test]
+    #[ignore = "trains real burn models; impractically slow in a debug CI build. Run with: cargo test --release --features ml-models -- --ignored"]
+    fn test_tpe_half_budget_matches_random_best_two_tower() -> Result<()> {
+        let (i_path, _tmp) = make_seq_dataset(24, 8, 6)?;
+        let evaluator = TwoTowerFoldEvaluator {
+            epochs: 10,
+            batch_size: 16,
+            seed: 0,
+        };
+        let space = TwoTowerSpace::from_axes(vec![
+            AxisSpec::new("embedding_dim", Axis::choice_usize(&[4, 8, 16, 32])),
+            AxisSpec::new(
+                "temperature",
+                Axis::LogUniform {
+                    low: 0.01,
+                    high: 1.0,
+                },
+            ),
+            AxisSpec::new(
+                "learning_rate",
+                Axis::LogUniform {
+                    low: 1e-3,
+                    high: 0.3,
+                },
+            ),
+        ])?;
+        let budget = 16;
+        let mut wins = 0;
+        let seeds = [1_u64, 2, 3];
+        for &seed in &seeds {
+            let cfg_r = TuneConfig {
+                n_folds: 2,
+                eval_k: 5,
+                seed,
+                max_trials: budget,
+            };
+            let random = tune_with(
+                &evaluator,
+                &i_path,
+                &space,
+                &mut RandomStrategy::new(budget),
+                &cfg_r,
+                &[],
+            )?;
+            let cfg_t = TuneConfig {
+                max_trials: budget / 2,
+                ..cfg_r
+            };
+            let tpe = tune_with(
+                &evaluator,
+                &i_path,
+                &space,
+                &mut TpeStrategy::for_budget(budget / 2).with_batch_size(2),
+                &cfg_t,
+                &[],
+            )?;
+            assert_eq!(tpe.all_trials.len(), budget / 2);
+            if tpe.best_score >= random.best_score - 1e-9 {
+                wins += 1;
+            }
+        }
+        assert!(
+            wins * 2 > seeds.len(),
+            "TPE (half budget) should match/beat random's best in a majority of seeds; won {wins}/{}",
+            seeds.len()
+        );
         Ok(())
     }
 }

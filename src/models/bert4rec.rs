@@ -367,10 +367,6 @@ pub fn train_bert4rec<B: AutodiffBackend>(
     dataset: &MaskedSequenceDataset,
     device: &B::Device,
 ) -> anyhow::Result<Bert4Rec<B::InnerBackend>> {
-    use burn::optim::{AdamConfig, GradientsParams, Optimizer};
-    use rand::SeedableRng;
-    use rand::seq::SliceRandom;
-
     model_config.check()?;
     if dataset.is_empty() {
         anyhow::bail!("train_bert4rec: dataset is empty (no users with >= 2 interactions)");
@@ -393,7 +389,23 @@ pub fn train_bert4rec<B: AutodiffBackend>(
         anyhow::bail!("train_bert4rec: batch_size must be >= 1");
     }
 
-    B::seed(device, train_config.seed);
+    // Reproducible section (#100): RNG lock + seed, so parameter init,
+    // dropout and the epoch shuffle replay identically for the same seed,
+    // whatever else is training (`models::burn_rng`).
+    crate::models::burn_rng::run_training::<B, _, _>(device, train_config.seed, || {
+        train_bert4rec_inner::<B>(model_config, train_config, dataset, device)
+    })
+}
+
+fn train_bert4rec_inner<B: AutodiffBackend>(
+    model_config: &Bert4RecConfig,
+    train_config: &Bert4RecTrainingConfig,
+    dataset: &MaskedSequenceDataset,
+    device: &B::Device,
+) -> anyhow::Result<Bert4Rec<B::InnerBackend>> {
+    use burn::optim::{AdamConfig, GradientsParams, Optimizer};
+    use rand::SeedableRng;
+    use rand::seq::SliceRandom;
 
     let items: Vec<MaskedItem> = (0..dataset.len())
         .map(|i| MaskedItem::from_dataset(dataset, i))
@@ -790,7 +802,10 @@ impl TrainedBert4Rec {
         let record = recorder
             .load(weights, &device)
             .context("failed to load BERT4Rec params blob")?;
-        let model: Bert4Rec<B4InfB> = config.init(&device).load_record(record);
+        let model: Bert4Rec<B4InfB> =
+            crate::models::burn_rng::load_under_rng_lock::<B4InfB, _, _>(|| {
+                config.init(&device).load_record(record)
+            });
 
         let mappings = Mappings {
             user_to_idx: meta
@@ -947,6 +962,17 @@ mod tests {
 
     /// vocab=10 (8 items + PAD + MASK), dim=16, seq_len=8, heads=2,
     /// layers=2, 8 position buckets, no dropout.
+    /// A freshly initialized test model whose (lazy) parameter draws all
+    /// happen under the burn RNG guard (#100), so these forward tests never
+    /// interleave with a concurrent training's stream. `num_params()`
+    /// touches every parameter and forces the initializers to run.
+    fn test_model(device: &NdArrayDevice) -> Bert4Rec<TestBackend> {
+        let _guard = crate::models::burn_rng::seeded_training_guard::<TestBackend>(device, 0);
+        let model: Bert4Rec<TestBackend> = test_config().init(device);
+        let _ = model.num_params();
+        model
+    }
+
     fn test_config() -> Bert4RecConfig {
         Bert4RecConfig::new(10, 8, 2, 2)
             .with_embedding_dim(16)
@@ -965,7 +991,7 @@ mod tests {
     #[test]
     fn test_construction_succeeds() {
         let device = NdArrayDevice::default();
-        let _model: Bert4Rec<TestBackend> = test_config().init(&device);
+        let _model = test_model(&device);
     }
 
     #[test]
@@ -979,7 +1005,7 @@ mod tests {
     #[test]
     fn test_forward_shape_is_batch_seq_vocab() {
         let device = NdArrayDevice::default();
-        let model: Bert4Rec<TestBackend> = test_config().init(&device);
+        let model = test_model(&device);
         let input = Tensor::<TestBackend, 2, Int>::from_data(
             [[0, 0, 2, 3, 4, 5, 6, 7], [2, 3, 4, 5, 6, 7, 8, 9]],
             &device,
@@ -991,7 +1017,7 @@ mod tests {
     #[test]
     fn test_forward_is_deterministic() {
         let device = NdArrayDevice::default();
-        let model: Bert4Rec<TestBackend> = test_config().init(&device);
+        let model = test_model(&device);
         let input = Tensor::<TestBackend, 2, Int>::from_data(
             [[2, 3, 4, 5, 6, 7, 8, 9], [9, 8, 7, 6, 5, 4, 3, 2]],
             &device,
@@ -1016,7 +1042,7 @@ mod tests {
         // itself, so this is impossible for SASRec and is the defining
         // property of BERT4Rec's encoder.
         let device = NdArrayDevice::default();
-        let model: Bert4Rec<TestBackend> = test_config().init(&device);
+        let model = test_model(&device);
         let a = Tensor::<TestBackend, 2, Int>::from_data([[2, 3, 4, 5, 6, 7, 8, 9]], &device);
         let b = Tensor::<TestBackend, 2, Int>::from_data([[2, 3, 4, 5, 6, 7, 8, 2]], &device);
         let pos = zeros_pos(1, 8, &device);
@@ -1034,7 +1060,7 @@ mod tests {
     #[test]
     fn position_buckets_change_the_output() {
         let device = NdArrayDevice::default();
-        let model: Bert4Rec<TestBackend> = test_config().init(&device);
+        let model = test_model(&device);
         let input = Tensor::<TestBackend, 2, Int>::from_data([[2, 3, 4, 5, 6, 7, 8, 9]], &device);
         let p0 = zeros_pos(1, 8, &device);
         let p1 = Tensor::<TestBackend, 2, Int>::from_data([[7, 6, 5, 4, 3, 2, 1, 0]], &device);
@@ -1051,7 +1077,7 @@ mod tests {
         // pooled embedding must be identical (pads are masked out of
         // attention as keys and excluded from the mean).
         let device = NdArrayDevice::default();
-        let model: Bert4Rec<TestBackend> = test_config().init(&device);
+        let model = test_model(&device);
         let padded = Tensor::<TestBackend, 2, Int>::from_data([[0, 0, 0, 0, 0, 2, 3, 4]], &device);
         let unpadded = Tensor::<TestBackend, 2, Int>::from_data([[2, 3, 4]], &device);
         let a = model.pooled(padded, zeros_pos(1, 8, &device));
@@ -1069,7 +1095,7 @@ mod tests {
     #[should_panic(expected = "exceeds max_seq_len")]
     fn forward_panics_when_seq_len_exceeds_max() {
         let device = NdArrayDevice::default();
-        let model: Bert4Rec<TestBackend> = test_config().init(&device);
+        let model = test_model(&device);
         let input = Tensor::<TestBackend, 2, Int>::zeros([1, 12], &device);
         let _ = model.forward(input, zeros_pos(1, 12, &device));
     }
@@ -1127,15 +1153,13 @@ mod tests {
 
     #[test]
     fn test_overfits_tiny_masked_dataset() {
-        // Same multi-seed robustness pattern as SASRec's overfit test
-        // (#48, #90): burn's NdArray init is not reseeded from `B::seed`,
-        // so require 2 successes within 5 seeds rather than one lucky run.
+        // Single run, fixed seed (#100): training is a pure function of the
+        // seed under the burn RNG guard (`models::burn_rng`), so the old
+        // 2-of-5-seeds hedge against concurrent tests interleaving draws
+        // from burn's global RNG is no longer needed.
         let device = NdArrayDevice::default();
         let mut correct = 0;
-        for seed in [1_u64, 2, 3, 4, 5] {
-            if correct >= 2 {
-                break;
-            }
+        for seed in [1_u64] {
             let model = train_tiny(seed, 200);
             let input = Tensor::<TestBackend, 2, Int>::from_data([[2, 3, 4, MASK_TOKEN]], &device);
             let pos = Tensor::<TestBackend, 2, Int>::from_data([[3, 2, 1, 0]], &device);
@@ -1158,7 +1182,7 @@ mod tests {
             }
         }
         assert!(
-            correct >= 2,
+            correct >= 1,
             "overfit model should recover token 5 at the masked slot in a majority of \
              runs; only {correct} of up to 5 seeds did"
         );
@@ -1413,4 +1437,27 @@ mod tests {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<TrainedBert4Rec>();
     };
+
+    /// #100: same seed → bit-identical model, run after run.
+    #[test]
+    fn bert4rec_training_is_reproducible_for_a_seed() {
+        let device = NdArrayDevice::default();
+        let logits = |m: &Bert4Rec<TestBackend>| -> Vec<f32> {
+            let input = Tensor::<TestBackend, 2, Int>::from_data([[2, 3, 4, MASK_TOKEN]], &device);
+            let pos = Tensor::<TestBackend, 2, Int>::from_data([[3, 2, 1, 0]], &device);
+            m.forward(input, pos)
+                .into_data()
+                .convert::<f32>()
+                .into_vec()
+                .unwrap()
+        };
+        let a = logits(&train_tiny(7, 15));
+        let b = logits(&train_tiny(7, 15));
+        assert_eq!(a, b, "same seed must replay bit-for-bit");
+        assert_ne!(
+            a,
+            logits(&train_tiny(8, 15)),
+            "a different seed must differ"
+        );
+    }
 }

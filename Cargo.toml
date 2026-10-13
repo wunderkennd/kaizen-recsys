@@ -37,7 +37,15 @@ burn = { version = "0.21", optional = true, default-features = false, features =
     "train",
     "std",
 ] }
-burn-ndarray = { version = "0.21", optional = true }
+# `default-features = false` drops burn-ndarray's `simd` feature on purpose
+# (#100): its SIMD reduction kernels chunk a buffer by its alignment, so the
+# order in which partial sums meet changes with the allocation address and
+# a training run was not bit-reproducible across runs, even single-threaded.
+# `multi-threads` (rayon, per-element parallelism) is kept: it is
+# deterministic, and `std` is what the backend needs. matmul still goes
+# through matrixmultiply's own SIMD kernels, so the cost is confined to
+# element-wise and reduction ops.
+burn-ndarray = { version = "0.21", optional = true, default-features = false, features = ["std", "multi-threads"] }
 
 # Optional — only pulled in with the `fast-blas` feature (ADR-0002 §"Decision"
 # #2, Phase 2). Delegates the dense Gram inversion in `src/model.rs` to a

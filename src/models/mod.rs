@@ -30,6 +30,9 @@ pub mod two_tower;
 #[cfg(feature = "ml-models")]
 pub mod bert4rec;
 
+#[cfg(feature = "ml-models")]
+pub mod burn_rng;
+
 pub use ease::{EaseAdapter, EaseAdapterRef};
 
 #[cfg(feature = "ml-models")]

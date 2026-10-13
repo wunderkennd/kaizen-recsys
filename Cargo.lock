@@ -734,9 +734,7 @@ dependencies = [
  "burn-backend",
  "burn-ir",
  "burn-std",
- "bytemuck",
  "const-random",
- "itertools 0.14.0",
  "libm",
  "macerator",
  "matrixmultiply",
@@ -747,7 +745,6 @@ dependencies = [
  "portable-atomic-util",
  "rand 0.10.1",
  "rayon",
- "seq-macro",
 ]
 
 [[package]]

@@ -106,7 +106,12 @@ Constraints that shaped the design:
   draw"; it is now a one-element axis that does draw. The Python layer
   never passes empty lists, so its outputs are unchanged.
 - Determinism: a whole search is a function of `(seed, space, strategy
-  settings)`; execution order and thread count do not affect it.
+  settings)`; execution order and thread count do not affect it. For the
+  burn-backed models this holds because each `train_*` seeds burn's
+  process-global RNG under a process-wide guard (`models::burn_rng`, #100):
+  the rayon runner still fans trials out, but burn-model trainings execute
+  one at a time, each owning the RNG stream. EASE trials keep ADR-0002's
+  parallelism in full.
 - Grids are enumerated lazily (mixed-radix counter, first axis
   outermost), so a trial budget bounds memory on any finite space, and a
   grid resumed from a warm start skips already-evaluated assignments.
@@ -116,12 +121,13 @@ Constraints that shaped the design:
   user's own history, split leave-last-out: user-disjoint folds give a
   test user no train interactions, so the previous "train history as
   context" was always empty and every user received the same query.
-- Acceptance evidence (issue #97): on the Two-Tower fixture, TPE with half
-  the budget matches or beats random search's best NDCG@k in a majority
-  of seeds (`test_tpe_half_budget_matches_random_best_two_tower`,
-  release-mode `--ignored`); on a synthetic 3-axis bowl it wins 7/7 seeds
-  at equal budget and 5/7 at half budget
-  (`strategy::tests::tpe_beats_random_on_quadratic_bowl`).
+- Acceptance evidence (issue #97): on the EASE fixture, TPE with half the
+  budget matches or beats random search's best NDCG@k in a majority of
+  seeds and on mean (`test_tpe_half_budget_matches_random_best_ease`,
+  release-mode `--ignored`); the Two-Tower counterpart
+  (`test_tpe_half_budget_matches_random_best_two_tower`) is deterministic
+  since #100; on a synthetic 3-axis bowl it wins 7/7 seeds at equal budget
+  and 5/7 at half budget (`strategy::tests::tpe_beats_random_on_quadratic_bowl`).
 
 ## Alternatives considered
 
