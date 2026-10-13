@@ -128,10 +128,13 @@ Constraints that shaped the design:
 - Acceptance evidence (issue #97): on the EASE fixture, TPE with half the
   budget matches or beats random search's best NDCG@k in a majority of
   seeds and on mean (`test_tpe_half_budget_matches_random_best_ease`,
-  release-mode `--ignored`); the Two-Tower counterpart
-  (`test_tpe_half_budget_matches_random_best_two_tower`) is deterministic
-  since #100; on a synthetic 3-axis bowl it wins 7/7 seeds at equal budget
-  and 5/7 at half budget (`strategy::tests::tpe_beats_random_on_quadratic_bowl`).
+  release-mode `--ignored`); on a synthetic 3-axis bowl it wins 7/7 seeds
+  at equal budget and 5/7 at half budget
+  (`strategy::tests::tpe_beats_random_on_quadratic_bowl`). The same claim
+  does not hold on the 24-user Two-Tower fixture: with #100's
+  deterministic training, TPE at half budget wins 1 of 3 seeds there, so
+  EASE is the acceptance fixture and the Two-Tower runner is covered by
+  the determinism tests instead.
 
 ## Alternatives considered
 
