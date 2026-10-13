@@ -18,18 +18,24 @@
 //!    another; EASE draws nothing from burn and keeps ADR-0002's
 //!    parallelism.
 //!
-//!    The lock must never be waited on from a rayon worker thread. burn's
-//!    element-wise parallelism (`multi-threads`) is dispatched to rayon's
-//!    global pool, so a training on an ordinary thread, holding the lock,
-//!    waits on that pool; a second training parked on the lock *inside* a
-//!    worker takes that worker away, and once every worker is parked the
-//!    holder can never finish — a deadlock. That is why the tuning runner
-//!    evaluates burn trials sequentially on the calling thread
-//!    (`FoldEvaluator::needs_exclusive_backend`). Running a training
-//!    *inside* a pool (`ThreadPool::install`) is fine on its own: the
-//!    holder then executes its own parallel work on that pool. What must
-//!    not happen is a second training parking a worker of the holder's
-//!    pool on the lock.
+//!    Holding a lock across work that runs on a shared rayon pool is a
+//!    deadlock waiting to happen: burn's element-wise parallelism
+//!    (`multi-threads`) dispatches to the *current* rayon pool, which for
+//!    an ordinary thread is the global one, so a training that held the
+//!    lock while waiting on the global pool could never finish once every
+//!    global worker was itself parked on the lock (concurrent tuning
+//!    trials, or any `train_*` call made from inside a rayon job). The
+//!    training body therefore runs on a private pool owned by this module
+//!    ([`burn_pool`]): the lock holder only ever waits on workers that no
+//!    other training can park, because only the lock holder's body is in
+//!    that pool. A `train_*` call made from a rayon worker takes the lock
+//!    on a plain helper thread instead (`install` from a worker would keep
+//!    it busy with its own pool's jobs while waiting, which could start a
+//!    second training inside the first), and the worker simply blocks on
+//!    the result, which no lock holder depends on. The tuning runner still
+//!    evaluates burn trials one at a time on the calling thread
+//!    (`FoldEvaluator::needs_exclusive_backend`): they serialize on the
+//!    lock anyway, so fanning them out would only park workers.
 //! 2. **Alignment-dependent SIMD reductions.** burn-ndarray's `simd`
 //!    feature chunks a buffer by its alignment, so the order in which
 //!    partial sums meet changes with the allocation address, and a run
@@ -45,9 +51,14 @@
 
 use burn::tensor::backend::Backend;
 use std::cell::Cell;
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 
 static BURN_RNG_LOCK: Mutex<()> = Mutex::new(());
+
+/// The pool every training body runs on (see the module docs). Sized like
+/// rayon's global pool (`RAYON_NUM_THREADS`, else the available
+/// parallelism), so the usual knob still caps burn's parallelism.
+static BURN_POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
 
 thread_local! {
     /// Whether this thread currently holds [`BURN_RNG_LOCK`]. `std::sync::Mutex`
@@ -56,13 +67,29 @@ thread_local! {
     /// inference backend through [`load_under_rng_lock`]), so the lock is
     /// taken once per thread and nested guards ride the outer one.
     static HELD_BY_THIS_THREAD: Cell<bool> = const { Cell::new(false) };
+
+    /// Set on every [`BURN_POOL`] worker. Only the lock holder's body runs
+    /// there, so a guard requested from one of its workers is nested in
+    /// that body and must not lock again.
+    static IN_BURN_POOL: Cell<bool> = const { Cell::new(false) };
 }
 
-/// Take the lock unless this thread already holds it. `None` means the
-/// caller is nested inside an outer guard on this thread, which keeps the
-/// RNG exclusive to it either way.
+fn burn_pool() -> &'static rayon::ThreadPool {
+    BURN_POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .thread_name(|i| format!("burn-train-{i}"))
+            .start_handler(|_| IN_BURN_POOL.with(|flag| flag.set(true)))
+            .build()
+            .expect("failed to build the burn training thread pool")
+    })
+}
+
+/// Take the lock unless this thread already holds it, or is a worker of
+/// the pool the lock holder's body is running on. `None` means the caller
+/// is nested inside an outer guard, which keeps the RNG exclusive to it
+/// either way.
 fn lock_for_this_thread() -> Option<MutexGuard<'static, ()>> {
-    if HELD_BY_THIS_THREAD.with(Cell::get) {
+    if HELD_BY_THIS_THREAD.with(Cell::get) || IN_BURN_POOL.with(Cell::get) {
         return None;
     }
     let guard = BURN_RNG_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
@@ -71,15 +98,37 @@ fn lock_for_this_thread() -> Option<MutexGuard<'static, ()>> {
 }
 
 /// Run `train` as a reproducible burn training: under the process-wide RNG
-/// lock, with `B` seeded to `seed`. Every burn `train_*` entry point goes
-/// through here.
+/// lock, with `B` seeded to `seed`, on the private burn pool. Every burn
+/// `train_*` entry point goes through here. Safe to call from any thread,
+/// a rayon worker included.
 pub fn run_training<B, R, F>(device: &B::Device, seed: u64, train: F) -> R
 where
     B: Backend,
-    F: FnOnce() -> R,
+    F: FnOnce() -> R + Send,
+    R: Send,
+{
+    if rayon::current_thread_index().is_some() {
+        // Called from inside a rayon job: take the lock on a plain thread
+        // and let the worker block on the result (see the module docs).
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| run_training_locked::<B, R, F>(device, seed, train))
+                .join()
+                .unwrap_or_else(|payload| std::panic::resume_unwind(payload))
+        })
+    } else {
+        run_training_locked::<B, R, F>(device, seed, train)
+    }
+}
+
+fn run_training_locked<B, R, F>(device: &B::Device, seed: u64, train: F) -> R
+where
+    B: Backend,
+    F: FnOnce() -> R + Send,
+    R: Send,
 {
     let _guard = seeded_training_guard::<B>(device, seed);
-    train()
+    burn_pool().install(train)
 }
 
 /// Build a model from a saved record under the RNG lock, with every lazy
@@ -109,8 +158,9 @@ where
 ///
 /// Hold it for the whole training run (bind it to a local that lives until
 /// the function returns). Dropping it releases the lock for the next run.
-/// A guard taken while this thread already holds one (`_guard == None`)
-/// is a no-op wrapper: the outer guard keeps the RNG exclusive.
+/// A guard taken while this thread already holds one, or on a burn-pool
+/// worker (`_guard == None`), is a no-op wrapper: the outer guard keeps
+/// the RNG exclusive.
 #[must_use = "the guard must stay alive for the whole training run"]
 pub struct BurnRngGuard {
     _guard: Option<MutexGuard<'static, ()>>,
@@ -141,6 +191,10 @@ mod tests {
     use burn::backend::NdArray;
     use burn::backend::ndarray::NdArrayDevice;
     use burn::tensor::{Distribution, Tensor};
+    use rayon::prelude::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::time::Duration;
 
     type B = NdArray<f32>;
 
@@ -154,9 +208,34 @@ mod tests {
         for _ in 0..4 {
             let t = Tensor::<B, 1>::random([32], Distribution::Default, &device);
             out.extend(t.into_data().convert::<f32>().into_vec::<f32>().unwrap());
-            std::thread::sleep(std::time::Duration::from_millis(5));
+            std::thread::sleep(Duration::from_millis(5));
         }
         out
+    }
+
+    /// A random draw followed by a matmul: burn-ndarray runs matmul (like
+    /// conv and pooling) inside `rayon::scope`, which from an ordinary
+    /// thread injects into the global pool and waits. That is the wait a
+    /// training does many times per step while the lock is held.
+    fn pool_backed_op(device: &NdArrayDevice) -> f32 {
+        let a = Tensor::<B, 2>::random([64, 64], Distribution::Default, device);
+        let b = Tensor::<B, 2>::random([64, 64], Distribution::Default, device);
+        a.matmul(b).sum().into_scalar()
+    }
+
+    /// Run `f` on a helper thread and fail, instead of hanging, if it has
+    /// not finished within `secs`.
+    fn finishes_within<T: Send + 'static>(
+        secs: u64,
+        what: &str,
+        f: impl FnOnce() -> T + Send + 'static,
+    ) -> T {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        rx.recv_timeout(Duration::from_secs(secs))
+            .unwrap_or_else(|_| panic!("{what} did not finish within {secs}s (deadlock?)"))
     }
 
     #[test]
@@ -182,39 +261,105 @@ mod tests {
         }
     }
 
-    /// Two-Tower's training calls `load_under_rng_lock` from inside
-    /// `run_training` (its `finalize` step); a non-reentrant lock would
-    /// deadlock there. Run it on a helper thread so a regression fails the
-    /// test instead of hanging it.
+    /// The training body runs on the burn pool while the caller holds the
+    /// lock; a guard or `load_under_rng_lock` requested from inside the
+    /// body (Two-Tower's `finalize` does the latter) must ride the outer
+    /// guard instead of locking again.
     #[test]
-    fn lock_is_reentrant_on_the_holding_thread() {
+    fn lock_is_reentrant_inside_a_training_body() {
         use burn::module::Module;
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
+        let n = finishes_within(30, "nested lock use", || {
             let device = NdArrayDevice::default();
             let n = run_training::<NdArray, _, _>(&device, 5, || {
+                assert!(IN_BURN_POOL.with(Cell::get), "body runs on the burn pool");
                 let inner = seeded_training_guard::<NdArray>(&device, 6);
                 assert!(inner._guard.is_none(), "nested guard must not re-lock");
                 drop(inner);
-                assert!(
-                    HELD_BY_THIS_THREAD.with(Cell::get),
-                    "dropping the nested guard must leave the outer one held"
-                );
                 let model = load_under_rng_lock::<NdArray, _, _>(|| {
                     burn::nn::LinearConfig::new(3, 2).init::<NdArray>(&device)
                 });
                 model.num_params()
             });
             assert!(!HELD_BY_THIS_THREAD.with(Cell::get));
-            tx.send(n).unwrap();
+            n
         });
-        let n = rx
-            .recv_timeout(std::time::Duration::from_secs(30))
-            .expect("nested lock use must not deadlock");
         assert_eq!(n, 3 * 2 + 2);
         // The lock is free again for another thread.
         let device = NdArrayDevice::default();
         let _g = seeded_training_guard::<NdArray>(&device, 1);
+    }
+
+    /// Contention test for the deadlock described in the module docs: an
+    /// ordinary thread holds the lock and needs pool-backed burn ops while
+    /// every worker of the global rayon pool is parked on the lock by a
+    /// training call of its own. The holder's body runs on the private
+    /// burn pool, so it finishes; the parked trainings then run in turn.
+    #[test]
+    fn trainings_from_rayon_workers_cannot_starve_the_lock_holder() {
+        let n_workers = rayon::current_num_threads();
+        let results = finishes_within(120, "trainings contending for the lock", move || {
+            let device = NdArrayDevice::default();
+            let holder_locked = Arc::new(AtomicBool::new(false));
+            let workers_at_lock = Arc::new(AtomicUsize::new(0));
+
+            let holder = {
+                let holder_locked = Arc::clone(&holder_locked);
+                let workers_at_lock = Arc::clone(&workers_at_lock);
+                std::thread::spawn(move || {
+                    run_training::<NdArray, _, _>(&device, 1, || {
+                        holder_locked.store(true, Ordering::SeqCst);
+                        // Wait until every global worker is about to block
+                        // on the lock, then give them a moment to do so.
+                        while workers_at_lock.load(Ordering::SeqCst) < n_workers {
+                            std::thread::yield_now();
+                        }
+                        std::thread::sleep(Duration::from_millis(100));
+                        pool_backed_op(&device)
+                    })
+                })
+            };
+            while !holder_locked.load(Ordering::SeqCst) {
+                std::thread::yield_now();
+            }
+
+            // One training call per global worker. Each item spins until all
+            // of them have started, so they occupy distinct workers, then
+            // calls `run_training` and blocks on the lock the holder has.
+            let started = Arc::new(AtomicUsize::new(0));
+            let from_workers: Vec<f32> = (0..n_workers)
+                .into_par_iter()
+                .with_min_len(1)
+                .map(|i| {
+                    started.fetch_add(1, Ordering::SeqCst);
+                    while started.load(Ordering::SeqCst) < n_workers {
+                        std::thread::yield_now();
+                    }
+                    assert!(rayon::current_thread_index().is_some());
+                    workers_at_lock.fetch_add(1, Ordering::SeqCst);
+                    run_training::<NdArray, _, _>(&device, 10 + i as u64, || {
+                        pool_backed_op(&device)
+                    })
+                })
+                .collect();
+
+            let from_holder = holder.join().unwrap();
+            (from_holder, from_workers)
+        });
+
+        let (from_holder, from_workers) = results;
+        assert_eq!(from_workers.len(), n_workers);
+        // Every run owned the RNG: same seed later gives the same value.
+        let device = NdArrayDevice::default();
+        assert_eq!(
+            from_holder,
+            run_training::<NdArray, _, _>(&device, 1, || pool_backed_op(&device))
+        );
+        for (i, v) in from_workers.iter().enumerate() {
+            assert_eq!(
+                *v,
+                run_training::<NdArray, _, _>(&device, 10 + i as u64, || pool_backed_op(&device))
+            );
+        }
     }
 
     #[test]

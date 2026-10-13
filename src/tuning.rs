@@ -864,17 +864,15 @@ pub trait FoldEvaluator<P>: Send + Sync {
         eval_k: usize,
     ) -> Result<f64>;
 
-    /// `true` when `evaluate_fold` must not run on a rayon worker thread.
+    /// `true` when `evaluate_fold` serializes on a process-wide resource.
     ///
-    /// The burn-backed evaluators hold the process-wide RNG lock for the
-    /// whole training (#100, `models::burn_rng`) while burn's own
-    /// element-wise parallelism is dispatched to rayon's global pool. A
-    /// trial blocked on that lock *inside* a pool worker can therefore
-    /// starve the lock holder of the workers it is waiting on — a deadlock
-    /// once every worker is parked on the lock. Such evaluators run their
-    /// batch one fold at a time on the calling thread instead; burn still
-    /// uses every core within each training. EASE (the default) keeps
-    /// ADR-0002's parallel trials.
+    /// The burn-backed evaluators hold the burn RNG lock for the whole
+    /// training (#100, `models::burn_rng`), so their trials execute one
+    /// at a time whatever the pool does; fanning them out over rayon would
+    /// only park every worker on that lock for the duration. Such
+    /// evaluators run their batch one fold at a time on the calling thread
+    /// instead; burn still uses every core within each training. EASE (the
+    /// default) keeps ADR-0002's parallel trials.
     fn needs_exclusive_backend(&self) -> bool {
         false
     }
@@ -1530,7 +1528,7 @@ where
 
     // Burn-backed evaluators (SASRec, Two-Tower, BERT4Rec) hold the
     // process-wide RNG lock for each training (#100, `models::burn_rng`),
-    // which must never be waited on from a rayon worker (see
+    // so their trials serialize anyway (see
     // `FoldEvaluator::needs_exclusive_backend`). Their work list runs in
     // order on this thread: one seeded training at a time, each still
     // multi-threaded inside burn. EASE trials keep the parallel path.

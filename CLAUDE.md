@@ -264,12 +264,14 @@ seed regardless of thread count. For the burn-backed models that relies on
 `models/burn_rng.rs` (#100): `burn-ndarray` has one process-global RNG, so
 each `train_*` takes a process-wide guard and seeds it; concurrent
 burn-model trainings (parallel tests, Python threads) therefore run one at
-a time, each a pure function of its seed. The tuning runner evaluates a
-burn evaluator's batch sequentially on the calling thread
-(`FoldEvaluator::needs_exclusive_backend`): the guard must never be waited
-on from a rayon worker, because burn's own element-wise parallelism runs
-on that pool and parked workers would deadlock the lock holder. Per-user
-metric sums iterate users in sorted order so a fold mean is bit-stable.
+a time, each a pure function of its seed. The training body runs on a
+private rayon pool owned by `burn_rng`, so the lock holder never waits on
+workers another training can park (a `train_*` call from inside a rayon
+job is safe: it takes the lock on a helper thread). The tuning runner
+evaluates a burn evaluator's batch sequentially on the calling thread
+(`FoldEvaluator::needs_exclusive_backend`), since the trials serialize on
+the guard anyway. Per-user metric sums iterate users in sorted order so a
+fold mean is bit-stable.
 burn-ndarray is also built without its `simd` feature (see `Cargo.toml`).
 EASE is unaffected.
 

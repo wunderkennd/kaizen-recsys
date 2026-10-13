@@ -108,13 +108,13 @@ Constraints that shaped the design:
 - Determinism: a whole search is a function of `(seed, space, strategy
   settings)`; execution order and thread count do not affect it. For the
   burn-backed models this holds because each `train_*` seeds burn's
-  process-global RNG under a process-wide guard (`models::burn_rng`, #100),
-  and the runner evaluates a burn evaluator's batch sequentially on the
-  calling thread (`FoldEvaluator::needs_exclusive_backend`) rather than
-  parking rayon workers on that guard, which would deadlock the holder
-  against burn's own pool-backed element-wise ops. Each training still
-  uses every core inside burn. EASE trials keep ADR-0002's parallelism in
-  full. Fold means iterate test users in sorted order, so the last ULP of
+  process-global RNG under a process-wide guard (`models::burn_rng`, #100)
+  and runs the training body on a private rayon pool, so the guard holder
+  never waits on workers that another training could park. The runner
+  evaluates a burn evaluator's batch sequentially on the calling thread
+  (`FoldEvaluator::needs_exclusive_backend`): those trials serialize on
+  the guard anyway. Each training still uses every core inside burn. EASE
+  trials keep ADR-0002's parallelism in full. Fold means iterate test users in sorted order, so the last ULP of
   a score does not depend on `AHashMap`'s per-process hash seed.
 - Grids are enumerated lazily (mixed-radix counter, first axis
   outermost), so a trial budget bounds memory on any finite space, and a
