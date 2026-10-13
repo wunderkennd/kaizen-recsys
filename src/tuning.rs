@@ -863,6 +863,19 @@ pub trait FoldEvaluator<P>: Send + Sync {
         params: &P,
         eval_k: usize,
     ) -> Result<f64>;
+
+    /// `true` when `evaluate_fold` serializes on a process-wide resource.
+    ///
+    /// The burn-backed evaluators hold the burn RNG lock for the whole
+    /// training (#100, `models::burn_rng`), so their trials execute one
+    /// at a time whatever the pool does; fanning them out over rayon would
+    /// only park every worker on that lock for the duration. Such
+    /// evaluators run their batch one fold at a time on the calling thread
+    /// instead; burn still uses every core within each training. EASE (the
+    /// default) keeps ADR-0002's parallel trials.
+    fn needs_exclusive_backend(&self) -> bool {
+        false
+    }
 }
 
 /// Scores a trained model against held-out test users via the
@@ -890,7 +903,7 @@ where
     let mut ndcg_sum = 0.0;
     let mut n_users = 0;
 
-    for (user_id, test_items) in test_user_items {
+    for (user_id, test_items) in sorted_users(test_user_items) {
         if test_items.is_empty() {
             continue;
         }
@@ -909,6 +922,17 @@ where
         return Ok(0.0);
     }
     Ok(ndcg_sum / n_users as f64)
+}
+
+/// Test users in ascending id order. Every fold score is a mean over
+/// users, and `AHashMap` iteration order follows its per-process random
+/// hash seed, so summing per-user NDCG in map order can move the mean by
+/// an ULP from one run (or thread pool) to the next (#100). Iterating in
+/// sorted order makes the fold mean a pure function of the data.
+fn sorted_users<V>(map: &AHashMap<String, V>) -> Vec<(&String, &V)> {
+    let mut users: Vec<(&String, &V)> = map.iter().collect();
+    users.sort_by(|a, b| a.0.cmp(b.0));
+    users
 }
 
 /// Exclude already-seen training items, rank the catalog by score
@@ -956,7 +980,7 @@ fn score_two_tower_over_test_users(
     let mut ndcg_sum = 0.0;
     let mut n_users = 0;
 
-    for (user_id, test_items) in test_user_items {
+    for (user_id, test_items) in sorted_users(test_user_items) {
         if test_items.is_empty() {
             continue;
         }
@@ -1151,6 +1175,11 @@ impl Default for SasRecFoldEvaluator {
 
 #[cfg(feature = "ml-models")]
 impl FoldEvaluator<SasRecParams> for SasRecFoldEvaluator {
+    /// Burn training holds the process-wide RNG lock (#100).
+    fn needs_exclusive_backend(&self) -> bool {
+        true
+    }
+
     fn evaluate_fold(
         &self,
         train_interactions_path: &str,
@@ -1256,7 +1285,7 @@ fn score_sequence_model_leave_last_out(
 
     let mut ndcg_sum = 0.0;
     let mut n_users = 0;
-    for (user_id, items) in &test_user_items {
+    for (user_id, items) in sorted_users(&test_user_items) {
         let Some(days_ago) = test_user_days_ago.get(user_id) else {
             continue;
         };
@@ -1315,6 +1344,11 @@ impl Default for TwoTowerFoldEvaluator {
 
 #[cfg(feature = "ml-models")]
 impl FoldEvaluator<TwoTowerParams> for TwoTowerFoldEvaluator {
+    /// Burn training holds the process-wide RNG lock (#100).
+    fn needs_exclusive_backend(&self) -> bool {
+        true
+    }
+
     fn evaluate_fold(
         &self,
         train_interactions_path: &str,
@@ -1397,6 +1431,11 @@ impl Default for Bert4RecFoldEvaluator {
 
 #[cfg(feature = "ml-models")]
 impl FoldEvaluator<Bert4RecParams> for Bert4RecFoldEvaluator {
+    /// Burn training holds the process-wide RNG lock (#100).
+    fn needs_exclusive_backend(&self) -> bool {
+        true
+    }
+
     fn evaluate_fold(
         &self,
         train_interactions_path: &str,
@@ -1487,6 +1526,13 @@ where
     let n_configs = configs.len();
     let n_folds = fold_paths.len();
 
+    // Burn-backed evaluators (SASRec, Two-Tower, BERT4Rec) hold the
+    // process-wide RNG lock for each training (#100, `models::burn_rng`),
+    // so their trials serialize anyway (see
+    // `FoldEvaluator::needs_exclusive_backend`). Their work list runs in
+    // order on this thread: one seeded training at a time, each still
+    // multi-threaded inside burn. EASE trials keep the parallel path.
+    //
     // Flatten the `(trial, fold)` cartesian product into one flat work list
     // so the rayon pool sees a single even work product. A nested
     // `configs.par_iter()` → `fold_paths.par_iter()` would let the outer
@@ -1497,15 +1543,16 @@ where
         .flat_map(|trial_idx| (0..n_folds).map(move |fold_idx| (trial_idx, fold_idx)))
         .collect();
 
-    let mut fold_results: Vec<(usize, usize, f64)> = work
-        .par_iter()
-        .map(|&(trial_idx, fold_idx)| -> Result<(usize, usize, f64)> {
-            let (train_path, test_path) = &fold_paths[fold_idx];
-            let score =
-                evaluator.evaluate_fold(train_path, test_path, &configs[trial_idx], eval_k)?;
-            Ok((trial_idx, fold_idx, score))
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let run_one = |&(trial_idx, fold_idx): &(usize, usize)| -> Result<(usize, usize, f64)> {
+        let (train_path, test_path) = &fold_paths[fold_idx];
+        let score = evaluator.evaluate_fold(train_path, test_path, &configs[trial_idx], eval_k)?;
+        Ok((trial_idx, fold_idx, score))
+    };
+    let mut fold_results: Vec<(usize, usize, f64)> = if evaluator.needs_exclusive_backend() {
+        work.iter().map(run_one).collect::<Result<Vec<_>>>()?
+    } else {
+        work.par_iter().map(run_one).collect::<Result<Vec<_>>>()?
+    };
 
     // Regroup deterministically: sorting by `(trial_idx, fold_idx)` makes
     // each trial's fold scores independent of parallel completion order.
@@ -2239,7 +2286,7 @@ mod tests {
 
         let mut ndcg_sum = 0.0;
         let mut n_users = 0;
-        for (user_id, test_items) in &test_user_items {
+        for (user_id, test_items) in sorted_users(&test_user_items) {
             if test_items.is_empty() {
                 continue;
             }
@@ -3263,6 +3310,54 @@ mod tests {
             assert!((1e-3..=0.3).contains(&t.params.learning_rate));
             assert!(t.mean_score.is_finite());
         }
+        Ok(())
+    }
+
+    /// #100: a burn-model search is a function of its seed regardless of
+    /// thread count. The `(trial, fold)` work items run in order either way
+    /// (`needs_exclusive_backend`), but burn's element-wise ops and the
+    /// Parquet reads fan out over whatever pool is current: the default
+    /// pool here, a one-thread pool in the second run. The per-trial scores
+    /// must be bit-identical, not merely close.
+    #[cfg(feature = "ml-models")]
+    #[test]
+    fn test_sasrec_search_is_identical_across_thread_counts() -> Result<()> {
+        let (i_path, _tmp) = make_seq_dataset(12, 6, 5)?;
+        let grid = SasRecParamGrid {
+            embedding_dim: vec![8, 16],
+            num_heads: vec![2],
+            num_layers: vec![1],
+            dropout: vec![0.1],
+            learning_rate: vec![1e-2],
+            num_epochs: vec![1],
+        };
+        let evaluator = SasRecFoldEvaluator {
+            max_seq_len: 8,
+            batch_size: 8,
+            patience: 1,
+            seed: 7,
+        };
+
+        let parallel = grid_search_with(&evaluator, &i_path, &grid, 2, 5, 42)?;
+        let sequential = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()?
+            .install(|| grid_search_with(&evaluator, &i_path, &grid, 2, 5, 42))?;
+
+        assert_eq!(parallel.all_trials.len(), 2);
+        assert_eq!(parallel.all_trials.len(), sequential.all_trials.len());
+        for (p, s) in parallel.all_trials.iter().zip(sequential.all_trials.iter()) {
+            assert_eq!(p.params.embedding_dim, s.params.embedding_dim);
+            assert_eq!(
+                p.fold_scores, s.fold_scores,
+                "fold scores must be bit-identical"
+            );
+        }
+        assert_eq!(parallel.best_score, sequential.best_score);
+        assert_eq!(
+            parallel.best_params.embedding_dim,
+            sequential.best_params.embedding_dim
+        );
         Ok(())
     }
 }

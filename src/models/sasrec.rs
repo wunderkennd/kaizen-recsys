@@ -334,6 +334,24 @@ pub fn train_sasrec<B: AutodiffBackend>(
     dataset: &SequenceDataset,
     device: &B::Device,
 ) -> anyhow::Result<SasRec<B::InnerBackend>> {
+    if dataset.is_empty() {
+        anyhow::bail!("train_sasrec: dataset is empty (no users with >= 2 interactions)");
+    }
+
+    // Reproducible section (#100): RNG lock + seed, so parameter init,
+    // dropout and the shuffle below replay identically for the same seed,
+    // whatever else is training (`models::burn_rng`).
+    crate::models::burn_rng::run_training::<B, _, _>(device, train_config.seed, || {
+        train_sasrec_inner::<B>(model_config, train_config, dataset, device)
+    })
+}
+
+fn train_sasrec_inner<B: AutodiffBackend>(
+    model_config: &SasRecConfig,
+    train_config: &SasRecTrainingConfig,
+    dataset: &SequenceDataset,
+    device: &B::Device,
+) -> anyhow::Result<SasRec<B::InnerBackend>> {
     use burn::data::dataloader::DataLoaderBuilder;
     use burn::optim::AdamConfig;
     use burn::train::metric::LossMetric;
@@ -341,12 +359,6 @@ pub fn train_sasrec<B: AutodiffBackend>(
     use burn::train::{
         Learner, MetricEarlyStoppingStrategy, StoppingCondition, SupervisedTraining,
     };
-
-    if dataset.is_empty() {
-        anyhow::bail!("train_sasrec: dataset is empty (no users with >= 2 interactions)");
-    }
-
-    B::seed(device, train_config.seed);
 
     let batcher = SeqBatcher;
     let loader_train = DataLoaderBuilder::new(batcher.clone())
@@ -527,7 +539,9 @@ pub fn load_sasrec<B: Backend>(
         .context("failed to load SASRec params blob")?;
 
     let config = meta.to_config();
-    let model = config.init::<B>(device).load_record(record);
+    let model = crate::models::burn_rng::load_under_rng_lock::<B, _, _>(|| {
+        config.init::<B>(device).load_record(record)
+    });
     Ok((model, config))
 }
 
@@ -711,7 +725,10 @@ impl TrainedSasRec {
         let record = recorder
             .load(weights, &device)
             .context("failed to load TrainedSasRec params blob")?;
-        let model: SasRec<SasInfB> = config.init(&device).load_record(record);
+        let model: SasRec<SasInfB> =
+            crate::models::burn_rng::load_under_rng_lock::<SasInfB, _, _>(|| {
+                config.init(&device).load_record(record)
+            });
 
         let mappings = Mappings {
             user_to_idx: meta
@@ -856,6 +873,17 @@ mod tests {
 
     type TestBackend = NdArray<f32>;
 
+    /// A freshly initialized test model whose (lazy) parameter draws all
+    /// happen under the burn RNG guard (#100), so these forward tests never
+    /// interleave with a concurrent training's stream. `num_params()`
+    /// touches every parameter and forces the initializers to run.
+    fn test_model(device: &NdArrayDevice) -> SasRec<TestBackend> {
+        let _guard = crate::models::burn_rng::seeded_training_guard::<TestBackend>(device, 0);
+        let model: SasRec<TestBackend> = test_config().init(device);
+        let _ = model.num_params();
+        model
+    }
+
     fn test_config() -> SasRecConfig {
         // vocab=10, dim=16, seq_len=8, heads=2, layers=2.
         SasRecConfig::new(10, 16, 8, 2, 2).with_dropout(0.0)
@@ -864,13 +892,13 @@ mod tests {
     #[test]
     fn construction_succeeds() {
         let device = NdArrayDevice::default();
-        let _model: SasRec<TestBackend> = test_config().init(&device);
+        let _model = test_model(&device);
     }
 
     #[test]
     fn forward_shape_is_batch_seq_vocab() {
         let device = NdArrayDevice::default();
-        let model: SasRec<TestBackend> = test_config().init(&device);
+        let model = test_model(&device);
 
         let batch = 2;
         let seq_len = 8;
@@ -883,7 +911,7 @@ mod tests {
     #[test]
     fn forward_is_deterministic() {
         let device = NdArrayDevice::default();
-        let model: SasRec<TestBackend> = test_config().init(&device);
+        let model = test_model(&device);
 
         let input = Tensor::<TestBackend, 2, Int>::from_data(
             [[1, 2, 3, 4, 5, 6, 7, 8], [8, 7, 6, 5, 4, 3, 2, 1]],
@@ -903,7 +931,7 @@ mod tests {
     #[test]
     fn forward_shorter_than_max_seq_len() {
         let device = NdArrayDevice::default();
-        let model: SasRec<TestBackend> = test_config().init(&device);
+        let model = test_model(&device);
 
         let batch = 2;
         let seq_len = 4; // < max_seq_len = 8
@@ -917,7 +945,7 @@ mod tests {
     #[should_panic(expected = "exceeds max_seq_len")]
     fn forward_panics_when_seq_len_exceeds_max() {
         let device = NdArrayDevice::default();
-        let model: SasRec<TestBackend> = test_config().init(&device);
+        let model = test_model(&device);
 
         let input = Tensor::<TestBackend, 2, Int>::zeros([2, 12], &device);
         let _ = model.forward(input);
@@ -958,55 +986,44 @@ mod tests {
         SasRecConfig::new(5, 16, 4, 2, 2).with_dropout(0.0)
     }
 
+    fn train_tiny(seed: u64, epochs: usize) -> SasRec<TestBackend> {
+        let device = NdArrayDevice::default();
+        let tcfg = SasRecTrainingConfig::new()
+            .with_num_epochs(epochs)
+            .with_batch_size(8)
+            .with_learning_rate(1e-2)
+            .with_patience(epochs)
+            .with_seed(seed);
+        train_sasrec::<TrainBackend>(&tiny_model_config(), &tcfg, &tiny_dataset(), &device)
+            .expect("training must succeed")
+    }
+
     #[test]
     fn overfits_tiny_next_item_dataset() {
-        // Robust against init noise (issues #48, #90): burn's `NdArray`
-        // backend does not deterministically reseed its parameter init
-        // from `B::seed`, so a single training run's argmax rides an init
-        // lottery. The property under test is "training *can* memorize a
-        // trivial single-pattern dataset", which is robust to one unlucky
-        // init: train independent runs (distinct configured seeds, ample
-        // epochs) and stop as soon as TWO predict the held-out next token,
-        // trying at most five seeds. With per-seed success ~0.8, the old
-        // strict majority-of-3 failed ~10% of the time (#90's CI flakes);
-        // 2-successes-within-5 fails ~0.7% and usually finishes after two
-        // trainings, so the common case is faster too.
+        // Single run, fixed seed (#100). Training is a pure function of
+        // the seed now that the burn RNG is seeded under a process-wide
+        // guard (`models::burn_rng`), so there is no init lottery to hedge
+        // against: this seed memorises the pattern, and will keep doing so
+        // until burn's initializers or our architecture change. The
+        // earlier multi-seed loop (#48, #90) hedged against concurrent
+        // tests interleaving their draws from burn's global RNG.
         let device = NdArrayDevice::default();
-        let ds = tiny_dataset();
-        let mcfg = tiny_model_config();
+        let model = train_tiny(1, 200);
 
-        let mut correct = 0;
-        for seed in [1_u64, 2, 3, 4, 5] {
-            if correct >= 2 {
-                break;
-            }
-            let tcfg = SasRecTrainingConfig::new()
-                .with_num_epochs(200)
-                .with_batch_size(8)
-                .with_learning_rate(1e-2)
-                .with_patience(200)
-                .with_seed(seed);
-
-            let model = train_sasrec::<TrainBackend>(&mcfg, &tcfg, &ds, &device)
-                .expect("training must succeed");
-
-            // Given prefix [1,2,3], the argmax next-item over real items
-            // (excluding pad slot 0) should be token 4.
-            let scores = model.score_history(&[1, 2, 3], &device);
-            assert_eq!(scores.len(), 5);
-            let (best, _) = scores
-                .iter()
-                .enumerate()
-                .skip(1) // ignore pad slot
-                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
-                .unwrap();
-            if best == 4 {
-                correct += 1;
-            }
-        }
+        // Given prefix [1,2,3], the argmax next-item over real items
+        // (excluding pad slot 0) should be token 4.
+        let scores = model.score_history(&[1, 2, 3], &device);
+        assert_eq!(scores.len(), 5);
+        let (best, _) = scores
+            .iter()
+            .enumerate()
+            .skip(1) // ignore pad slot
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .unwrap();
+        let correct = usize::from(best == 4);
 
         assert!(
-            correct >= 2,
+            correct >= 1,
             "overfit model should predict token 4 after [1,2,3] in a \
              majority of runs; only {correct} of up to 5 seeds did"
         );
@@ -1219,5 +1236,31 @@ mod tests {
         let t = trained_tiny();
         let report = t.validate();
         assert!(report.passed, "validation messages: {:?}", report.messages);
+    }
+
+    /// #100: same seed → bit-identical model, run after run.
+    #[test]
+    fn sasrec_training_is_reproducible_for_a_seed() {
+        let device = NdArrayDevice::default();
+        let a = train_tiny(7, 15).score_history(&[1, 2, 3], &device);
+        let b = train_tiny(7, 15).score_history(&[1, 2, 3], &device);
+        assert_eq!(a, b, "same seed must replay bit-for-bit");
+        let c = train_tiny(8, 15).score_history(&[1, 2, 3], &device);
+        assert_ne!(a, c, "a different seed must train a different model");
+    }
+
+    /// #100: concurrent trainings (what rayon-parallel tuning and the test
+    /// harness do) must not corrupt each other's RNG streams.
+    #[test]
+    fn sasrec_training_is_reproducible_under_concurrency() {
+        let device = NdArrayDevice::default();
+        let reference = train_tiny(3, 10).score_history(&[1, 2, 3], &device);
+        let handles: Vec<_> = (0..3)
+            .map(|_| std::thread::spawn(|| train_tiny(3, 10)))
+            .collect();
+        for h in handles {
+            let model = h.join().expect("training thread panicked");
+            assert_eq!(model.score_history(&[1, 2, 3], &device), reference);
+        }
     }
 }

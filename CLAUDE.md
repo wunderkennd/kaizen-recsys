@@ -128,6 +128,7 @@ src/data_validation.rs — GaussianAnomalyDetector for pre-training data quality
 - **`models/sasrec.rs`**: `SasRecConfig`, `SasRecTrainingConfig`, `train_sasrec()`, `TrainedSasRec` (transformer; `burn` backend). Magic-bytes-framed save/load.
 - **`models/two_tower.rs`**: `TwoTowerConfig`, `TrainParams`, `train()`, `TrainedTwoTower`. Reserved cold-start row trained via `id_dropout`. Magic-bytes-framed save/load.
 - **`models/bert4rec.rs`**: `Bert4RecConfig`, `Bert4RecTrainingConfig`, `train_bert4rec()` (hand-rolled Adam loop with best-loss early stopping), `TrainedBert4Rec` (`embed_user`, `embed_users_batch`, `embed_items`; scoring appends a `[MASK]` query token). No causal mask; pad positions are excluded via `mask_pad`. `FB4R` framed save/load, format v1.
+- **`models/burn_rng.rs`**: `run_training::<B>(device, seed, || ...)` — takes a process-wide lock, then `B::seed`, and runs the training body under it. Every burn `train_*` goes through it, so same seed → bit-identical model, single-threaded or not (#100). The other half of that guarantee is in `Cargo.toml`: burn-ndarray is built without its `simd` feature, whose alignment-dependent reductions made runs differ in the last ULP.
 - **`model.rs`**: Pure Rust `RustFeaseModel`. EASE training, prediction (including `predict_raw` over raw features via the embedded transformation schema), MLT similarity, validation, sparsity pruning.
 - **`transform.rs`**: `FeatureTransformationSchema` + `NumericalBucketConfig` — declarative raw-feature → engineered-key transformation embedded in the model for zero-drift online inference (`FeaseModel.predict_raw`, persisted in FEAS v3).
 - **`data/sequences.rs`**: Build chronologically-ordered left-padded item sequences for SASRec from a long-format interactions file with a `days_ago` column.
@@ -259,7 +260,20 @@ two_tower,bert4rec}` / `random_search_*` keep the list-only grids; the
 strategy-driven `tune_{ease,sasrec,two_tower,bert4rec}(interactions_path,
 space, strategy=..., max_trials=..., warm_start=...)` take a dict space
 with continuous / log / int ranges. A search is deterministic for a fixed
-seed regardless of thread count.
+seed regardless of thread count. For the burn-backed models that relies on
+`models/burn_rng.rs` (#100): `burn-ndarray` has one process-global RNG, so
+each `train_*` takes a process-wide guard and seeds it; concurrent
+burn-model trainings (parallel tests, Python threads) therefore run one at
+a time, each a pure function of its seed. The training body runs on a
+private rayon pool owned by `burn_rng`, so the lock holder never waits on
+workers another training can park (a `train_*` call from inside a rayon
+job is safe: it takes the lock on a helper thread). The tuning runner
+evaluates a burn evaluator's batch sequentially on the calling thread
+(`FoldEvaluator::needs_exclusive_backend`), since the trials serialize on
+the guard anyway. Per-user metric sums iterate users in sorted order so a
+fold mean is bit-stable.
+burn-ndarray is also built without its `simd` feature (see `Cargo.toml`).
+EASE is unaffected.
 
 ## Key Dependencies
 

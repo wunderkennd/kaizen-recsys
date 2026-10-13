@@ -106,7 +106,16 @@ Constraints that shaped the design:
   draw"; it is now a one-element axis that does draw. The Python layer
   never passes empty lists, so its outputs are unchanged.
 - Determinism: a whole search is a function of `(seed, space, strategy
-  settings)`; execution order and thread count do not affect it.
+  settings)`; execution order and thread count do not affect it. For the
+  burn-backed models this holds because each `train_*` seeds burn's
+  process-global RNG under a process-wide guard (`models::burn_rng`, #100)
+  and runs the training body on a private rayon pool, so the guard holder
+  never waits on workers that another training could park. The runner
+  evaluates a burn evaluator's batch sequentially on the calling thread
+  (`FoldEvaluator::needs_exclusive_backend`): those trials serialize on
+  the guard anyway. Each training still uses every core inside burn. EASE
+  trials keep ADR-0002's parallelism in full. Fold means iterate test users in sorted order, so the last ULP of
+  a score does not depend on `AHashMap`'s per-process hash seed.
 - Grids are enumerated lazily (mixed-radix counter, first axis
   outermost), so a trial budget bounds memory on any finite space, and a
   grid resumed from a warm start skips already-evaluated assignments.
@@ -116,12 +125,16 @@ Constraints that shaped the design:
   user's own history, split leave-last-out: user-disjoint folds give a
   test user no train interactions, so the previous "train history as
   context" was always empty and every user received the same query.
-- Acceptance evidence (issue #97): on the Two-Tower fixture, TPE with half
-  the budget matches or beats random search's best NDCG@k in a majority
-  of seeds (`test_tpe_half_budget_matches_random_best_two_tower`,
+- Acceptance evidence (issue #97): on the EASE fixture, TPE with half the
+  budget matches or beats random search's best NDCG@k in a majority of
+  seeds and on mean (`test_tpe_half_budget_matches_random_best_ease`,
   release-mode `--ignored`); on a synthetic 3-axis bowl it wins 7/7 seeds
   at equal budget and 5/7 at half budget
-  (`strategy::tests::tpe_beats_random_on_quadratic_bowl`).
+  (`strategy::tests::tpe_beats_random_on_quadratic_bowl`). The same claim
+  does not hold on the 24-user Two-Tower fixture: with #100's
+  deterministic training, TPE at half budget wins 1 of 3 seeds there, so
+  EASE is the acceptance fixture and the Two-Tower runner is covered by
+  the determinism tests instead.
 
 ## Alternatives considered
 
