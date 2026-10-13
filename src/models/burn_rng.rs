@@ -44,9 +44,31 @@
 //! draws, so only the `train_*` entry points go through here.
 
 use burn::tensor::backend::Backend;
+use std::cell::Cell;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 static BURN_RNG_LOCK: Mutex<()> = Mutex::new(());
+
+thread_local! {
+    /// Whether this thread currently holds [`BURN_RNG_LOCK`]. `std::sync::Mutex`
+    /// is not reentrant, and a training legitimately nests a lock-taking
+    /// step (Two-Tower's `finalize` reloads the trained record onto the
+    /// inference backend through [`load_under_rng_lock`]), so the lock is
+    /// taken once per thread and nested guards ride the outer one.
+    static HELD_BY_THIS_THREAD: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Take the lock unless this thread already holds it. `None` means the
+/// caller is nested inside an outer guard on this thread, which keeps the
+/// RNG exclusive to it either way.
+fn lock_for_this_thread() -> Option<MutexGuard<'static, ()>> {
+    if HELD_BY_THIS_THREAD.with(Cell::get) {
+        return None;
+    }
+    let guard = BURN_RNG_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    HELD_BY_THIS_THREAD.with(|held| held.set(true));
+    Some(guard)
+}
 
 /// Run `train` as a reproducible burn training: under the process-wide RNG
 /// lock, with `B` seeded to `seed`. Every burn `train_*` entry point goes
@@ -75,7 +97,9 @@ where
     M: burn::module::Module<B>,
     F: FnOnce() -> M,
 {
-    let _guard = BURN_RNG_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let _guard = BurnRngGuard {
+        _guard: lock_for_this_thread(),
+    };
     let model = build();
     let _ = model.num_params();
     model
@@ -85,9 +109,19 @@ where
 ///
 /// Hold it for the whole training run (bind it to a local that lives until
 /// the function returns). Dropping it releases the lock for the next run.
+/// A guard taken while this thread already holds one (`_guard == None`)
+/// is a no-op wrapper: the outer guard keeps the RNG exclusive.
 #[must_use = "the guard must stay alive for the whole training run"]
 pub struct BurnRngGuard {
-    _guard: MutexGuard<'static, ()>,
+    _guard: Option<MutexGuard<'static, ()>>,
+}
+
+impl Drop for BurnRngGuard {
+    fn drop(&mut self) {
+        if self._guard.is_some() {
+            HELD_BY_THIS_THREAD.with(|held| held.set(false));
+        }
+    }
 }
 
 /// Take the process-wide burn RNG lock, then seed `B` on `device`.
@@ -96,7 +130,7 @@ pub struct BurnRngGuard {
 /// rather than propagated: the RNG is re-seeded right after, so nothing the
 /// panicking run did can leak into this one.
 pub fn seeded_training_guard<B: Backend>(device: &B::Device, seed: u64) -> BurnRngGuard {
-    let guard = BURN_RNG_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let guard = lock_for_this_thread();
     B::seed(device, seed);
     BurnRngGuard { _guard: guard }
 }
@@ -146,6 +180,41 @@ mod tests {
             let expected = if seed == 11 { &ref_a } else { &ref_b };
             assert_eq!(&stream, expected, "seed {seed} diverged under concurrency");
         }
+    }
+
+    /// Two-Tower's training calls `load_under_rng_lock` from inside
+    /// `run_training` (its `finalize` step); a non-reentrant lock would
+    /// deadlock there. Run it on a helper thread so a regression fails the
+    /// test instead of hanging it.
+    #[test]
+    fn lock_is_reentrant_on_the_holding_thread() {
+        use burn::module::Module;
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let device = NdArrayDevice::default();
+            let n = run_training::<NdArray, _, _>(&device, 5, || {
+                let inner = seeded_training_guard::<NdArray>(&device, 6);
+                assert!(inner._guard.is_none(), "nested guard must not re-lock");
+                drop(inner);
+                assert!(
+                    HELD_BY_THIS_THREAD.with(Cell::get),
+                    "dropping the nested guard must leave the outer one held"
+                );
+                let model = load_under_rng_lock::<NdArray, _, _>(|| {
+                    burn::nn::LinearConfig::new(3, 2).init::<NdArray>(&device)
+                });
+                model.num_params()
+            });
+            assert!(!HELD_BY_THIS_THREAD.with(Cell::get));
+            tx.send(n).unwrap();
+        });
+        let n = rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("nested lock use must not deadlock");
+        assert_eq!(n, 3 * 2 + 2);
+        // The lock is free again for another thread.
+        let device = NdArrayDevice::default();
+        let _g = seeded_training_guard::<NdArray>(&device, 1);
     }
 
     #[test]
