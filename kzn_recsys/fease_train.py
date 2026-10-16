@@ -47,6 +47,10 @@ from kzn_recsys.spark.interactions_agg import (
     filter_activity_window,
     with_days_ago,
 )
+from kzn_recsys.spark.interaction_attrs import (
+    add_interaction_attr_user_features,
+    aggregate_viewership_attrs_daily,
+)
 
 print("Successfully imported 'kzn_recsys'")
 
@@ -84,6 +88,12 @@ SUBSIDIARY = cfg.VIEWERSHIP_SUBSIDIARY
 # Only interactions with days_ago <= this many days are used. None = all
 # history in the source. days_ago is derived at read time from view_date.
 ACTIVITY_WINDOW_DAYS = None
+# Add per-user summaries of the interaction attributes (top-platform shares,
+# dub/sub preference, completed-episode and binge-heavy shares) to the user
+# features, read from cfg.INTERACTION_ATTRS_TABLE ("agg" source) or
+# aggregated from ENGAGEMENT_TABLE ("raw"). Off by default: the training
+# inputs are then byte-identical to a run without the attrs tables.
+USE_INTERACTION_ATTR_FEATURES = False
 
 # --- Training Backend ---
 #   "rust":  pair-grain Parquet handoff + the native extension. The whole
@@ -302,6 +312,35 @@ df_user_features = (
     .unionByName(df_user_tenure)
     .withColumnRenamed(USER_ID_COL, "user_id")
     .distinct()
+)
+
+# Interaction-attribute summaries (off by default; see
+# USE_INTERACTION_ATTR_FEATURES). Built from the same windowed daily frame
+# as the interactions, so they describe the history the model trains on.
+df_attrs = None
+if USE_INTERACTION_ATTR_FEATURES:
+    if INTERACTIONS_SOURCE == "agg":
+        df_attrs = spark.table(cfg.INTERACTION_ATTRS_TABLE)
+    else:
+        df_attrs = aggregate_viewership_attrs_daily(
+            df_eng,
+            user_col=USER_ID_COL,
+            item_col=ITEM_ID_COL,
+            date_col=TIMESTAMP_COL,
+            ts_col=USER_FEATURE_TS_COL,
+            seconds_col=WATCH_SECONDS_COL,
+            media_id_col=cfg.VIEWERSHIP_MEDIA_ID_COL,
+            media_duration_col=cfg.VIEWERSHIP_MEDIA_DURATION_COL,
+            platform_col=cfg.VIEWERSHIP_PLATFORM_COL,
+            audio_col=cfg.VIEWERSHIP_AUDIO_COL,
+            min_watch_seconds=MIN_WATCH_SECONDS,
+            subsidiary_col=SUBSIDIARY_COL,
+            subsidiary=SUBSIDIARY,
+            completed_ratio=cfg.COMPLETED_RATIO,
+            duration_to_seconds=cfg.MEDIA_DURATION_TO_SECONDS,
+        )
+df_user_features = add_interaction_attr_user_features(
+    df_user_features, df_interactions_daily, df_attrs, enabled=USE_INTERACTION_ATTR_FEATURES,
 )
 
 

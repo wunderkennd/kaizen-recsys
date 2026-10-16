@@ -26,6 +26,10 @@ Everything time-related happens at read time:
 
 Sequence models (SASRec, BERT4Rec) need per-event ``days_ago`` and should
 consume the daily frame directly.
+
+Per-view and per-series attributes (watch depth, binge, platform, audio,
+discovery lag) live in sibling tables keyed the same way; see
+``kzn_recsys.spark.interaction_attrs``.
 """
 from __future__ import annotations
 

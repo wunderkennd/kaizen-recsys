@@ -1460,4 +1460,85 @@ mod tests {
             "a different seed must differ"
         );
     }
+
+    /// The interaction-attribute columns (`fease_interaction_attrs`, joined
+    /// onto the daily frame) are ignored by the BERT4Rec readers: a Parquet
+    /// file carrying them trains the same model as one without, bit for bit.
+    #[test]
+    fn extra_attribute_columns_do_not_change_training() {
+        use polars::prelude::{DataFrame, NamedFrom, ParquetWriter, Series};
+
+        let users = ["u1", "u1", "u1", "u2", "u2", "u3", "u3", "u3"];
+        let items = ["a", "b", "c", "b", "d", "a", "c", "d"];
+        let values = [1.0_f64, 2.0, 1.5, 1.0, 3.0, 2.0, 1.0, 1.0];
+        let days = [30.0_f64, 9.0, 1.0, 12.0, 2.0, 40.0, 5.0, 0.0];
+        let base = || {
+            vec![
+                Series::new("user_id".into(), users.to_vec()).into(),
+                Series::new("item_id".into(), items.to_vec()).into(),
+                Series::new("value".into(), values.to_vec()).into(),
+                Series::new("days_ago".into(), days.to_vec()).into(),
+            ]
+        };
+        let mut plain = DataFrame::new(base()).unwrap();
+        let mut cols = base();
+        cols.extend([
+            Series::new("view_date".into(), vec!["2026-10-01"; 8]).into(),
+            Series::new("num_views".into(), vec![1_i64, 2, 1, 1, 3, 1, 1, 2]).into(),
+            Series::new("episodes_watched".into(), vec![1_i64, 2, 1, 1, 3, 1, 1, 2]).into(),
+            Series::new(
+                "max_depth_ratio".into(),
+                vec![Some(0.1_f64), Some(1.0), None, Some(0.5), Some(0.95), None, Some(0.3), Some(1.0)],
+            )
+            .into(),
+            Series::new("platform_top".into(), vec!["tv", "web", "mobile", "other", "tv", "tv", "web", "tv"]).into(),
+            Series::new("dub_share".into(), vec![Some(0.0_f64), None, Some(1.0), Some(0.5), None, Some(0.0), Some(1.0), None]).into(),
+            Series::new("depth_bucket".into(), vec!["sampled", "completed", "unknown", "partial", "completed", "unknown", "partial", "completed"]).into(),
+            Series::new("discovery_lag_bucket".into(), vec![Some(4_i32), Some(2), None, Some(0), Some(1), Some(5), Some(3), None]).into(),
+        ]);
+        let mut wide = DataFrame::new(cols).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let write = |df: &mut DataFrame, name: &str| -> String {
+            let p = dir.path().join(name);
+            ParquetWriter::new(std::fs::File::create(&p).unwrap())
+                .finish(df)
+                .unwrap();
+            p.to_str().unwrap().to_string()
+        };
+        let plain_path = write(&mut plain, "plain.parquet");
+        let wide_path = write(&mut wide, "wide.parquet");
+
+        let train = |path: &str| {
+            let mappings = crate::data_pipeline::build_interaction_mappings(path).unwrap();
+            let ds = crate::data::masked_sequences::build_masked_sequences(
+                path, &mappings, 4, 0.3, 8, 11,
+            )
+            .unwrap();
+            let config = Bert4RecConfig::new(mappings.idx_to_item.len() + 2, 4, 2, 1)
+                .with_embedding_dim(8)
+                .with_num_position_buckets(8)
+                .with_dropout(0.0);
+            let tcfg = Bert4RecTrainingConfig::new()
+                .with_num_epochs(5)
+                .with_batch_size(4)
+                .with_learning_rate(1e-2)
+                .with_patience(5)
+                .with_seed(3);
+            let device = NdArrayDevice::default();
+            let model = train_bert4rec::<TrainBackend>(&config, &tcfg, &ds, &device).unwrap();
+            let trained = TrainedBert4Rec::new(model, config, mappings);
+            let embeddings = trained.embed_users_batch(path).unwrap();
+            (ds, trained.embed_items(), embeddings, trained.mappings.idx_to_item.clone())
+        };
+        let (ds_a, items_a, users_a, vocab_a) = train(&plain_path);
+        let (ds_b, items_b, users_b, vocab_b) = train(&wide_path);
+        assert_eq!(vocab_a, vocab_b);
+        assert_eq!(ds_a.original, ds_b.original);
+        assert_eq!(ds_a.inputs, ds_b.inputs);
+        assert_eq!(ds_a.mask, ds_b.mask);
+        assert_eq!(ds_a.positions, ds_b.positions);
+        assert_eq!(items_a, items_b, "item embeddings must be bit-identical");
+        assert_eq!(users_a, users_b, "user embeddings must be bit-identical");
+    }
 }

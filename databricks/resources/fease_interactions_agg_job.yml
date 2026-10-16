@@ -27,3 +27,49 @@ resources:
               table: ${var.agg_table}
               source_table: ${var.viewership_table}
               lookback_days: ${var.agg_lookback_days}
+        # Per-interaction attributes (sibling table, same key set). Runs after
+        # the agg MERGE so both tables cover the same window. Needs the
+        # kzn_recsys_spark wheel for the platform mapping in cr_config.
+        - task_key: attrs_merge
+          depends_on: [{ task_key: merge }]
+          job_cluster_key: agg_refresh
+          notebook_task:
+            notebook_path: ../src/00_refresh_interactions_agg.py
+            base_parameters:
+              target: attrs
+              mode: merge
+              catalog: ${var.agg_catalog}
+              schema: ${var.agg_schema}
+              table: ${var.agg_table}
+              attrs_table: ${var.attrs_table}
+              item_attrs_table: ${var.item_attrs_table}
+              source_table: ${var.viewership_table}
+              lookback_days: ${var.agg_lookback_days}
+              media_id_col: ${var.attrs_media_id_col}
+              media_duration_col: ${var.attrs_media_duration_col}
+              platform_col: ${var.attrs_platform_col}
+              audio_col: ${var.attrs_audio_col}
+              completed_ratio: ${var.attrs_completed_ratio}
+              catalog_table: ${var.catalog_table}
+          libraries:
+            - whl: ../../packaging/pure-python/dist/*.whl
+        # Per-series attributes: small, rebuilt in full; reads the agg table
+        # for the first-view premiere fallback.
+        - task_key: item_attrs_rebuild
+          depends_on: [{ task_key: merge }]
+          job_cluster_key: agg_refresh
+          notebook_task:
+            notebook_path: ../src/00_refresh_interactions_agg.py
+            base_parameters:
+              target: item_attrs
+              mode: merge
+              catalog: ${var.agg_catalog}
+              schema: ${var.agg_schema}
+              table: ${var.agg_table}
+              attrs_table: ${var.attrs_table}
+              item_attrs_table: ${var.item_attrs_table}
+              source_table: ${var.viewership_table}
+              platform_col: ${var.attrs_platform_col}
+              catalog_table: ${var.catalog_table}
+          libraries:
+            - whl: ../../packaging/pure-python/dist/*.whl
