@@ -215,7 +215,11 @@ def join_attrs(daily_df: DataFrame, attrs_df: DataFrame, *, validate: bool = Tru
     Daily rows without attributes keep null attribute columns (every bucket
     helper maps those to ``unknown``). With ``validate``, raises if an attrs
     key inside the daily frame's date range has no daily row: the tables are
-    built with identical filters, so such a key means the two drifted.
+    built with identical filters, so such a key means the two drifted. That
+    holds for a daily frame restricted to a contiguous date range (as
+    ``with_days_ago`` / ``filter_activity_window`` produce); pass
+    ``validate=False`` after any other filter (by user, by item, …), or
+    filter ``attrs_df`` the same way first.
     """
     attr_cols = [c for c in attrs_df.columns if c not in KEY_COLUMNS]
     clash = [c for c in attr_cols if c in daily_df.columns]

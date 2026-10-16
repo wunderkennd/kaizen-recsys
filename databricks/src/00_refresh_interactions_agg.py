@@ -176,9 +176,13 @@ with open(os.path.join(_sql_dir, _sql_file)) as fh:
 
 
 def _statements(text):
-    """Split on statement-terminating semicolons, dropping comment-only chunks."""
-    for chunk in text.split(";"):
-        body = "\n".join(l for l in chunk.splitlines() if not l.strip().startswith("--")).strip()
+    """Drop full-line ``--`` comments, then split on the semicolons that end
+    statements. Comments go first because they may contain semicolons
+    themselves. The SQL in ../sql/ has no trailing comments and no
+    semicolons inside string literals."""
+    code = "\n".join(l for l in text.splitlines() if not l.strip().startswith("--"))
+    for chunk in code.split(";"):
+        body = chunk.strip()
         if body:
             yield body
 

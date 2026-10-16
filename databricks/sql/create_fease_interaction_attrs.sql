@@ -27,7 +27,7 @@
 --   ${sub_audio_locale}   locale counted as "sub"; any other non-null is "dub"
 --   ${completed_ratio}    seconds / duration at or above this = completed
 --
--- ${source_table} / ${catalog_table} are spliced unquoted on purpose: a
+-- The source and catalog table names are spliced unquoted on purpose: a
 -- backticked `a.b.c` is one identifier, not a three-part name. The notebook
 -- restricts both to [A-Za-z0-9_.]+.
 --
@@ -40,8 +40,8 @@ CREATE TABLE IF NOT EXISTS `${catalog}`.`${schema}`.`${attrs_table}` (
     `view_date`           DATE      NOT NULL COMMENT 'Date the aggregated views fell on',
     `seconds_watched`     DOUBLE    NOT NULL COMMENT 'sum(${seconds_col}) over that day''s qualifying views (raw, not log)',
     `episodes_watched`    BIGINT    NOT NULL COMMENT 'Distinct episode ids watched that day (0 if ids unknown)',
-    `completed_episodes`  BIGINT             COMMENT 'Qualifying views with seconds / duration >= ${completed_ratio}; NULL if no duration known that day',
-    `max_depth_ratio`     DOUBLE             COMMENT 'max(least(seconds / duration, 1)); NULL if no duration known that day',
+    `completed_episodes`  BIGINT             COMMENT 'Qualifying views with seconds / duration >= ${completed_ratio}, NULL if no duration known that day',
+    `max_depth_ratio`     DOUBLE             COMMENT 'max(least(seconds / duration, 1)), NULL if no duration known that day',
     `platform_top`        STRING    NOT NULL COMMENT 'Most frequent normalized platform (tv/mobile/web/other), ties by fixed order',
     `dub_views`           BIGINT    NOT NULL COMMENT 'Qualifying views with a non-null audio locale other than ${sub_audio_locale}',
     `sub_views`           BIGINT    NOT NULL COMMENT 'Qualifying views with audio locale ${sub_audio_locale}',

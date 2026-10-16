@@ -19,7 +19,7 @@
 --   ${catalog_available_expr}  first CR availability (NULL if column blank)
 --   ${catalog_air_year_expr}   original air year (NULL if column blank)
 --
--- ${source_table} / ${catalog_table} are spliced unquoted on purpose: a
+-- The source and catalog table names are spliced unquoted on purpose: a
 -- backticked `a.b.c` is one identifier, not a three-part name. The notebook
 -- restricts both to [A-Za-z0-9_.]+.
 -- ==========================================================================

@@ -340,3 +340,34 @@ def test_flag_off_training_inputs_are_byte_identical(spark):
     }
     with pytest.raises(ValueError):
         add_interaction_attr_user_features(user_feats, daily, None, enabled=True)
+
+
+def _notebook_statements():
+    """`_statements` from the refresh notebook (which needs dbutils to run)."""
+    import ast
+
+    path = SQL_DIR.parent / "src" / "00_refresh_interactions_agg.py"
+    tree = ast.parse(path.read_text())
+    fn = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_statements")
+    ns = {}
+    exec(compile(ast.Module(body=[fn], type_ignores=[]), str(path), "exec"), ns)
+    return ns["_statements"]
+
+
+@pytest.mark.parametrize(
+    "name, expected",
+    [
+        ("create_fease_interactions_agg.sql", ["CREATE", "INSERT", "OPTIMIZE"]),
+        ("merge_fease_interactions_agg.sql", ["MERGE"]),
+        ("validate_fease_interactions_agg.sql", ["SELECT"] * 6),
+        ("create_fease_interaction_attrs.sql", ["CREATE", "INSERT", "OPTIMIZE"]),
+        ("merge_fease_interaction_attrs.sql", ["CREATE", "MERGE"]),
+        ("validate_fease_interaction_attrs.sql", ["SELECT"] * 7),
+        ("create_fease_item_attrs.sql", ["CREATE", "INSERT"]),
+    ],
+)
+def test_refresh_notebook_splits_every_sql_file_into_whole_statements(name, expected):
+    # Comments contain semicolons; splitting before stripping them used to
+    # hand Spark comment fragments as statements.
+    stmts = list(_notebook_statements()((SQL_DIR / name).read_text()))
+    assert [s.split()[0].upper() for s in stmts] == expected
