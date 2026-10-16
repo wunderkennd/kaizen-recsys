@@ -1488,13 +1488,65 @@ mod tests {
             Series::new("episodes_watched".into(), vec![1_i64, 2, 1, 1, 3, 1, 1, 2]).into(),
             Series::new(
                 "max_depth_ratio".into(),
-                vec![Some(0.1_f64), Some(1.0), None, Some(0.5), Some(0.95), None, Some(0.3), Some(1.0)],
+                vec![
+                    Some(0.1_f64),
+                    Some(1.0),
+                    None,
+                    Some(0.5),
+                    Some(0.95),
+                    None,
+                    Some(0.3),
+                    Some(1.0),
+                ],
             )
             .into(),
-            Series::new("platform_top".into(), vec!["tv", "web", "mobile", "other", "tv", "tv", "web", "tv"]).into(),
-            Series::new("dub_share".into(), vec![Some(0.0_f64), None, Some(1.0), Some(0.5), None, Some(0.0), Some(1.0), None]).into(),
-            Series::new("depth_bucket".into(), vec!["sampled", "completed", "unknown", "partial", "completed", "unknown", "partial", "completed"]).into(),
-            Series::new("discovery_lag_bucket".into(), vec![Some(4_i32), Some(2), None, Some(0), Some(1), Some(5), Some(3), None]).into(),
+            Series::new(
+                "platform_top".into(),
+                vec!["tv", "web", "mobile", "other", "tv", "tv", "web", "tv"],
+            )
+            .into(),
+            Series::new(
+                "dub_share".into(),
+                vec![
+                    Some(0.0_f64),
+                    None,
+                    Some(1.0),
+                    Some(0.5),
+                    None,
+                    Some(0.0),
+                    Some(1.0),
+                    None,
+                ],
+            )
+            .into(),
+            Series::new(
+                "depth_bucket".into(),
+                vec![
+                    "sampled",
+                    "completed",
+                    "unknown",
+                    "partial",
+                    "completed",
+                    "unknown",
+                    "partial",
+                    "completed",
+                ],
+            )
+            .into(),
+            Series::new(
+                "discovery_lag_bucket".into(),
+                vec![
+                    Some(4_i32),
+                    Some(2),
+                    None,
+                    Some(0),
+                    Some(1),
+                    Some(5),
+                    Some(3),
+                    None,
+                ],
+            )
+            .into(),
         ]);
         let mut wide = DataFrame::new(cols).unwrap();
 
@@ -1529,7 +1581,12 @@ mod tests {
             let model = train_bert4rec::<TrainBackend>(&config, &tcfg, &ds, &device).unwrap();
             let trained = TrainedBert4Rec::new(model, config, mappings);
             let embeddings = trained.embed_users_batch(path).unwrap();
-            (ds, trained.embed_items(), embeddings, trained.mappings.idx_to_item.clone())
+            (
+                ds,
+                trained.embed_items(),
+                embeddings,
+                trained.mappings.idx_to_item.clone(),
+            )
         };
         let (ds_a, items_a, users_a, vocab_a) = train(&plain_path);
         let (ds_b, items_b, users_b, vocab_b) = train(&wide_path);
