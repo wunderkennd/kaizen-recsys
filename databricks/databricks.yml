@@ -26,6 +26,17 @@ variables:
   agg_table:          { default: fease_interactions_agg }
   viewership_table:   { default: cr_prod.gold_db.ds_viewership }
   agg_lookback_days:  { default: "3" }
+  # Per-interaction / per-series attribute tables (sibling tables of agg_table).
+  # The column defaults are unverified against the live gold schema; a blank
+  # duration / audio / media-id column makes the dependent attributes NULL.
+  attrs_table:              { default: fease_interaction_attrs }
+  item_attrs_table:         { default: fease_item_attrs }
+  attrs_media_id_col:       { default: catalog_media_id }
+  attrs_media_duration_col: { default: catalog_media_duration }
+  attrs_platform_col:       { default: view_platform_name }
+  attrs_audio_col:          { default: view_audio_locale }
+  attrs_completed_ratio:    { default: "0.9" }
+  catalog_table:            { default: cr_prod.gold_db.ds_catalog }
 
 artifacts:
   spark_wheel:
