@@ -143,3 +143,55 @@ def test_pair_frame_trains_identically_to_daily_frame(spark):
     )
     assert np.allclose(from_pairs.s_matrix, from_daily.s_matrix, atol=1e-9)
     assert np.allclose(from_pairs.s_matrix, from_daily_dist.s_matrix, atol=1e-9)
+
+
+def _daily_rows(spark, rows):
+    """(user, item, days_ago, value) -> a daily frame with days_ago set."""
+    return spark.createDataFrame(
+        [(u, i, dt.date(2026, 10, 7) - dt.timedelta(days=int(d)), v, 1, float(d))
+         for u, i, d, v in rows],
+        "user_id string, item_id string, view_date date, value double, "
+        "num_views long, days_ago double",
+    )
+
+
+def test_temporal_split_daily_cuts_days_not_pairs(spark):
+    from kzn_recsys.spark.interactions_agg import temporal_split_daily
+    daily = _daily_rows(spark, [
+        ("u1", "A", 20, 1.0),   # train only
+        ("u1", "B", 15, 2.0),   # continuation: train day + test day
+        ("u1", "B", 3, 4.0),
+        ("u1", "C", 2, 1.0),    # started in the test window -> test
+        ("u1", "C", 1, 1.0),
+        ("u2", "A", 5, 1.0),    # test only (user has no train history)
+    ])
+    train, test = temporal_split_daily(daily, 7.0)
+    tr = {(r["user_id"], r["item_id"]): (r["value"], r["days_ago"]) for r in train.collect()}
+    te = {(r["user_id"], r["item_id"]): (r["value"], r["days_ago"]) for r in test.collect()}
+    # B keeps its pre-cutoff history in train and is not an (unhittable) test item.
+    assert tr == {("u1", "A"): (1.0, 20.0), ("u1", "B"): (2.0, 15.0)}
+    assert te == {("u1", "C"): (2.0, 1.0), ("u2", "A"): (1.0, 5.0)}
+    assert train.columns == test.columns == ["user_id", "item_id", "value", "days_ago"]
+
+
+def test_temporal_split_daily_decays_from_the_cutoff(spark):
+    from kzn_recsys.spark.interactions_agg import temporal_split_daily
+    daily = _daily_rows(spark, [("u1", "A", 17, 1.0), ("u1", "A", 10, 1.0), ("u1", "B", 1, 1.0)])
+    train, _ = temporal_split_daily(daily, 7.0, decay_rate=0.1)
+    (row,) = train.collect()
+    # As if trained on the cutoff day: ages 10 and 3, not 17 and 10.
+    assert row["value"] == pytest.approx(math.exp(-1.0) + math.exp(-0.3))
+    assert row["days_ago"] == 10.0
+
+
+def test_temporal_split_daily_validates_inputs(spark):
+    from kzn_recsys.spark.interactions_agg import temporal_split_daily
+    daily = _daily_rows(spark, [("u1", "A", 3, 1.0)])
+    with pytest.raises(ValueError, match="days_ago_cutoff"):
+        temporal_split_daily(daily, -1.0)
+    with pytest.raises(ValueError, match="with_days_ago"):
+        temporal_split_daily(daily.drop("days_ago"), 7.0)
+    with pytest.raises(ValueError, match="nulls"):
+        temporal_split_daily(
+            daily.withColumn("days_ago", __import__("pyspark.sql.functions", fromlist=["x"])
+                             .lit(None).cast("double")), 7.0)

@@ -58,6 +58,31 @@ VIEWERSHIP_SUBSIDIARY_COL = "view_subsidiary"
 VIEWERSHIP_SUBSIDIARY = "crunchyroll"
 # A view shorter than this does not count as an interaction.
 MIN_WATCH_SECONDS = 30.0
+
+# --- FEASE side features (kzn_recsys.spark.cr_features) --------------------
+# User features: each profile's most recent viewership row, one-hot encoded
+# as `<column>_<value>`, plus a bucketed account tenure.
+CR_USER_CATEGORICAL_FEATURES = (
+    "view_subscription_plan",
+    "account_country_code_account",
+    "region_major_account",
+    "subscription_status",
+)
+CR_USER_TENURE_COL = "account_tenure_days"
+# Item features from the media-grain content metadata, keyed by
+# METADATA_SERIES_COL. `media_series_title` is deliberately absent: at
+# series grain it is one feature per item (an identity column).
+CR_ITEM_CATEGORICAL_FEATURES = (
+    "media_type",
+    "media_audio_language",
+    "airtable_primary_genre",
+    "airtable_ca_brand_grade",
+)
+# Comma-separated multi-value columns -> (column, feature-name prefix).
+CR_ITEM_MULTI_VALUE_FEATURES = (
+    ("media_genres", "genre_"),
+    ("media_tags", "tag_"),
+)
 # Days the daily MERGE recomputes; must cover the gold table's late-arrival window.
 INTERACTIONS_AGG_LOOKBACK_DAYS = 3
 
