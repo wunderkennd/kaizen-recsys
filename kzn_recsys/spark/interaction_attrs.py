@@ -452,3 +452,34 @@ def add_interaction_attr_user_features(
         raise ValueError("enabled=True needs attrs_df")
     extra = attrs_to_user_features(join_attrs(daily_df, attrs_df))
     return user_features_df.unionByName(extra.select(*user_features_df.columns))
+
+
+def fold_interaction_attr_user_features(
+    base_user_features_df: DataFrame,
+    daily_df: DataFrame,
+    attrs_df: DataFrame,
+    *,
+    days_ago_cutoff: Optional[float] = None,
+    train_pairs_df: Optional[DataFrame] = None,
+) -> DataFrame:
+    """``add_interaction_attr_user_features`` for an evaluation train fold.
+
+    The summaries are built from the fold's own days only, so held-out views
+    never shape the features the model trains and scores with. Give exactly
+    one of ``days_ago_cutoff`` (temporal fold: the days older than the
+    cutoff) or ``train_pairs_df`` (any other split: every day of the fold's
+    ``(user_id, item_id)`` pairs; ``attrs_df`` is restricted to the same
+    pairs so ``join_attrs``' drift check still holds).
+    """
+    if (days_ago_cutoff is None) == (train_pairs_df is None):
+        raise ValueError("give exactly one of days_ago_cutoff or train_pairs_df")
+    if days_ago_cutoff is not None:
+        fold_daily = daily_df.where(F.col("days_ago") > F.lit(float(days_ago_cutoff)))
+        fold_attrs = attrs_df
+    else:
+        keys = train_pairs_df.select("user_id", "item_id").distinct()
+        fold_daily = daily_df.join(keys, on=["user_id", "item_id"], how="left_semi")
+        fold_attrs = attrs_df.join(keys, on=["user_id", "item_id"], how="left_semi")
+    return add_interaction_attr_user_features(
+        base_user_features_df, fold_daily, fold_attrs, enabled=True,
+    )
