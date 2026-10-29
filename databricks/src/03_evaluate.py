@@ -11,6 +11,10 @@
 # MAGIC every day before the cutoff, test the series each user started after
 # MAGIC it (see `kzn_recsys.spark.temporal_split_daily`).
 # MAGIC
+# MAGIC With interaction-attribute user features (ingest `use_attr_features`),
+# MAGIC the summaries are rebuilt from the train fold's days only, on top of
+# MAGIC `kzn_user_base_features`, so held-out views never shape the features.
+# MAGIC
 # MAGIC With `do_tune=true` the hyperparameters are grid-searched here, on the
 # MAGIC train fold only, so the test window never informs them. Otherwise the
 # MAGIC train task's `best_lambda` is used.
@@ -48,6 +52,9 @@ dbutils.widgets.text("tune_k_folds", "3")
 dbutils.widgets.text("tune_max_users", "0")
 dbutils.widgets.text("max_eval_users", "0")
 dbutils.widgets.text("baseline", "true")
+# Standalone runs only (in the job the ingest task passes it): the attrs table
+# the ingest task built the interaction-attribute user features from.
+dbutils.widgets.text("attrs_table", "")
 # Used only when there is no train-task run to log into.
 dbutils.widgets.text("mlflow_experiment", "/Shared/kzn_recsys_spark")
 
@@ -84,6 +91,7 @@ daily = spark.table(daily_fq) if spark.catalog.tableExists(daily_fq) else None
 best_lambda = float(_tv("train", "best_lambda", 150.0))
 run_id = _tv("train", "mlflow_run_id", None)
 as_of = _tv("ingest", "as_of", "")
+attrs_table = _tv("ingest", "attrs_table", dbutils.widgets.get("attrs_table").strip())
 
 # COMMAND ----------
 import json
@@ -95,6 +103,7 @@ from kzn_recsys.spark import (
     PopularityBaseline, build_and_train, grid_search, leave_last_k_out_split,
     random_split, temporal_split, temporal_split_daily,
 )
+from kzn_recsys.spark.interaction_attrs import fold_interaction_attr_user_features
 
 # Time-aware splits need days_ago; fall back to random if absent.
 if "days_ago" not in interactions.columns and split != "random":
@@ -123,6 +132,16 @@ elif split == "random":
 else:
     raise ValueError(f"unknown split {split!r}; expected temporal | leave_last_k | random")
 train_df, test_df = train_df.cache(), test_df.cache()
+
+if attrs_table:
+    if daily is None:
+        raise ValueError("interaction-attribute features need the daily grain (ingest data_mode=agg)")
+    fold = ({"days_ago_cutoff": days_ago_cutoff} if split == "temporal"
+            else {"train_pairs_df": train_df})
+    users = fold_interaction_attr_user_features(
+        spark.table(f"{catalog}.{schema}.kzn_user_base_features"), daily,
+        spark.table(attrs_table), **fold,
+    ).cache()
 
 if availability_table:
     eval_kwargs["availability_df"] = spark.table(availability_table)
@@ -223,6 +242,7 @@ eval_params = {
     "eval_decay_rate": decay_rate,
     "eval_as_of": as_of or None,
     "eval_strategy": strategy,
+    "eval_attr_features": bool(attrs_table),
     "eval_do_tune": do_tune,
     "eval_max_eval_users": max_eval_users,
     "eval_availability_table": availability_table,

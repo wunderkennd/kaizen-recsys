@@ -92,10 +92,15 @@ never touches the demo job's tables or predictions.
 | `availability_table` / `user_territory_feature` | `""` | availability-aware ranking (shared with the demo job) |
 | `ndcg_gate` / `k` | `0.0` / `10` | quality gate and cutoff (shared) |
 
-User features describe each user's latest state, including rows after the
-cutoff, and new series reach the catalog through their metadata before their
-first train interaction; pass an `availability_table` to keep not-yet-released
-series out of the ranking.
+User state features (plan, country, tenure, …) are each user's latest
+viewership row on or before `as_of`, so a pinned backtest gives the same
+features when rerun later. They can still postdate the evaluation cutoff,
+which is inside the `as_of` window. Interaction-attribute summaries
+(`use_attr_features`) do not: the evaluate task rebuilds them from the train
+fold's days only, on top of the state features in `kzn_user_base_features`.
+New series reach the catalog through their metadata before their first train
+interaction; pass an `availability_table` to keep not-yet-released series out
+of the ranking.
 
 ## Series-grain interactions table (issue #102)
 

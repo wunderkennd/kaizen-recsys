@@ -69,16 +69,22 @@ def cr_user_features(
     tenure_col: str | None = cfg.CR_USER_TENURE_COL,
     subsidiary_col: str | None = cfg.VIEWERSHIP_SUBSIDIARY_COL,
     subsidiary: str | None = cfg.VIEWERSHIP_SUBSIDIARY,
+    as_of=None,
 ) -> DataFrame:
     """User features from each user's most recent engagement row.
 
     Only users present in ``interactions_daily_df`` are kept, so the user
     mapping matches the interactions. The latest row is picked with
     ``row_number()`` over ``ts_col`` descending, ties broken by the feature
-    values themselves, so the pick is a pure function of the data.
+    values themselves, so the pick is a pure function of the data. With
+    ``as_of`` (a date, as for ``with_days_ago``) only rows dated on or
+    before it count, so a backtest sees each user's state on that day and
+    rerunning it later gives the same features.
     """
     feature_cols = [*categorical_cols, *([tenure_col] if tenure_col else [])]
     df = engagement_df
+    if as_of is not None:
+        df = df.where(F.to_date(F.col(ts_col)) <= F.to_date(F.lit(str(as_of))))
     if subsidiary_col is not None and subsidiary is not None:
         df = df.where(F.col(subsidiary_col) == F.lit(subsidiary))
     base = (

@@ -7,8 +7,10 @@
 # MAGIC item features `kzn_recsys/fease_train.py` trains on.
 # MAGIC
 # MAGIC `agg` also writes the daily grain to `kzn_interactions_daily`, which the
-# MAGIC evaluate task splits on for a temporal hold-out. The other modes drop
-# MAGIC that table so a stale one never shadows their interactions.
+# MAGIC evaluate task splits on for a temporal hold-out, and the state-only user
+# MAGIC features (no interaction-attribute summaries) to `kzn_user_base_features`,
+# MAGIC from which the evaluate task rebuilds those summaries per train fold. The
+# MAGIC other modes drop both tables so stale ones never shadow their inputs.
 
 # COMMAND ----------
 dbutils.widgets.text("catalog", "main")
@@ -46,6 +48,7 @@ for name, value in (("catalog", catalog), ("schema", schema)):
 spark.sql(f"CREATE CATALOG IF NOT EXISTS `{catalog}`")
 spark.sql(f"CREATE SCHEMA IF NOT EXISTS `{catalog}`.`{schema}`")
 daily_fq = f"{catalog}.{schema}.kzn_interactions_daily"
+base_users_fq = f"{catalog}.{schema}.kzn_user_base_features"
 
 if data_mode == "synthetic":
     n_users = int(dbutils.widgets.get("n_users"))
@@ -84,10 +87,17 @@ elif data_mode == "agg":
     # Decay is applied here, per day; the train / evaluate tasks get the pair
     # frame and must not decay it again.
     interactions = daily_to_pairs(daily, decay_rate=decay_rate)
-    users = cr_user_features(spark.table(dbutils.widgets.get("viewership_table")), daily)
+    # User state as of `as_of`: later viewership rows must not leak into a
+    # backtest (and would make reruns drift).
+    base_users = cr_user_features(
+        spark.table(dbutils.widgets.get("viewership_table")), daily, as_of=as_of)
+    base_users.write.mode("overwrite").option("overwriteSchema", "true").saveAsTable(base_users_fq)
+    base_users = spark.table(base_users_fq)
+    attrs_table = dbutils.widgets.get("attrs_table").strip() if use_attrs else ""
+    # Summaries over the whole window, for the full-data model; the evaluate
+    # task rebuilds them from its train fold only.
     users = add_interaction_attr_user_features(
-        users, daily, spark.table(dbutils.widgets.get("attrs_table")) if use_attrs else None,
-        enabled=use_attrs,
+        base_users, daily, spark.table(attrs_table) if use_attrs else None, enabled=use_attrs,
     )
     if metadata_table:
         items = cr_item_features(spark.table(metadata_table))
@@ -95,6 +105,7 @@ elif data_mode == "agg":
         print("metadata_table is empty: training without item features")
         items = spark.createDataFrame([], "item_id string, feature_name string, value double")
     dbutils.jobs.taskValues.set("as_of", as_of)
+    dbutils.jobs.taskValues.set("attrs_table", attrs_table)
 else:
     engagement = spark.table(dbutils.widgets.get("raw_engagement_table"))
     metadata = spark.table(dbutils.widgets.get("raw_metadata_table"))
@@ -115,6 +126,7 @@ else:
 
 if data_mode != "agg":
     spark.sql(f"DROP TABLE IF EXISTS {daily_fq}")
+    spark.sql(f"DROP TABLE IF EXISTS {base_users_fq}")
 
 # COMMAND ----------
 tables = {

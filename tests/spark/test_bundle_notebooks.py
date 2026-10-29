@@ -101,9 +101,19 @@ def source_tables(spark, tmp_path):
                 agg.append((uid, item, AS_OF - dt.timedelta(days=d), rng.uniform(1, 8), 1))
         views.append((uid, dt.datetime(2026, 10, 1), "crunchyroll", f"plan{persona}",
                       "US", "NA", "Paying", 100))
+    # A state change after as_of: a backtest pinned to AS_OF must not see it.
+    views.append(("p000", dt.datetime(2026, 10, 20), "crunchyroll", "planLATE",
+                  "US", "NA", "Paying", 100))
     spark.createDataFrame(
         agg, "user_id string, item_id string, view_date date, value double, num_views long",
     ).write.saveAsTable(f"{DB}.agg")
+    spark.createDataFrame(
+        [(u, i, d, 600.0, 2, 1, 0.8, "tv", int(v > 4), int(v <= 4), None)
+         for u, i, d, v, _ in agg],
+        "user_id string, item_id string, view_date date, seconds_watched double, "
+        "episodes_watched long, completed_episodes long, max_depth_ratio double, "
+        "platform_top string, dub_views long, sub_views long, first_view_ts timestamp",
+    ).write.saveAsTable(f"{DB}.attrs")
     spark.createDataFrame(views, (
         "view_profile_id string, view_ts timestamp, view_subsidiary string, "
         "view_subscription_plan string, account_country_code_account string, "
@@ -128,8 +138,15 @@ def test_eval_job_runs_end_to_end_on_the_agg_table(spark, source_tables, mlflow_
         "agg_table": f"{DB}.agg", "viewership_table": f"{DB}.viewership",
         "metadata_table": f"{DB}.metadata", "as_of": AS_OF.isoformat(),
         "activity_window_days": "90",
+        "use_attr_features": "true", "attrs_table": f"{DB}.attrs",
     }, task_values)
     assert task_values[("ingest", "as_of")] == AS_OF.isoformat()
+    assert task_values[("ingest", "attrs_table")] == f"{DB}.attrs"
+    base = {r["feature_name"] for r in spark.table(f"{DB}.kzn_user_base_features").collect()}
+    assert "view_subscription_plan_plan0" in base and "view_subscription_plan_planLATE" not in base
+    assert not any(f.startswith("dub_pref_") for f in base)
+    assert any(r["feature_name"].startswith("dub_pref_")
+               for r in spark.table(f"{DB}.kzn_user_features").collect())
     assert spark.catalog.tableExists(f"spark_catalog.{DB}.kzn_interactions_daily")
     assert spark.table(f"{DB}.kzn_item_features").count() > 0
 
@@ -141,6 +158,7 @@ def test_eval_job_runs_end_to_end_on_the_agg_table(spark, source_tables, mlflow_
     }, task_values)
 
     assert out["eval_daily_grain"] is True and out["eval_as_of"] == AS_OF.isoformat()
+    assert out["eval_attr_features"] is True
     assert out["eval_lambda_"] in (1.0, 10.0)
     assert 0 < out["num_eval_users"] <= 30
     assert 0.0 <= out["test_ndcg@5"] <= 1.0 and "baseline_ndcg@5" in out
@@ -170,6 +188,8 @@ def test_eval_job_runs_end_to_end_on_the_agg_table(spark, source_tables, mlflow_
     _run(spark, "01_ingest_and_features.py", "ingest",
          {**common, "data_mode": "synthetic", "n_users": "40", "n_items": "20"}, {})
     assert not spark.catalog.tableExists(f"spark_catalog.{DB}.kzn_interactions_daily")
+    assert not spark.catalog.tableExists(f"spark_catalog.{DB}.kzn_user_base_features")
     out = _run(spark, "03_evaluate.py", "evaluate", {**common, "k": "5"}, {})
     assert out["eval_split"] == "random" and out["eval_lambda_"] == 150.0
+    assert out["eval_attr_features"] is False
     assert out["num_eval_users"] > 0

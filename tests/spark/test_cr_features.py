@@ -82,3 +82,12 @@ def test_cr_item_features_series_keyed_and_exploded(spark):
         ("S2", "genre_drama"), ("S2", "genre_"),   # trailing comma, as fease_train.py did
         ("S2", "tag_tearjerker"), ("S2", "tag_school"),
     }
+
+
+def test_cr_user_features_as_of_ignores_later_state(spark):
+    # p1's 2026-10-05 row (plan Mega) postdates as_of: the 2026-10-01 state wins.
+    feats = cr_user_features(_engagement(spark), _daily(spark), as_of="2026-10-03")
+    got = {(r["user_id"], r["feature_name"]) for r in feats.collect() if r["user_id"] == "p1"}
+    assert ("p1", "view_subscription_plan_Fan") in got
+    assert ("p1", "tenure_7d") in got
+    assert not any("Mega" in f or f == "tenure_90d+" for _, f in got)
