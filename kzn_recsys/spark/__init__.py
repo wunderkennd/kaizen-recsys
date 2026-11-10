@@ -19,8 +19,11 @@ from kzn_recsys.spark.interactions_agg import (
     with_days_ago,
     filter_activity_window,
     daily_to_pairs,
+    temporal_split_daily,
     active_users,
 )
+from kzn_recsys.spark.baselines import PopularityBaseline
+from kzn_recsys.spark.cr_features import cr_user_features, cr_item_features
 from kzn_recsys.spark.metrics import (
     precision_at_k,
     recall_at_k,
@@ -48,7 +51,11 @@ __all__ = [
     "with_days_ago",
     "filter_activity_window",
     "daily_to_pairs",
+    "temporal_split_daily",
     "active_users",
+    "PopularityBaseline",
+    "cr_user_features",
+    "cr_item_features",
     "precision_at_k",
     "recall_at_k",
     "ndcg_at_k",

@@ -371,3 +371,53 @@ def test_refresh_notebook_splits_every_sql_file_into_whole_statements(name, expe
     # hand Spark comment fragments as statements.
     stmts = list(_notebook_statements()((SQL_DIR / name).read_text()))
     assert [s.split()[0].upper() for s in stmts] == expected
+
+
+def _fold_frames(spark):
+    """u1 watches A sub-only before the cutoff and B dubbed only after it."""
+    from kzn_recsys.spark.interactions_agg import with_days_ago
+    as_of = dt.date(2026, 10, 7)
+    days = [("u1", "A", 20), ("u1", "A", 15), ("u1", "B", 3), ("u1", "B", 2)]
+    daily = with_days_ago(spark.createDataFrame(
+        [(u, i, as_of - dt.timedelta(days=d), 1.0, 1) for u, i, d in days],
+        "user_id string, item_id string, view_date date, value double, num_views long",
+    ), as_of=as_of)
+    attrs = spark.createDataFrame(
+        [(u, i, as_of - dt.timedelta(days=d), 600.0, 1, 1, 1.0, "tv",
+          1 if i == "B" else 0, 0 if i == "B" else 1, None) for u, i, d in days],
+        "user_id string, item_id string, view_date date, seconds_watched double, "
+        "episodes_watched long, completed_episodes long, max_depth_ratio double, "
+        "platform_top string, dub_views long, sub_views long, first_view_ts timestamp",
+    )
+    base = spark.createDataFrame([("u1", "plan_Fan", 1.0)],
+                                 "user_id string, feature_name string, value double")
+    return base, daily, attrs
+
+
+@pytest.mark.parametrize("fold", ["temporal", "pairs"])
+def test_fold_attr_features_never_see_held_out_views(spark, fold):
+    from kzn_recsys.spark.interaction_attrs import fold_interaction_attr_user_features
+    base, daily, attrs = _fold_frames(spark)
+    if fold == "temporal":
+        kw = {"days_ago_cutoff": 7.0}
+    else:  # e.g. leave-last-1-out: B held out, A is the train pair
+        kw = {"train_pairs_df": spark.createDataFrame(
+            [("u1", "A", 1.0, 15.0)], "user_id string, item_id string, value double, days_ago double")}
+    got = {r["feature_name"]: r["value"]
+           for r in fold_interaction_attr_user_features(base, daily, attrs, **kw).collect()}
+    assert got["plan_Fan"] == 1.0
+    # Only A's (sub) views count: B's dubbed, held-out views do not.
+    assert "dub_pref_sub" in got and "dub_pref_dub" not in got and "dub_pref_mixed" not in got
+    # The full window would have said "mixed" (2 dub vs 2 sub views).
+    full = add_interaction_attr_user_features(base, daily, attrs, enabled=True)
+    assert "dub_pref_mixed" in {r["feature_name"] for r in full.collect()}
+
+
+def test_fold_attr_features_needs_exactly_one_fold(spark):
+    from kzn_recsys.spark.interaction_attrs import fold_interaction_attr_user_features
+    base, daily, attrs = _fold_frames(spark)
+    with pytest.raises(ValueError, match="exactly one"):
+        fold_interaction_attr_user_features(base, daily, attrs)
+    with pytest.raises(ValueError, match="exactly one"):
+        fold_interaction_attr_user_features(base, daily, attrs, days_ago_cutoff=7.0,
+                                            train_pairs_df=daily)

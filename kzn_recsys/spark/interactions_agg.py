@@ -131,6 +131,45 @@ def daily_to_pairs(daily_df: DataFrame, *, decay_rate: float = 0.0) -> DataFrame
     )
 
 
+def temporal_split_daily(daily_df: DataFrame, days_ago_cutoff: float, *,
+                         decay_rate: float = 0.0):
+    """Temporal hold-out on the daily grain, each side collapsed to pairs.
+
+    Splitting the pair frame instead would move a series the user watched
+    both before and after the cutoff wholly into test, deleting its earlier
+    history from train. Here the cutoff cuts days, not pairs:
+
+    - train: days with ``days_ago > days_ago_cutoff``, collapsed by
+      ``daily_to_pairs`` with decay measured from the cutoff (as if trained
+      on that day); ``days_ago`` keeps the original reference.
+    - test: pairs with a day at or after the cutoff and none before it,
+      i.e. series the user started in the test window. Continuations are
+      dropped because evaluation excludes a user's train items from the
+      ranking, so they could never be hit.
+
+    Returns ``(train_df, test_df)`` in the ``daily_to_pairs`` schema.
+    """
+    if not days_ago_cutoff >= 0.0:
+        raise ValueError(f"days_ago_cutoff must be >= 0, got {days_ago_cutoff}")
+    if "days_ago" not in daily_df.columns:
+        raise ValueError("temporal_split_daily needs a days_ago column; call with_days_ago first")
+    if daily_df.where(F.col("days_ago").isNull()).limit(1).count() > 0:
+        raise ValueError("days_ago contains nulls; temporal_split_daily requires non-null days_ago")
+    cutoff = F.lit(float(days_ago_cutoff))
+    train_df = (
+        daily_to_pairs(
+            daily_df.where(F.col("days_ago") > cutoff)
+            .withColumn("days_ago", F.col("days_ago") - cutoff),
+            decay_rate=decay_rate,
+        )
+        .withColumn("days_ago", F.col("days_ago") + cutoff)
+    )
+    test_df = daily_to_pairs(daily_df.where(F.col("days_ago") <= cutoff)).join(
+        train_df.select("user_id", "item_id"), on=["user_id", "item_id"], how="left_anti",
+    ).select(*PAIR_COLUMNS)
+    return train_df, test_df
+
+
 def active_users(daily_df: DataFrame) -> DataFrame:
     """Distinct ``user_id`` column, for restricting user-feature builds to
     users that actually have interactions."""

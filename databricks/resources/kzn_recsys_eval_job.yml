@@ -1,0 +1,69 @@
+resources:
+  jobs:
+    # End-to-end offline evaluation on the production data path:
+    # fease_interactions_agg (#102) + CR user / item features -> temporal
+    # hold-out -> grid search on the train fold -> EASE vs. most-popular
+    # metrics in MLflow. Writes to its own schema (`eval_schema`), so it never
+    # overwrites the demo job's tables, and has no predict task. Refresh the
+    # agg table first (fease_interactions_agg_refresh) if it is stale.
+    kzn_recsys_eval_job:
+      name: kzn_recsys_eval_job
+      job_clusters:
+        - job_cluster_key: eval
+          new_cluster:
+            spark_version: 14.3.x-scala2.12
+            node_type_id: Standard_DS3_v2
+            # The evaluate task collects the scored users' train / test rows
+            # and the tuning sample to the driver; size it with
+            # max_eval_users / tune_max_users.
+            driver_node_type_id: Standard_DS4_v2
+            num_workers: 2
+            data_security_mode: SINGLE_USER
+      tasks:
+        - task_key: ingest
+          job_cluster_key: eval
+          notebook_task:
+            notebook_path: ../src/01_ingest_and_features.py
+            base_parameters:
+              catalog: ${var.catalog}
+              schema: ${var.eval_schema}
+              data_mode: ${var.eval_data_mode}
+              seed: ${var.seed}
+              n_users: ${var.n_users}
+              n_items: ${var.n_items}
+              agg_table: ${var.agg_catalog}.${var.agg_schema}.${var.agg_table}
+              viewership_table: ${var.viewership_table}
+              metadata_table: ${var.metadata_table}
+              activity_window_days: ${var.activity_window_days}
+              as_of: ${var.as_of}
+              decay_rate: ${var.decay_rate}
+              use_attr_features: ${var.use_attr_features}
+              attrs_table: ${var.agg_catalog}.${var.agg_schema}.${var.attrs_table}
+          libraries:
+            - whl: ../../packaging/pure-python/dist/*.whl
+        - task_key: evaluate
+          depends_on: [{ task_key: ingest }]
+          job_cluster_key: eval
+          notebook_task:
+            notebook_path: ../src/03_evaluate.py
+            base_parameters:
+              catalog: ${var.catalog}
+              schema: ${var.eval_schema}
+              k: ${var.k}
+              ndcg_gate: ${var.ndcg_gate}
+              seed: ${var.seed}
+              split: ${var.split}
+              days_ago_cutoff: ${var.days_ago_cutoff}
+              holdout_k: ${var.holdout_k}
+              availability_table: ${var.availability_table}
+              user_territory_feature: ${var.user_territory_feature}
+              strategy: ${var.eval_strategy}
+              decay_rate: ${var.decay_rate}
+              do_tune: ${var.eval_do_tune}
+              param_grid: ${var.param_grid}
+              tune_k_folds: ${var.tune_k_folds}
+              tune_max_users: ${var.tune_max_users}
+              max_eval_users: ${var.max_eval_users}
+              mlflow_experiment: ${var.eval_mlflow_experiment}
+          libraries:
+            - whl: ../../packaging/pure-python/dist/*.whl

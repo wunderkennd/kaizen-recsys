@@ -37,6 +37,24 @@ variables:
   attrs_audio_col:          { default: view_audio_locale }
   attrs_completed_ratio:    { default: "0.9" }
   catalog_table:            { default: cr_prod.gold_db.ds_catalog }
+  # End-to-end evaluation job (kzn_recsys_eval_job.yml). Shares catalog, k,
+  # ndcg_gate, seed, split, days_ago_cutoff, holdout_k, availability_table,
+  # user_territory_feature and the agg_* / attrs_table / viewership_table
+  # names with the jobs above.
+  eval_schema:            { default: kzn_recsys_eval }
+  eval_data_mode:         { default: agg }      # agg | synthetic (smoke test)
+  metadata_table:         { default: "" }       # media-grain content metadata; empty = no item features
+  activity_window_days:   { default: "" }       # empty = all history
+  as_of:                  { default: "" }       # ISO date; pin it for a reproducible backtest; empty = today
+  decay_rate:             { default: "0.0" }
+  use_attr_features:      { default: "false" }
+  eval_strategy:          { default: distributed }  # collect | distributed
+  eval_do_tune:           { default: "true" }
+  param_grid:             { default: '{"lambda_": [50.0, 100.0, 150.0, 300.0]}' }
+  tune_k_folds:           { default: "3" }
+  tune_max_users:         { default: "20000" }  # 0 = all
+  max_eval_users:         { default: "50000" }  # 0 = all
+  eval_mlflow_experiment: { default: /Shared/kzn_recsys_eval }
 
 artifacts:
   spark_wheel:

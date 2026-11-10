@@ -51,6 +51,7 @@ from kzn_recsys.spark.interaction_attrs import (
     add_interaction_attr_user_features,
     aggregate_viewership_attrs_daily,
 )
+from kzn_recsys.spark.cr_features import cr_item_features, cr_user_features
 
 print("Successfully imported 'kzn_recsys'")
 
@@ -220,98 +221,25 @@ df_interactions = daily_to_pairs(df_interactions_daily, decay_rate=DECAY_RATE)
 # schema: ["user_id", "feature_name", "value"]
 print("Building User Features table...")
 
-# Helper function to create a "long" feature table from a "wide" table
-def to_long_format(df: DataFrame, id_col: str, feature_cols: list) -> DataFrame:
-    """Melts a DataFrame from wide to long format for features."""
-    melted_dfs = []
-    for col_name in feature_cols:
-        melted_df = (
-            df
-            .select(
-                F.col(id_col),
-                F.concat(F.lit(f"{col_name}_"), F.col(col_name)).alias("feature_name")
-            )
-            .filter(F.col(col_name).isNotNull())
-            .withColumn("value", F.lit(1.0))
-        )
-        melted_dfs.append(melted_df)
-
-    # Union all feature DataFrames
-    if not melted_dfs:
-        return spark.createDataFrame([], schema="user_id string, feature_name string, value double")
-
-    final_df = melted_dfs[0]
-    for i in range(1, len(melted_dfs)):
-        final_df = final_df.unionByName(melted_dfs[i])
-
-    return final_df.distinct()
-
 # ---
 # Experiment here! Add or remove columns from this list.
 # ---
-categorical_user_features = [
-    "view_subscription_plan",
-    "account_country_code_account",
-    "region_major_account",
-    "subscription_status"
-]
+categorical_user_features = list(cfg.CR_USER_CATEGORICAL_FEATURES)
 
-# Each user's most recent engagement row gives their "current" state. Only
-# users present in the interactions frame are kept, so the full engagement
-# table is scanned once for features and the user mapping matches the
-# interactions exactly. row_number() over an explicit window is
-# deterministic; orderBy + dropDuplicates is not. Rows with the same
-# timestamp are ordered by the feature values themselves, so the pick is
-# a pure function of the data.
-_user_feature_cols = [*categorical_user_features, "account_tenure_days"]
-df_user_base = (
-    df_eng
-    .filter(F.col(SUBSIDIARY_COL) == F.lit(SUBSIDIARY))
-    .filter(F.nullif(F.trim(F.col(USER_ID_COL)), F.lit("")).isNotNull())
-    .join(
-        active_users(df_interactions_daily).withColumnRenamed("user_id", "_active_uid"),
-        F.col(USER_ID_COL) == F.col("_active_uid"),
-        "inner",
-    )
-    .drop("_active_uid")
-    .select(USER_ID_COL, USER_FEATURE_TS_COL, *_user_feature_cols)
-    .withColumn(
-        "_rn",
-        F.row_number().over(
-            Window.partitionBy(USER_ID_COL).orderBy(
-                F.col(USER_FEATURE_TS_COL).desc_nulls_last(),
-                *[F.col(c).desc_nulls_last() for c in _user_feature_cols],
-            )
-        ),
-    )
-    .filter(F.col("_rn") == 1)
-    .drop("_rn")
-)
-
-df_user_categorical = to_long_format(df_user_base, USER_ID_COL, categorical_user_features)
-
-# Example of a numerical feature (bucketizing tenure)
-df_user_tenure = (
-    df_user_base
-    .select(USER_ID_COL, "account_tenure_days")
-    .withColumn("feature_name",
-                F.when(F.col("account_tenure_days").isNull(), F.lit("tenure_unknown"))
-                .when(F.col("account_tenure_days") <= 0, F.lit("tenure_0d"))
-                .when(F.col("account_tenure_days") <= 7, F.lit("tenure_7d"))
-                .when(F.col("account_tenure_days") <= 30, F.lit("tenure_30d"))
-                .when(F.col("account_tenure_days") <= 90, F.lit("tenure_90d"))
-                .otherwise(F.lit("tenure_90d+"))
-                )
-    .withColumn("value", F.lit(1.0))
-    .select(USER_ID_COL, "feature_name", "value")
-)
-
-# Combine all user feature tables
-df_user_features = (
-    df_user_categorical
-    .unionByName(df_user_tenure)
-    .withColumnRenamed(USER_ID_COL, "user_id")
-    .distinct()
+# Each user's most recent engagement row gives their "current" state, one-hot
+# encoded as `<column>_<value>`, plus bucketed account tenure. Only users
+# present in the interactions frame are kept, so the full engagement table is
+# scanned once and the user mapping matches the interactions exactly. The
+# same helper builds the features for the bundle's evaluation job.
+df_user_features = cr_user_features(
+    df_eng,
+    df_interactions_daily,
+    user_col=USER_ID_COL,
+    ts_col=USER_FEATURE_TS_COL,
+    categorical_cols=categorical_user_features,
+    tenure_col=cfg.CR_USER_TENURE_COL,
+    subsidiary_col=SUBSIDIARY_COL,
+    subsidiary=SUBSIDIARY,
 )
 
 # Interaction-attribute summaries (off by default; see
@@ -350,54 +278,23 @@ df_user_features = add_interaction_attr_user_features(
 # schema: ["item_id", "feature_name", "value"]
 print("Building Item Features table...")
 
-# Helper for splitting comma-separated features like genres/tags
-def split_and_explode(df: DataFrame, id_col: str, feature_col: str, prefix: str) -> DataFrame:
-    """Splits a comma-separated string column and explodes it to long format."""
-    return (
-        df
-        .select(
-            F.col(id_col),
-            F.explode(
-                F.split(F.col(feature_col), ",")
-            ).alias("feature_val")
-        )
-        .withColumn("feature_name", F.concat(F.lit(prefix), F.trim(F.col("feature_val"))))
-        .withColumn("value", F.lit(1.0))
-        .select(id_col, "feature_name", "value")
-    )
-
 # ---
 # Experiment here! Add or remove features.
 # ---
 # `media_series_title` is deliberately absent: at series grain it is one
 # feature per item (an identity column), which adds a catalog-sized block
 # to the Gram matrix and carries no information the item row lacks.
-categorical_item_features = [
-    "media_type",
-    "media_audio_language",
-    "airtable_primary_genre",
-    "airtable_ca_brand_grade"
-]
+categorical_item_features = list(cfg.CR_ITEM_CATEGORICAL_FEATURES)
+# Comma-separated columns, split and exploded: (column, feature-name prefix).
+multi_value_item_features = list(cfg.CR_ITEM_MULTI_VALUE_FEATURES)
 
-# Metadata is media-grain; key every feature by the series id so it lands
-# on the interaction items. The trailing distinct() collapses the episodes
-# of a series into one feature row each.
-df_meta_series = df_meta.filter(F.col(METADATA_SERIES_COL).isNotNull())
-
-df_item_categorical = to_long_format(df_meta_series, METADATA_SERIES_COL, categorical_item_features)
-
-# Split/explode features
-df_item_genres = split_and_explode(df_meta_series, METADATA_SERIES_COL, "media_genres", "genre_")
-df_item_tags = split_and_explode(df_meta_series, METADATA_SERIES_COL, "media_tags", "tag_")
-
-# Combine all item feature tables
-df_item_features = (
-    df_item_categorical
-    .unionByName(df_item_genres)
-    .unionByName(df_item_tags)
-    .withColumnRenamed(METADATA_SERIES_COL, "item_id")
-    .filter(F.col("feature_name").isNotNull() & (F.col("feature_name") != F.lit("")))
-    .distinct()
+# Metadata is media-grain; every feature is keyed by the series id so it
+# lands on the interaction items, one row per (series, feature).
+df_item_features = cr_item_features(
+    df_meta,
+    series_col=METADATA_SERIES_COL,
+    categorical_cols=categorical_item_features,
+    multi_value_cols=multi_value_item_features,
 )
 
 
