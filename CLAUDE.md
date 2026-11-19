@@ -332,3 +332,17 @@ This repository is currently solo-developed and `main` is not branch-protected. 
 ## Python Module Name
 
 The compiled Rust extension is a submodule of the Python package: `kzn_recsys._native`. The public Python package is `kzn_recsys`, which re-exports the extension's symbols alongside Python helpers (`SplitResult`, schemas, `fease_wrapper`). End users should import from `kzn_recsys`, not `kzn_recsys._native` directly.
+
+## Agent skills
+
+### Issue tracker
+
+Issues live in this repo's GitHub Issues. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+The five default triage labels (`needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`). See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context: `GLOSSARY.md` at the repo root, ADRs in `docs/adr/`. See `docs/agents/domain.md`.
